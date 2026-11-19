@@ -22,6 +22,7 @@
 //! the commands the brokers push for each segment's producer, the layouts and the passing of time, and answers the
 //! application's sends, flushes and close. Everything is polled from one future.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -35,8 +36,9 @@ use apache_pulsar_protocol::connection::IdKind;
 use apache_pulsar_protocol::frame::Frame;
 use apache_pulsar_protocol::producer::{Action, OutgoingMessage, Producer, RegisterError, SendError, SendId};
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{BaseCommand, CommandCloseProducer, CommandProducerSuccess};
+use apache_pulsar_protocol::proto::{BaseCommand, CommandCloseProducer, CommandProducerSuccess, MessageMetadata};
 use buffa::{EnumValue, MessageView};
+use bytes::Bytes;
 use futures_channel::{mpsc, oneshot};
 use futures_util::stream::{FuturesUnordered, SelectAll};
 use futures_util::{Stream, StreamExt};
@@ -44,7 +46,7 @@ use futures_util::{Stream, StreamExt};
 use crate::conn::{ConnHandle, Push};
 use crate::error::{Error, ErrorKind, Result, server_error_kind};
 use crate::local;
-use crate::memory::MemoryLimit;
+use crate::memory::Reservation;
 use crate::message_id::MessageId;
 use crate::watch::LayoutWatch;
 
@@ -53,13 +55,15 @@ pub(crate) enum Request {
     Send {
         message: OutgoingMessage,
         publish_time: u64,
-        reserved: u64,
+        /// The message's room under the memory limit. It goes back when the message completes, or when the
+        /// request drops untaken.
+        room: Reservation,
         reply: oneshot::Sender<Result<MessageId>>,
     },
     Flush {
         reply: oneshot::Sender<Result<()>>,
     },
-    /// `None` when the last handle dropped: close in the background.
+    /// `None` when the last handle dropped, or the client is closing: close in the background.
     Close {
         reply: Option<oneshot::Sender<Result<()>>>,
     },
@@ -70,30 +74,36 @@ type Registration = Pin<Box<dyn Future<Output = Registered>>>;
 type Closing = Pin<Box<dyn Future<Output = (u64, u64)>>>;
 type Pushes = Pin<Box<dyn Stream<Item = (u64, u64, Push)>>>;
 /// Where a registration in flight registered its producer id, once it did.
-type Registering = Rc<std::cell::RefCell<Option<(ConnHandle, u64)>>>;
+type Registering = Rc<RefCell<Option<(ConnHandle, u64)>>>;
+/// A registered producer: its link, the commands pushed for it, and the broker's answer.
+type Linked = (Link, mpsc::UnboundedReceiver<Push>, CommandProducerSuccess);
 
 /// The outcome of registering a segment's producer.
 struct Registered {
     segment: u64,
     generation: u64,
-    outcome:
-        std::result::Result<(ConnHandle, u64, mpsc::UnboundedReceiver<Push>, CommandProducerSuccess), RegisterError>,
+    outcome: std::result::Result<Linked, RegisterError>,
 }
 
-/// A segment's producer as registered on a connection.
+/// A segment's producer as registered on a connection. Dropping it unregisters the producer id there.
 struct Link {
     generation: u64,
     connection: ConnHandle,
     producer_id: u64,
 }
 
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.connection.unregister(IdKind::Producer, self.producer_id);
+    }
+}
+
 pub(crate) struct Task {
     producer: Producer,
     client: local::PulsarClient,
     watch: LayoutWatch,
+    /// The client keeps a sender of its own, to close the producer: the channel doesn't end while the task runs.
     requests: mpsc::UnboundedReceiver<Request>,
-    requests_open: bool,
-    memory: Arc<MemoryLimit>,
     last_sequence: Arc<AtomicI64>,
     links: HashMap<u64, Link>,
     registrations: FuturesUnordered<Registration>,
@@ -102,7 +112,8 @@ pub(crate) struct Task {
     registering: HashMap<(u64, u64), Registering>,
     closes: FuturesUnordered<Closing>,
     pushes: SelectAll<Pushes>,
-    replies: HashMap<SendId, (oneshot::Sender<Result<MessageId>>, u64)>,
+    /// Sends in flight: where to answer each, and the room it holds.
+    replies: HashMap<SendId, (oneshot::Sender<Result<MessageId>>, Reservation)>,
     /// Flushes: the last send each waits for, the first failure among them, and where to answer.
     flushes: Vec<(SendId, Option<Error>, oneshot::Sender<Result<()>>)>,
     last_send: Option<SendId>,
@@ -118,7 +129,6 @@ impl Task {
         client: local::PulsarClient,
         watch: LayoutWatch,
         requests: mpsc::UnboundedReceiver<Request>,
-        memory: Arc<MemoryLimit>,
         last_sequence: Arc<AtomicI64>,
         created: oneshot::Sender<Result<()>>,
     ) -> Self {
@@ -128,8 +138,6 @@ impl Task {
             client,
             watch,
             requests,
-            requests_open: true,
-            memory,
             last_sequence,
             links: HashMap::new(),
             registrations: FuturesUnordered::new(),
@@ -148,28 +156,17 @@ impl Task {
 
     pub(crate) async fn run(mut self) {
         poll_fn(|cx| self.poll(cx)).await;
-        // Requests that came in as the producer closed: their room goes back.
+        // Requests that came in as the producer closed fail as they drop: their senders see no answer coming, and
+        // their room goes back.
         self.requests.close();
-        while let Ok(request) = self.requests.try_recv() {
-            match request {
-                Request::Send { reserved, reply, .. } => {
-                    self.memory.release(reserved);
-                    let _ = reply.send(Err(Error::new(ErrorKind::AlreadyClosed, "the producer is closed")));
-                }
-                Request::Flush { reply } | Request::Close { reply: Some(reply) } => {
-                    let _ = reply.send(Ok(()));
-                }
-                Request::Close { reply: None } => {}
-            }
-        }
+        while self.requests.try_recv().is_ok() {}
         // Registrations that never completed: close them, so a queued wait-for-exclusive producer leaves the
-        // broker's line.
+        // broker's line. Dropping them unregisters their producer ids.
         let pending: Vec<(ConnHandle, u64)> =
             self.registering.values().filter_map(|registered| registered.borrow().clone()).collect();
         self.registrations = FuturesUnordered::new();
         for (connection, producer_id) in pending {
             let _ = connection.request(move |request_id| close_command(producer_id, request_id)).await;
-            connection.unregister(IdKind::Producer, producer_id);
         }
     }
 
@@ -197,24 +194,23 @@ impl Task {
 
     fn poll_requests(&mut self, cx: &mut Context<'_>) -> bool {
         let mut progressed = false;
-        while self.requests_open {
-            let Poll::Ready(request) = self.requests.poll_next_unpin(cx) else { break };
+        while let Poll::Ready(Some(request)) = self.requests.poll_next_unpin(cx) {
             progressed = true;
             let now = Instant::now();
             match request {
-                Some(Request::Send { message, publish_time, reserved, reply }) => {
+                Request::Send { message, publish_time, room, reply } => {
                     match self.producer.send(message, publish_time, now) {
                         Ok(send) => {
                             self.last_send = Some(send);
-                            self.replies.insert(send, (reply, reserved));
+                            self.replies.insert(send, (reply, room));
                         }
+                        // Its room goes back as it drops.
                         Err(error) => {
-                            self.memory.release(reserved);
                             let _ = reply.send(Err(send_error(error)));
                         }
                     }
                 }
-                Some(Request::Flush { reply }) => match self.last_send {
+                Request::Flush { reply } => match self.last_send {
                     Some(last) if self.producer.oldest_outstanding().is_some_and(|oldest| oldest <= last) => {
                         self.flushes.push((last, None, reply));
                     }
@@ -223,13 +219,8 @@ impl Task {
                     }
                 },
                 // The task ends once closed, so a close comes before that; closing again is a no-op.
-                Some(Request::Close { reply }) => {
+                Request::Close { reply } => {
                     self.close_replies.extend(reply);
-                    self.producer.close(now);
-                }
-                // Every handle is gone: close in the background.
-                None => {
-                    self.requests_open = false;
                     self.producer.close(now);
                 }
             }
@@ -254,10 +245,12 @@ impl Task {
             self.registering.remove(&(segment, generation));
             let now = Instant::now();
             match outcome {
-                Ok((connection, producer_id, pushes, success)) => {
-                    let max_message_size = connection.broker().max_message_size.map_or(5 << 20, |size| size as usize);
+                Ok((link, pushes, success)) => {
+                    let producer_id = link.producer_id;
+                    let max_message_size =
+                        link.connection.broker().max_message_size.map_or(5 << 20, |size| size as usize);
                     self.pushes.push(Box::pin(pushes.map(move |push| (segment, generation, push))));
-                    self.links.insert(segment, Link { generation, connection, producer_id });
+                    self.links.insert(segment, link);
                     self.producer.on_registered(segment, generation, producer_id, &success, max_message_size, now);
                     self.last_sequence.store(self.producer.last_sequence_id(), Ordering::Release);
                 }
@@ -280,40 +273,38 @@ impl Task {
         let mut progressed = false;
         while let Poll::Ready(Some((segment, generation, push))) = self.pushes.poll_next_unpin(cx) {
             progressed = true;
-            let now = Instant::now();
-            let current = self.links.get(&segment).is_some_and(|link| link.generation == generation);
             match push {
-                Push::Command(frame) => self.on_push(segment, generation, current, &frame, now),
-                Push::Closed(_) => {
-                    if current {
-                        self.links.remove(&segment);
-                    }
-                    self.producer.on_disconnected(segment, generation, now);
-                }
+                Push::Command(frame) => self.on_push(segment, generation, &frame),
+                // The connection closed, and the producer with it.
+                Push::Closed(_) => self.unlink(segment, generation),
             }
         }
         progressed
     }
 
-    fn on_push(&mut self, segment: u64, generation: u64, current: bool, frame: &Frame, now: Instant) {
+    fn on_push(&mut self, segment: u64, generation: u64, frame: &Frame) {
         let Ok(command) = frame.command_view() else { return };
         let Ok(command) = command.to_owned_message() else { return };
-        let EnumValue::Known(kind) = command.r#type else { return };
-        match kind {
-            Type::SEND_RECEIPT => {
+        let now = Instant::now();
+        match command.r#type {
+            EnumValue::Known(Type::SEND_RECEIPT) => {
                 self.producer.on_receipt(segment, generation, &command.send_receipt, now);
                 self.last_sequence.store(self.producer.last_sequence_id(), Ordering::Release);
             }
-            Type::SEND_ERROR => self.producer.on_send_error(segment, generation, &command.send_error, now),
-            // The broker closed the producer (an unload, a terminated topic) or moved the topic.
-            Type::CLOSE_PRODUCER | Type::TOPIC_MIGRATED => {
-                if current && let Some(link) = self.links.remove(&segment) {
-                    link.connection.unregister(IdKind::Producer, link.producer_id);
-                }
-                self.producer.on_disconnected(segment, generation, now);
+            EnumValue::Known(Type::SEND_ERROR) => {
+                self.producer.on_send_error(segment, generation, &command.send_error, now);
             }
-            _ => {}
+            // The broker closed the producer (an unload, a terminated topic) or moved the topic: the only other
+            // commands it pushes to a producer.
+            _ => self.unlink(segment, generation),
         }
+    }
+
+    /// The segment's producer of `generation` is gone from its connection: forget its link, if it is still the
+    /// current one, and tell the producer.
+    fn unlink(&mut self, segment: u64, generation: u64) {
+        self.links.retain(|&s, link| (s, link.generation) != (segment, generation));
+        self.producer.on_disconnected(segment, generation, Instant::now());
     }
 
     fn poll_timer(&mut self, cx: &mut Context<'_>) -> bool {
@@ -321,22 +312,22 @@ impl Task {
             self.timer = None;
             return false;
         };
-        let now = Instant::now();
-        if deadline <= now {
-            self.timer = None;
-            self.producer.handle_timeout(now);
-            return true;
+        // A sleep only completes once its deadline has passed: either way, the deadline is reached.
+        if deadline > Instant::now() && self.poll_sleep(deadline, cx).is_pending() {
+            return false;
         }
+        self.timer = None;
+        self.producer.handle_timeout(Instant::now());
+        true
+    }
+
+    /// Polls the sleep until `deadline`, starting a new one when the deadline changed.
+    fn poll_sleep(&mut self, deadline: Instant, cx: &mut Context<'_>) -> Poll<()> {
         if self.timer.as_ref().is_none_or(|(at, _)| *at != deadline) {
             self.timer = Some((deadline, Box::pin(compio::time::sleep_until(deadline))));
         }
         let (_, sleep) = self.timer.as_mut().unwrap();
-        if sleep.as_mut().poll(cx).is_ready() {
-            self.timer = None;
-            self.producer.handle_timeout(Instant::now());
-            return true;
-        }
-        false
+        sleep.as_mut().poll(cx)
     }
 
     fn drain_actions(&mut self) -> bool {
@@ -345,30 +336,13 @@ impl Task {
             progressed = true;
             match action {
                 Action::Connect { segment, generation, topic } => self.connect(segment, generation, topic),
-                Action::Send { segment, command, metadata, payload } => {
-                    if let Some(link) = self.links.get(&segment) {
-                        // A connection that just went is noticed from its pushes.
-                        let _ = link.connection.send_payload(command, metadata, payload);
-                    }
-                }
+                Action::Send { segment, command, metadata, payload } => self.write(segment, command, metadata, payload),
                 Action::CloseProducer { segment, generation } => self.close_producer(segment, generation),
-                Action::Disconnect { segment, generation } => {
-                    if let Some(link) = self.links.get(&segment).filter(|l| l.generation == generation) {
-                        tracing::warn!(segment, "a receipt did not match the producer's queue: reconnecting");
-                        let connection = link.connection.clone();
-                        // The connection task ends the connection; its owners hear about it from their pushes.
-                        let close = Box::pin(async move {
-                            connection.close().await;
-                            (u64::MAX, u64::MAX)
-                        });
-                        self.closes.push(close);
-                    }
-                }
+                Action::Disconnect { segment, generation } => self.disconnect(segment, generation),
                 Action::Done { send, result } => self.done(send, result),
                 Action::Created(result) => {
-                    if let Some(created) = self.created.take() {
-                        let _ = created.send(result.map_err(send_error));
-                    }
+                    let created = self.created.take().expect("a producer is created once");
+                    let _ = created.send(result.map_err(send_error));
                 }
                 Action::Closed => {
                     self.closed = true;
@@ -384,27 +358,44 @@ impl Task {
     fn connect(&mut self, segment: u64, generation: u64, topic: String) {
         let Some(command) = self.producer.register_command(segment, 0) else { return };
         let client = self.client.clone();
-        let registered = Rc::new(std::cell::RefCell::new(None));
+        let registered = Rc::new(RefCell::new(None));
         self.registering.insert((segment, generation), registered.clone());
         self.registrations.push(Box::pin(async move {
-            let outcome = register(&client, &topic, command, &registered).await;
+            let outcome = register(&client, &topic, generation, command, &registered).await;
             Registered { segment, generation, outcome }
         }));
     }
 
+    /// Writes a message on its segment's connection. Without a link, the connection just went: the producer
+    /// heard it from the pushes, and writes the message again once registered anew. A connection that is going
+    /// is noticed from the pushes too.
+    fn write(&self, segment: u64, command: Box<BaseCommand>, metadata: Box<MessageMetadata>, payload: Bytes) {
+        let Some(link) = self.links.get(&segment) else { return };
+        let _ = link.connection.send_payload(command, metadata, payload);
+    }
+
+    /// Closes the segment's producer. Without a link, the connection just went: the producer heard it from the
+    /// pushes.
     fn close_producer(&mut self, segment: u64, generation: u64) {
-        let Some(link) = self.links.get(&segment).filter(|l| l.generation == generation) else {
-            // Its connection is gone, and the producer with it.
-            self.producer.on_producer_closed(segment, generation, Instant::now());
-            return;
-        };
-        let connection = link.connection.clone();
-        let producer_id = link.producer_id;
+        let Some(link) = self.links.remove(&segment) else { return };
+        debug_assert_eq!(link.generation, generation);
         self.closes.push(Box::pin(async move {
             // Its receipts keep coming until the answer: the broker answers once its pending writes are done.
-            let _ = connection.request(move |request_id| close_command(producer_id, request_id)).await;
-            connection.unregister(IdKind::Producer, producer_id);
+            let producer_id = link.producer_id;
+            let _ = link.connection.request(move |request_id| close_command(producer_id, request_id)).await;
             (segment, generation)
+        }));
+    }
+
+    /// The broker and the segment's producer disagree on what was sent: end the connection, so that the producer
+    /// registers again and writes everything again. Its owners hear about it from their pushes.
+    fn disconnect(&mut self, segment: u64, generation: u64) {
+        let Some(link) = self.links.get(&segment).filter(|link| link.generation == generation) else { return };
+        tracing::warn!(segment, "a receipt did not match the producer's queue: reconnecting");
+        let connection = link.connection.clone();
+        self.closes.push(Box::pin(async move {
+            connection.close().await;
+            (u64::MAX, u64::MAX)
         }));
     }
 
@@ -414,19 +405,17 @@ impl Task {
         result: std::result::Result<apache_pulsar_protocol::message_id::MessageId, SendError>,
     ) {
         let result = result.map(MessageId).map_err(send_error);
-        if let Some((reply, reserved)) = self.replies.remove(&send) {
-            // The room goes back first, so a send chained on this one finds it.
-            self.memory.release(reserved);
-            let _ = reply.send(result.clone());
-        }
+        let (reply, room) = self.replies.remove(&send).expect("a send in flight");
+        // The room goes back first, so a send chained on this one finds it.
+        drop(room);
+        let _ = reply.send(result.clone());
         // A flush fails if a send it waits for failed, as Java's does.
         if let Err(error) = &result {
-            for (last, failure, _) in &mut self.flushes {
-                if send <= *last {
-                    failure.get_or_insert_with(|| error.clone());
-                }
+            for (_, failure, _) in self.flushes.iter_mut().filter(|(last, ..)| send <= *last) {
+                failure.get_or_insert_with(|| error.clone());
             }
         }
+        // A flush is done once none of the sends it waits for is outstanding.
         let oldest = self.producer.oldest_outstanding();
         let (finished, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.flushes)
             .into_iter()
@@ -442,40 +431,41 @@ impl Task {
 async fn register(
     client: &local::PulsarClient,
     topic: &str,
+    generation: u64,
     mut command: BaseCommand,
-    registered: &std::cell::RefCell<Option<(ConnHandle, u64)>>,
-) -> std::result::Result<(ConnHandle, u64, mpsc::UnboundedReceiver<Push>, CommandProducerSuccess), RegisterError> {
-    let unavailable = |error: Error| RegisterError::Unavailable(error.to_string());
-    let address = client.lookup(topic).await.map_err(|error| refused(&error).unwrap_or_else(|| unavailable(error)))?;
-    let connection = client.connection(&address).await.map_err(unavailable)?;
-    let (producer_id, pushes) = connection.register(IdKind::Producer).await.map_err(unavailable)?;
+    registered: &RefCell<Option<(ConnHandle, u64)>>,
+) -> std::result::Result<Linked, RegisterError> {
+    let address = client.lookup(topic).await?;
+    let connection = client.connection(&address).await?;
+    let (producer_id, pushes) = connection.register(IdKind::Producer).await?;
+    // From here, a failure unregisters the producer id as the link drops.
+    let link = Link { generation, connection, producer_id };
     command.producer.get_or_insert_default().producer_id = producer_id;
-    *registered.borrow_mut() = Some((connection.clone(), producer_id));
-    let response = connection
+    *registered.borrow_mut() = Some((link.connection.clone(), producer_id));
+    let frame = link
+        .connection
         .request(move |request_id| {
             let mut command = command;
             command.producer.get_or_insert_default().request_id = request_id;
             command
         })
-        .await;
-    let frame = match response {
-        Ok(frame) => frame,
-        Err(error) => {
-            connection.unregister(IdKind::Producer, producer_id);
-            return Err(refused(&error).unwrap_or_else(|| unavailable(error)));
-        }
-    };
+        .await?;
     let success = frame
         .command_view()
         .ok()
         .and_then(|c| c.producer_success.as_option().and_then(|s| s.to_owned_message().ok()))
-        .ok_or_else(|| RegisterError::Unavailable("not a producer success".into()))?;
-    Ok((connection, producer_id, pushes, success))
+        .ok_or(RegisterError::Unavailable("not a producer success".into()))?;
+    Ok((link, pushes, success))
 }
 
-/// The broker's refusal in an error, if it is one.
-fn refused(error: &Error) -> Option<RegisterError> {
-    error.server_error().map(|(error, message)| RegisterError::Server { error, message })
+/// Why a producer couldn't register: the broker's refusal, or no broker to ask.
+impl From<Error> for RegisterError {
+    fn from(error: Error) -> Self {
+        match error.server_error() {
+            Some((error, message)) => RegisterError::Server { error, message },
+            None => RegisterError::Unavailable(error.to_string()),
+        }
+    }
 }
 
 fn close_command(producer_id: u64, request_id: u64) -> BaseCommand {

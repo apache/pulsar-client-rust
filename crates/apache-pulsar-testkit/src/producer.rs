@@ -158,17 +158,14 @@ impl Harness {
 
     /// The segment a successful send landed on.
     pub fn segment_of(&self, send: SendId) -> u64 {
-        match &self.done[&send] {
-            Ok(id) => id.segment_id as u64,
-            Err(error) => panic!("send {send} failed: {error}"),
-        }
+        self.done[&send].as_ref().expect("the send failed").segment_id as u64
     }
 
     /// Drops the connection, as a network failure would: the producer's registrations are lost, and the watch
     /// reopens on a new connection.
     pub fn drop_connection(&mut self) {
         self.world.kill(self.conn);
-        self.reconnect();
+        self.pump();
     }
 
     /// Does what the producer and the world ask until neither has anything left to do.
@@ -184,6 +181,7 @@ impl Harness {
                 progressed = true;
                 self.answer(&output);
             }
+            // The world closed the connection, or the test did: connect again.
             if !self.world.is_open(self.conn) {
                 progressed = true;
                 self.reconnect();
@@ -238,25 +236,15 @@ impl Harness {
         self.world.disconnected(self.conn);
         self.conn = self.world.connect();
         self.handshake();
-        let closing_ids: Vec<u64> = self.closing.values().map(|(_, _, id)| *id).collect();
-        let lost: Vec<(u64, u64)> =
-            self.producers.drain().filter(|(id, _)| !closing_ids.contains(id)).map(|(_, v)| v).collect();
-        let registering: Vec<(u64, u64)> = self.registering.drain().map(|(_, (s, g, _))| (s, g)).collect();
-        let closing: Vec<(u64, u64)> = self.closing.drain().map(|(_, (s, g, _))| (s, g)).collect();
+        // What was registered on the old connection, or being closed there, is gone with it.
+        self.closing.clear();
         let now = self.clock.now();
-        for (segment, generation) in lost {
+        for (_, (segment, generation)) in std::mem::take(&mut self.producers) {
             self.producer.on_disconnected(segment, generation, now);
         }
-        for (segment, generation) in registering {
-            self.producer.on_register_failed(
-                segment,
-                generation,
-                RegisterError::Unavailable("disconnected".into()),
-                now,
-            );
-        }
-        for (segment, generation) in closing {
-            self.producer.on_producer_closed(segment, generation, now);
+        for (_, (segment, generation, _)) in std::mem::take(&mut self.registering) {
+            let lost = RegisterError::Unavailable("disconnected".into());
+            self.producer.on_register_failed(segment, generation, lost, now);
         }
         self.open_session();
     }
@@ -279,25 +267,21 @@ impl Harness {
                 self.world.input(self.conn, &buf);
             }
             Action::CloseProducer { segment, generation } => {
-                let producer_id = self.producers.iter().find(|(_, v)| **v == (segment, generation)).map(|(id, _)| *id);
-                match producer_id {
-                    Some(producer_id) => {
-                        let request_id = self.next_id;
-                        self.next_id += 1;
-                        self.closing.insert(request_id, (segment, generation, producer_id));
-                        let close = BaseCommand {
-                            r#type: Type::CLOSE_PRODUCER.into(),
-                            close_producer: CommandCloseProducer { producer_id, request_id, ..Default::default() }
-                                .into(),
-                            ..Default::default()
-                        };
-                        self.write(&close);
-                    }
-                    // Its connection is gone: nothing to close.
-                    None => self.producer.on_producer_closed(segment, generation, self.clock.now()),
-                }
+                // Without a producer, its connection is gone, and the producer heard it.
+                let registered = self.producers.iter().find(|(_, v)| **v == (segment, generation));
+                let Some((&producer_id, _)) = registered else { return };
+                let request_id = self.next_id;
+                self.next_id += 1;
+                self.closing.insert(request_id, (segment, generation, producer_id));
+                let close = BaseCommand {
+                    r#type: Type::CLOSE_PRODUCER.into(),
+                    close_producer: CommandCloseProducer { producer_id, request_id, ..Default::default() }.into(),
+                    ..Default::default()
+                };
+                self.write(&close);
             }
-            Action::Disconnect { .. } => self.drop_connection(),
+            // The pump connects again.
+            Action::Disconnect { .. } => self.world.kill(self.conn),
             Action::Done { send, result } => {
                 assert!(self.done.insert(send, result).is_none(), "send {send} finished twice");
             }
@@ -310,60 +294,53 @@ impl Harness {
         let now = self.clock.now();
         for command in decode(output) {
             let EnumValue::Known(kind) = command.r#type else { continue };
+            // What the world sends on a connection only ever answers what the harness wrote on it, or concerns a
+            // producer still registered there.
             match kind {
                 Type::PRODUCER_SUCCESS => {
                     let success = &command.producer_success;
+                    // A wait-for-exclusive producer in line: the answer that counts comes once it has the topic.
                     if success.producer_ready == Some(false) {
                         continue;
                     }
-                    let Some((segment, generation, producer_id)) = self.registering.remove(&success.request_id) else {
-                        continue;
-                    };
+                    let (segment, generation, producer_id) = self.registering.remove(&success.request_id).unwrap();
                     self.producers.insert(producer_id, (segment, generation));
                     self.producer.on_registered(segment, generation, producer_id, success, 5 << 20, now);
                 }
+                // The world refuses registrations only: it closes every producer it is asked to.
                 Type::ERROR => {
                     let error = &command.error;
-                    if let Some((segment, generation, _)) = self.registering.remove(&error.request_id) {
-                        let refused = RegisterError::Server { error: error.error, message: error.message.clone() };
-                        self.producer.on_register_failed(segment, generation, refused, now);
-                    } else if let Some((segment, generation, producer_id)) = self.closing.remove(&error.request_id) {
-                        self.producers.remove(&producer_id);
-                        self.producer.on_producer_closed(segment, generation, now);
-                    }
+                    let (segment, generation, _) = self.registering.remove(&error.request_id).unwrap();
+                    let refused = RegisterError::Server { error: error.error, message: error.message.clone() };
+                    self.producer.on_register_failed(segment, generation, refused, now);
                 }
                 Type::SUCCESS => {
-                    if let Some((segment, generation, producer_id)) = self.closing.remove(&command.success.request_id) {
-                        self.producers.remove(&producer_id);
-                        self.producer.on_producer_closed(segment, generation, now);
-                    }
+                    let (segment, generation, producer_id) = self.closing.remove(&command.success.request_id).unwrap();
+                    self.producers.remove(&producer_id);
+                    self.producer.on_producer_closed(segment, generation, now);
                 }
                 Type::SEND_RECEIPT => {
                     let receipt = &command.send_receipt;
-                    if let Some(&(segment, generation)) = self.producers.get(&receipt.producer_id) {
-                        self.producer.on_receipt(segment, generation, receipt, now);
-                    }
+                    let (segment, generation) = self.producers[&receipt.producer_id];
+                    self.producer.on_receipt(segment, generation, receipt, now);
                 }
                 Type::SEND_ERROR => {
                     let error = &command.send_error;
-                    if let Some(&(segment, generation)) = self.producers.get(&error.producer_id) {
-                        self.producer.on_send_error(segment, generation, error, now);
-                    }
+                    let (segment, generation) = self.producers[&error.producer_id];
+                    self.producer.on_send_error(segment, generation, error, now);
                 }
                 Type::CLOSE_PRODUCER => {
-                    if let Some((segment, generation)) = self.producers.remove(&command.close_producer.producer_id) {
-                        self.producer.on_disconnected(segment, generation, now);
-                    }
+                    let (segment, generation) = self.producers.remove(&command.close_producer.producer_id).unwrap();
+                    self.producer.on_disconnected(segment, generation, now);
                 }
-                Type::SCALABLE_TOPIC_UPDATE => {
+                // The only other command the world sends: a layout, on the session open now.
+                _ => {
                     let update = &command.scalableTopicUpdate;
-                    if update.session_id == self.session_id && update.error.is_none() {
-                        let topic = update.resolved_topic_name.as_deref().unwrap_or(&self.topic);
-                        let layout = Layout::from_dag(&update.dag, topic).unwrap();
-                        self.producer.on_layout(Rc::new(layout), now);
-                    }
+                    assert_eq!((update.session_id, update.error), (self.session_id, None), "{command:?}");
+                    let topic = update.resolved_topic_name.as_deref().unwrap_or(&self.topic);
+                    let layout = Layout::from_dag(&update.dag, topic).unwrap();
+                    self.producer.on_layout(Rc::new(layout), now);
                 }
-                _ => {}
             }
         }
     }

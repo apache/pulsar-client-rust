@@ -121,8 +121,8 @@ impl ConnHandle {
         self.inner
             .commands
             .unbounded_send(Command::Request { build: Box::new(build), reply })
-            .map_err(|_| not_connected())?;
-        response.await.map_err(|_| not_connected())?
+            .map_err(not_connected)?;
+        response.await.map_err(not_connected)?
     }
 
     /// Allocates an id of `kind` on this connection, and returns it with the commands the broker pushes for it.
@@ -131,8 +131,8 @@ impl ConnHandle {
     pub async fn register(&self, kind: IdKind) -> Result<(u64, mpsc::UnboundedReceiver<Push>)> {
         let (sink, pushes) = mpsc::unbounded();
         let (reply, id) = oneshot::channel();
-        self.inner.commands.unbounded_send(Command::Register { kind, sink, reply }).map_err(|_| not_connected())?;
-        let id = id.await.map_err(|_| not_connected())?;
+        self.inner.commands.unbounded_send(Command::Register { kind, sink, reply }).map_err(not_connected)?;
+        let id = id.await.map_err(not_connected)?;
         Ok((id, pushes))
     }
 
@@ -145,7 +145,7 @@ impl ConnHandle {
     /// any, comes as a [`Push`].
     pub fn send(&self, command: BaseCommand) -> Result<()> {
         let send = Command::Send { command: Box::new(command), payload: None };
-        self.inner.commands.unbounded_send(send).map_err(|_| not_connected())
+        self.inner.commands.unbounded_send(send).map_err(not_connected)
     }
 
     /// Sends a `CommandSend` with its metadata and payload.
@@ -158,7 +158,7 @@ impl ConnHandle {
         self.inner
             .commands
             .unbounded_send(Command::Send { command, payload: Some((metadata, payload)) })
-            .map_err(|_| not_connected())
+            .map_err(not_connected)
     }
 
     /// Closes the connection and waits for its task to end.
@@ -170,7 +170,8 @@ impl ConnHandle {
     }
 }
 
-fn not_connected() -> Error {
+/// The error of an operation on a connection whose task is gone, or went before answering.
+fn not_connected<E>(_: E) -> Error {
     Error::new(ErrorKind::NotConnected, "the connection closed")
 }
 
@@ -222,7 +223,7 @@ pub(crate) async fn open(address: BrokerAddress, config: &ClientConfig) -> Resul
         address: address.clone(),
     };
     let task = compio::runtime::spawn(driver.run());
-    let broker = connected.await.map_err(|_| not_connected())??;
+    let broker = connected.await.map_err(not_connected)??;
     tracing::debug!(address = %address.physical, logical = %address.logical, server = %broker.server_version, "connected");
     Ok(ConnHandle { inner: Rc::new(Inner { address, broker, commands, closed, task: Cell::new(Some(task)) }) })
 }

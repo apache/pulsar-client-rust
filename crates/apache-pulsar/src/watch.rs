@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use apache_pulsar_protocol::backoff::Backoff;
 use apache_pulsar_protocol::connection::IdKind;
+use apache_pulsar_protocol::frame::Frame;
 use apache_pulsar_protocol::layout::Layout;
 use apache_pulsar_protocol::proto::base_command::Type;
 use apache_pulsar_protocol::proto::{BaseCommand, CommandScalableTopicClose, CommandScalableTopicLookup};
@@ -75,6 +76,18 @@ impl LayoutWatch {
     }
 }
 
+#[cfg(test)]
+impl LayoutWatch {
+    /// Whether the watch's task still runs.
+    pub(crate) fn is_running(&self) -> bool {
+        let task = self.shared.task.take();
+        let running = task.as_ref().is_some_and(|task| !task.is_finished());
+        self.shared.task.set(task);
+        running
+    }
+}
+
+/// A watch. Dropping it, with its last holder, cancels its task, which closes its session as it goes.
 struct Shared {
     topic: String,
     state: RefCell<State>,
@@ -87,29 +100,25 @@ struct State {
     subscribers: Vec<mpsc::UnboundedSender<Rc<Layout>>>,
     /// Openers waiting for the first layout.
     waiters: Vec<oneshot::Sender<Result<()>>>,
-    /// The session open now, to close when the watch goes.
-    session: Option<(ConnHandle, u64)>,
 }
 
-impl Drop for Shared {
+/// A session open on a connection. Dropping it closes it there.
+struct Session {
+    connection: ConnHandle,
+    id: u64,
+}
+
+impl Drop for Session {
     fn drop(&mut self) {
-        if let Some((connection, session_id)) = self.state.get_mut().session.take() {
-            close_session(&connection, session_id);
-        }
-        // Dropping the handle cancels the task.
-        drop(self.task.take());
+        let close = BaseCommand {
+            r#type: Type::SCALABLE_TOPIC_CLOSE.into(),
+            scalableTopicClose: CommandScalableTopicClose { session_id: self.id, ..Default::default() }.into(),
+            ..Default::default()
+        };
+        // Best effort: a connection that is gone has closed the session with it.
+        let _ = self.connection.send(close);
+        self.connection.unregister(IdKind::Session, self.id);
     }
-}
-
-fn close_session(connection: &ConnHandle, session_id: u64) {
-    let close = BaseCommand {
-        r#type: Type::SCALABLE_TOPIC_CLOSE.into(),
-        scalableTopicClose: CommandScalableTopicClose { session_id, ..Default::default() }.into(),
-        ..Default::default()
-    };
-    // Best effort: a connection that is gone has closed the session with it.
-    let _ = connection.send(close);
-    connection.unregister(IdKind::Session, session_id);
 }
 
 impl Watches {
@@ -143,13 +152,11 @@ impl Watches {
             }
         };
         if let Some(first) = waiting {
-            let outcome = first.await.unwrap_or_else(|_| Err(Error::closed()));
-            if let Err(error) = outcome {
+            // The answer comes: the waiters are the watch's, and this opener holds it.
+            if let Err(error) = first.await.expect("a watch answers its openers") {
                 // A failed watch is not reused: the next opener starts a new one.
-                let mut by_topic = self.by_topic.borrow_mut();
-                if by_topic.get(topic).is_some_and(|w| w.ptr_eq(&Rc::downgrade(&shared))) {
-                    by_topic.remove(topic);
-                }
+                let failed = Rc::downgrade(&shared);
+                self.by_topic.borrow_mut().retain(|_, watch| !watch.ptr_eq(&failed));
                 return Err(error);
             }
         }
@@ -197,36 +204,12 @@ async fn run(shared: Weak<Shared>, client: local::PulsarClient, topic: String) {
 
 /// Opens a session and serves its updates until it ends.
 async fn session(shared: &Weak<Shared>, client: &local::PulsarClient, topic: &str, backoff: &mut Backoff) -> Ended {
-    let connection = match connect(client, topic).await {
-        Ok(connection) => connection,
+    // Closed as it drops, however the session ends.
+    let (_session, mut pushes) = match open_session(client, topic).await {
+        Ok(opened) => opened,
         Err(error) if error.kind() == ErrorKind::UnsupportedBroker => return Ended::Failed(error),
         Err(error) => return Ended::Lost(error),
     };
-    let (session_id, mut pushes) = match connection.register(IdKind::Session).await {
-        Ok(registered) => registered,
-        Err(error) => return Ended::Lost(error),
-    };
-    let lookup = BaseCommand {
-        r#type: Type::SCALABLE_TOPIC_LOOKUP.into(),
-        scalableTopicLookup: CommandScalableTopicLookup {
-            session_id,
-            topic: topic.to_string(),
-            create_if_missing: Some(true),
-            ..Default::default()
-        }
-        .into(),
-        ..Default::default()
-    };
-    if let Err(error) = connection.send(lookup) {
-        return Ended::Lost(error);
-    }
-    match shared.upgrade() {
-        Some(watch) => watch.state.borrow_mut().session = Some((connection.clone(), session_id)),
-        None => {
-            close_session(&connection, session_id);
-            return Ended::Lost(Error::closed());
-        }
-    }
     let operation_timeout = client.operation_timeout();
     loop {
         let waiting_for_first = shared.upgrade().is_some_and(|w| w.state.borrow().layout.is_none());
@@ -235,10 +218,6 @@ async fn session(shared: &Weak<Shared>, client: &local::PulsarClient, topic: &st
             match compio::time::timeout(operation_timeout, pushes.next()).await {
                 Ok(push) => push,
                 Err(_) => {
-                    if let Some(watch) = shared.upgrade() {
-                        watch.state.borrow_mut().session = None;
-                    }
-                    close_session(&connection, session_id);
                     let error = Error::new(ErrorKind::Timeout, format!("no layout for {topic} within the timeout"));
                     return Ended::Failed(error);
                 }
@@ -247,35 +226,24 @@ async fn session(shared: &Weak<Shared>, client: &local::PulsarClient, topic: &st
             pushes.next().await
         };
         let Some(watch) = shared.upgrade() else { return Ended::Lost(Error::closed()) };
+        // Without a word, the connection's task went.
+        let Some(push) = push else { return Ended::Lost(Error::new(ErrorKind::NotConnected, "the connection closed")) };
         match push {
-            Some(Push::Command(frame)) => {
-                if let Err(error) = apply(&watch, topic, &frame) {
-                    if watch.state.borrow().layout.is_none() {
-                        watch.state.borrow_mut().session = None;
-                        close_session(&connection, session_id);
-                        return Ended::Failed(error);
-                    }
-                    // After the first layout, a broker-side error on the session is transient, as in Java: the
-                    // connection-closed path takes it from here.
-                    tracing::warn!(%topic, %error, "layout watch error");
-                } else {
-                    backoff.reset();
-                }
-            }
-            Some(Push::Closed(error)) => {
-                watch.state.borrow_mut().session = None;
-                return Ended::Lost(error);
-            }
-            None => {
-                watch.state.borrow_mut().session = None;
-                return Ended::Lost(Error::new(ErrorKind::NotConnected, "the connection closed"));
-            }
+            Push::Command(frame) => match apply(&watch, topic, &frame) {
+                Ok(()) => backoff.reset(),
+                Err(error) if watch.state.borrow().layout.is_none() => return Ended::Failed(error),
+                // After the first layout, a broker-side error on the session is transient, as in Java: the
+                // connection-closed path takes it from here.
+                Err(error) => tracing::warn!(%topic, %error, "layout watch error"),
+            },
+            Push::Closed(error) => return Ended::Lost(error),
         }
     }
 }
 
-/// A connection to the broker that serves `topic`, if it supports scalable topics (C15).
-async fn connect(client: &local::PulsarClient, topic: &str) -> Result<ConnHandle> {
+/// Opens a session on the broker that serves `topic`, if it supports scalable topics (C15), and asks for the
+/// topic's layout there.
+async fn open_session(client: &local::PulsarClient, topic: &str) -> Result<(Session, mpsc::UnboundedReceiver<Push>)> {
     let address = client.lookup(topic).await?;
     let connection = client.connection(&address).await?;
     if !connection.broker().features.scalable_topics {
@@ -284,15 +252,27 @@ async fn connect(client: &local::PulsarClient, topic: &str) -> Result<ConnHandle
             format!("the broker at {} does not support scalable topics", address.physical),
         ));
     }
-    Ok(connection)
+    let (id, pushes) = connection.register(IdKind::Session).await?;
+    let session = Session { connection, id };
+    let lookup = BaseCommand {
+        r#type: Type::SCALABLE_TOPIC_LOOKUP.into(),
+        scalableTopicLookup: CommandScalableTopicLookup {
+            session_id: id,
+            topic: topic.to_string(),
+            create_if_missing: Some(true),
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    };
+    session.connection.send(lookup)?;
+    Ok((session, pushes))
 }
 
-/// Applies a `CommandScalableTopicUpdate`: a newer layout reaches every holder; an error fails the session.
-fn apply(watch: &Shared, topic: &str, frame: &apache_pulsar_protocol::frame::Frame) -> Result<()> {
-    let command = frame.command_view().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-    if command.r#type != EnumValue::Known(Type::SCALABLE_TOPIC_UPDATE) {
-        return Ok(());
-    }
+/// Applies a `CommandScalableTopicUpdate`, the only command pushed to a session: a newer layout reaches every
+/// holder; an error fails the session.
+fn apply(watch: &Shared, topic: &str, frame: &Frame) -> Result<()> {
+    let command = frame.command_view().map_err(malformed)?;
     let Some(update) = command.scalableTopicUpdate.as_option() else { return Ok(()) };
     if let Some(error) = update.error {
         let message = update.message.unwrap_or_default();
@@ -302,13 +282,11 @@ fn apply(watch: &Shared, topic: &str, frame: &apache_pulsar_protocol::frame::Fra
         ));
     }
     let Some(dag) = update.dag.as_option() else { return Ok(()) };
-    let dag = dag.to_owned_message().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+    let dag = dag.to_owned_message().map_err(malformed)?;
     let mut state = watch.state.borrow_mut();
-    let resolved = match update.resolved_topic_name {
-        Some(name) => name.to_string(),
-        None => state.layout.as_ref().map_or_else(|| topic.to_string(), |l| l.topic().to_string()),
-    };
-    let layout = Layout::from_dag(&dag, &resolved).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+    // The name the broker resolved the topic to, now or before.
+    let resolved = update.resolved_topic_name.or(state.layout.as_ref().map(|l| l.topic())).unwrap_or(topic);
+    let layout = Layout::from_dag(&dag, resolved).map_err(malformed)?;
     if let Some(current) = &state.layout
         && layout.epoch() <= current.epoch()
     {
@@ -323,4 +301,38 @@ fn apply(watch: &Shared, topic: &str, frame: &apache_pulsar_protocol::frame::Fra
         let _ = waiter.send(Ok(()));
     }
     Ok(())
+}
+
+/// An update the client can't make sense of.
+fn malformed(error: impl std::fmt::Display) -> Error {
+    Error::new(ErrorKind::Other, format!("a malformed layout update: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use apache_pulsar_protocol::frame::{FrameDecoder, encode_command};
+    use apache_pulsar_protocol::proto::{CommandScalableTopicUpdate, ScalableTopicDAG, SegmentInfoProto, SegmentState};
+
+    use super::*;
+
+    /// A layout with a segment off the hash ring is refused, and changes nothing.
+    #[test]
+    fn a_malformed_layout_is_refused() {
+        let watch = Shared { topic: "topic://t/n/x".into(), state: RefCell::default(), task: Cell::new(None) };
+        let off_ring = SegmentInfoProto { hash_end: 0x1_0000, state: SegmentState::ACTIVE, ..Default::default() };
+        let dag = ScalableTopicDAG { epoch: 1, segments: vec![off_ring], ..Default::default() };
+        let update = CommandScalableTopicUpdate { dag: dag.into(), ..Default::default() };
+        let command = BaseCommand {
+            r#type: Type::SCALABLE_TOPIC_UPDATE.into(),
+            scalableTopicUpdate: update.into(),
+            ..Default::default()
+        };
+        let mut bytes = bytes::BytesMut::new();
+        encode_command(&command, &mut bytes).unwrap();
+        let frame = FrameDecoder::default().decode(&mut bytes).unwrap().unwrap();
+        let error = apply(&watch, &watch.topic, &frame).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("outside the 16-bit ring"), "{error}");
+        assert!(watch.state.borrow().layout.is_none());
+    }
 }

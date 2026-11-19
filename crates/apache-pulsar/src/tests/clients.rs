@@ -102,8 +102,11 @@ fn clients_print_their_loops_and_connections() {
         futures_executor::block_on(PulsarClient::builder().service_url("pulsar://127.0.0.1:1").event_loops(2).build())
             .unwrap();
     assert!(format!("{client:?}").contains("event_loops: 2"));
-    // With nothing placed yet, the first loop is the least loaded.
-    assert_eq!(client.place(), 0);
+    // With nothing placed yet, the first loop is the least loaded; the slot counts on it until dropped.
+    let (slot, index) = client.place();
+    assert_eq!((index, client.loads()), (0, vec![1, 0]));
+    drop(slot);
+    assert_eq!(client.loads(), [0, 0]);
     futures_executor::block_on(client.close()).unwrap();
 }
 

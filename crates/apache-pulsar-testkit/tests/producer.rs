@@ -568,3 +568,19 @@ fn a_non_partitioned_legacy_topic_is_one_segment() {
     }
     assert_eq!(h.world.received(Type::PRODUCER)[0].producer.topic, topic);
 }
+
+/// With deduplication, a message whose sequence id the segment stored already is acknowledged as a duplicate, at
+/// -1:-1, and not stored again.
+#[test]
+fn a_duplicate_is_acknowledged_but_not_stored() {
+    let mut w = world(1);
+    w.dedup = true;
+    let mut h = Harness::new(w, TOPIC, options());
+    h.send(None, "first");
+    let again = OutgoingMessage { sequence_id: Some(0), payload: "again".into(), ..Default::default() };
+    let duplicate = h.producer.send(again, 0, h.clock.now()).unwrap();
+    h.pump();
+    let id = h.result(duplicate).unwrap().as_ref().unwrap();
+    assert_eq!((id.entry.ledger_id, id.entry.entry_id), (-1, -1));
+    assert_eq!(values_in(&h, 0), ["first"]);
+}

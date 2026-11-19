@@ -54,7 +54,14 @@ impl<T> Clone for Schema<T> {
 
 impl<T> std::fmt::Debug for Schema<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.info {
+        SchemaInfo::fmt_schema(self.info.as_ref(), f)
+    }
+}
+
+impl SchemaInfo {
+    /// A schema's `Debug`, the same for every value type.
+    fn fmt_schema(info: Option<&SchemaInfo>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match info {
             Some(info) => f.debug_struct("Schema").field("name", &info.name).field("type", &info.kind).finish(),
             None => f.write_str("Schema(bytes)"),
         }
@@ -110,6 +117,7 @@ mod tests {
         let bytes = Schema::bytes();
         assert_eq!(bytes.info(), None);
         assert_eq!(&bytes.encode(&vec![1, 2, 3]).unwrap()[..], [1, 2, 3]);
+        assert_eq!(bytes.decode(&[1, 2, 3]).unwrap(), [1, 2, 3]);
         let text = Schema::string();
         assert_eq!(text.info().unwrap().kind, Type::String);
         assert_eq!(text.decode(&text.encode(&"héllo".to_string()).unwrap()).unwrap(), "héllo");

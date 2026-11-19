@@ -192,11 +192,7 @@ impl World {
         c.input.extend_from_slice(bytes);
         loop {
             let Some(c) = self.conns.get_mut(&conn).filter(|c| c.open) else { return };
-            let frame = match c.decoder.decode(&mut c.input) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return,
-                Err(error) => panic!("the client sent a bad frame: {error}"),
-            };
+            let Some(frame) = c.decoder.decode(&mut c.input).expect("the client sent a bad frame") else { return };
             self.handle(conn, frame);
         }
     }
@@ -299,21 +295,18 @@ impl World {
             std::mem::take(&mut seg.producers)
         };
         for (conn, producer_id, _) in producers {
-            if let Some(c) = self.conns.get_mut(&conn) {
-                c.producers.remove(&producer_id);
-                c.closed_producers.insert(producer_id);
-            }
-            self.push(conn, close_producer(producer_id));
+            self.close_producer(conn, producer_id);
         }
     }
 
     /// Processes the sends held while [`World::hold_sends`] was set, in order.
     pub fn release_sends(&mut self) {
-        for (conn, frame) in std::mem::take(&mut self.held_sends) {
-            if self.is_open(conn) {
-                let command = BaseCommand::decode_from_slice(&frame.command).unwrap();
-                self.send(conn, &command, &frame);
-            }
+        // A connection that went took its sends with it.
+        let held: Vec<(ConnId, Frame)> =
+            std::mem::take(&mut self.held_sends).into_iter().filter(|(conn, _)| self.is_open(*conn)).collect();
+        for (conn, frame) in held {
+            let command = BaseCommand::decode_from_slice(&frame.command).unwrap();
+            self.send(conn, &command, &frame);
         }
     }
 
@@ -335,6 +328,25 @@ impl World {
         self.push_layout(topic);
     }
 
+    /// Pushes `error` to every watch of the topic, as a broker that can't serve them for now does. Their sessions
+    /// stay open.
+    pub fn fail_watchers(&mut self, topic: &str, error: ServerError) {
+        for (conn, session_id) in self.watchers(topic) {
+            let update = CommandScalableTopicUpdate {
+                session_id,
+                error: Some(error),
+                message: Some("try again later".into()),
+                ..Default::default()
+            };
+            let update = BaseCommand {
+                r#type: Type::SCALABLE_TOPIC_UPDATE.into(),
+                scalableTopicUpdate: update.into(),
+                ..Default::default()
+            };
+            self.push(conn, update);
+        }
+    }
+
     /// Sends the receipts held while [`World::hold_receipts`] was set.
     pub fn release_receipts(&mut self) {
         for (conn, receipt) in std::mem::take(&mut self.held) {
@@ -343,11 +355,24 @@ impl World {
     }
 
     fn topic(&self, topic: &str) -> &Topic {
-        self.topics.get(topic).unwrap_or_else(|| panic!("no topic {topic}"))
+        &self.topics[topic]
     }
 
     fn topic_mut(&mut self, topic: &str) -> &mut Topic {
-        self.topics.get_mut(topic).unwrap_or_else(|| panic!("no topic {topic}"))
+        self.topics.get_mut(topic).expect("no such topic")
+    }
+
+    /// A connection the world accepted: it knows each one for good.
+    fn conn(&mut self, conn: ConnId) -> &mut Conn {
+        self.conns.get_mut(&conn).expect("a connection the world accepted")
+    }
+
+    /// Closes a producer from the broker side: its later sends are ignored.
+    fn close_producer(&mut self, conn: ConnId, producer_id: u64) {
+        let c = self.conn(conn);
+        c.producers.remove(&producer_id);
+        c.closed_producers.insert(producer_id);
+        self.push(conn, close_producer(producer_id));
     }
 
     /// Seals `old` and adds segments over `ranges`, as children of all of `old`, in a new epoch.
@@ -392,15 +417,18 @@ impl World {
 
     fn push_layout(&mut self, topic: &str) {
         let dag = self.dag(topic);
-        let watchers: Vec<(ConnId, u64)> = self
-            .conns
+        for (conn, session_id) in self.watchers(topic) {
+            self.push(conn, layout_update(session_id, topic, dag.clone()));
+        }
+    }
+
+    /// The sessions watching `topic`, on the open connections.
+    fn watchers(&self, topic: &str) -> Vec<(ConnId, u64)> {
+        self.conns
             .iter()
             .filter(|(_, c)| c.open)
             .flat_map(|(id, c)| c.sessions.iter().filter(|(_, t)| *t == topic).map(move |(s, _)| (*id, *s)))
-            .collect();
-        for (conn, session_id) in watchers {
-            self.push(conn, layout_update(session_id, topic, dag.clone()));
-        }
+            .collect()
     }
 
     fn dag(&self, topic: &str) -> ScalableTopicDAG {
@@ -428,9 +456,9 @@ impl World {
     }
 
     fn push(&mut self, conn: ConnId, command: BaseCommand) {
-        if let Some(c) = self.conns.get_mut(&conn).filter(|c| c.open) {
-            encode_command(&command, &mut c.out).unwrap();
-        }
+        // A closed connection gets nothing more.
+        let Some(c) = self.conns.get_mut(&conn).filter(|c| c.open) else { return };
+        encode_command(&command, &mut c.out).unwrap();
     }
 
     fn handle(&mut self, conn: ConnId, frame: Frame) {
@@ -443,18 +471,14 @@ impl World {
                 self.push(conn, connected);
             }
             Type::PING => self.push(conn, reply::pong()),
-            Type::LOOKUP => {
-                if self.lookup != LookupAnswer::Silent {
-                    let answer = reply::lookup(command.lookupTopic.request_id, &self.lookup);
-                    self.push(conn, answer);
-                }
+            Type::LOOKUP if self.lookup != LookupAnswer::Silent => {
+                let answer = reply::lookup(command.lookupTopic.request_id, &self.lookup);
+                self.push(conn, answer);
             }
             Type::SCALABLE_TOPIC_LOOKUP if self.silent_lookups => {}
             Type::SCALABLE_TOPIC_LOOKUP => self.scalable_lookup(conn, &command),
             Type::SCALABLE_TOPIC_CLOSE => {
-                if let Some(c) = self.conns.get_mut(&conn) {
-                    c.sessions.remove(&command.scalableTopicClose.session_id);
-                }
+                self.conn(conn).sessions.remove(&command.scalableTopicClose.session_id);
             }
             Type::PRODUCER => self.producer(conn, &command),
             Type::SEND if self.hold_sends => self.held_sends.push((conn, frame)),
@@ -463,11 +487,10 @@ impl World {
                 // The broker answers once the producer's pending writes are done.
                 self.release_receipts();
                 let close = &command.close_producer;
-                let segment = self.conns.get_mut(&conn).and_then(|c| {
-                    c.closed_producers.insert(close.producer_id);
-                    c.producers.remove(&close.producer_id)
-                });
-                if let Some((topic, segment)) = segment {
+                let c = self.conn(conn);
+                c.closed_producers.insert(close.producer_id);
+                // One queued for exclusive access has no segment yet.
+                if let Some((topic, segment)) = c.producers.remove(&close.producer_id) {
                     self.remove_producer(conn, close.producer_id, &topic, segment);
                 }
                 // Closing a queued wait-for-exclusive producer cancels it.
@@ -506,9 +529,7 @@ impl World {
                 return;
             }
         }
-        if let Some(c) = self.conns.get_mut(&conn) {
-            c.sessions.insert(lookup.session_id, topic.clone());
-        }
+        self.conn(conn).sessions.insert(lookup.session_id, topic.clone());
         let update = layout_update(lookup.session_id, &topic, self.dag(&topic));
         self.push(conn, update);
     }
@@ -570,11 +591,7 @@ impl World {
                 let fenced = std::mem::take(&mut seg.producers);
                 seg.exclusive = false;
                 for (c, id, _) in fenced {
-                    if let Some(cs) = self.conns.get_mut(&c) {
-                        cs.producers.remove(&id);
-                        cs.closed_producers.insert(id);
-                    }
-                    self.push(c, close_producer(id));
+                    self.close_producer(c, id);
                 }
             }
             _ => {}
@@ -587,33 +604,27 @@ impl World {
         });
         seg.producers.push((conn, producer.producer_id, name.clone()));
         let last = if dedup { seg.last_sequence.get(&name).copied().unwrap_or(-1) } else { -1 };
-        if let Some(c) = self.conns.get_mut(&conn) {
-            c.producers.insert(producer.producer_id, (topic, segment));
-        }
+        self.conn(conn).producers.insert(producer.producer_id, (topic, segment));
         let mut success = producer_success(request_id, &name, last, true);
         success.producer_success.get_or_insert_default().topic_epoch = topic_epoch;
         self.push(conn, success);
     }
 
     fn remove_producer(&mut self, conn: ConnId, producer_id: u64, topic: &str, segment: u64) {
-        let Some(seg) = self.topics.get_mut(topic).and_then(|t| t.segments.get_mut(&segment)) else { return };
+        let seg = self.topics.get_mut(topic).unwrap().segments.get_mut(&segment).unwrap();
         seg.producers.retain(|(c, id, _)| (*c, *id) != (conn, producer_id));
-        if seg.producers.is_empty() {
-            seg.exclusive = false;
-            // The first wait-for-exclusive producer in line gets the topic.
-            if let Some((c, id, request_id, name)) = seg.waiting.pop_front() {
-                seg.exclusive = true;
-                seg.topic_epoch += 1;
-                let topic_epoch = seg.topic_epoch;
-                seg.producers.push((c, id, name.clone()));
-                if let Some(cs) = self.conns.get_mut(&c) {
-                    cs.producers.insert(id, (topic.to_string(), segment));
-                }
-                let mut success = producer_success(request_id, &name, -1, true);
-                success.producer_success.get_or_insert_default().topic_epoch = Some(topic_epoch);
-                self.push(c, success);
-            }
-        }
+        let alone = seg.producers.is_empty();
+        seg.exclusive &= !alone;
+        // The first wait-for-exclusive producer in line gets the topic, once nobody has it.
+        let Some((c, id, request_id, name)) = (if alone { seg.waiting.pop_front() } else { None }) else { return };
+        seg.exclusive = true;
+        seg.topic_epoch += 1;
+        let topic_epoch = seg.topic_epoch;
+        seg.producers.push((c, id, name.clone()));
+        self.conn(c).producers.insert(id, (topic.to_string(), segment));
+        let mut success = producer_success(request_id, &name, -1, true);
+        success.producer_success.get_or_insert_default().topic_epoch = Some(topic_epoch);
+        self.push(c, success);
     }
 
     fn send(&mut self, conn: ConnId, command: &BaseCommand, frame: &Frame) {

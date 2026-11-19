@@ -144,11 +144,25 @@ fn sentinels_and_order() {
     assert_eq!(sized, at(1, 1, 2, 0));
 }
 
+/// Older Java clients wrote ids without the trailing sections: the segment id and the position only.
+#[test]
+fn decodes_ids_without_the_trailing_sections() {
+    let id = MessageId::new(3, EntryId { ledger_id: 1, entry_id: 2, partition: -1, batch_index: -1, batch_size: 0 });
+    let position = id.entry.to_bytes();
+    let short = [&3i64.to_be_bytes()[..], &(position.len() as i32).to_be_bytes(), &position].concat();
+    let decoded = MessageId::from_bytes(&short).unwrap();
+    assert_eq!(decoded, id);
+    assert_eq!((decoded.positions.len(), decoded.parent_topic, decoded.topics), (0, None, None));
+}
+
 #[test]
 fn rejects_malformed_bytes() {
     assert_eq!(MessageId::from_bytes(&[0; 11]), Err(MessageIdError::Truncated));
     let mut bytes = MessageId::new(3, EntryId::EARLIEST).to_bytes();
     bytes[11] = 0xff; // the v4 length now runs past the end
+    assert_eq!(MessageId::from_bytes(&bytes), Err(MessageIdError::Length("position")));
+    let mut bytes = MessageId::new(3, EntryId::EARLIEST).to_bytes();
+    bytes[8] = 0xff; // a negative v4 length
     assert_eq!(MessageId::from_bytes(&bytes), Err(MessageIdError::Length("position")));
     let mut bytes = MessageId::new(3, EntryId::EARLIEST).to_bytes();
     bytes.truncate(bytes.len() - 2); // the cross-topic count is cut

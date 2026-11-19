@@ -187,12 +187,9 @@ impl<T: 'static> ProducerBuilder<T, ThreadSafe> {
         let topic = normalize_topic(self.settings.topic.as_deref())?;
         let (slot, index) = client.place();
         let options = self.options(client.operation_timeout());
-        let memory = client.memory().clone();
-        let job_memory = memory.clone();
-        let link = client
-            .run_on(index, move |local| Box::pin(async move { create_on(local, topic, options, job_memory).await }))
-            .await?;
-        Ok(Producer::from_link(link, self.schema, memory, self.settings, Some(slot)))
+        let link =
+            client.run_on(index, move |local| Box::pin(async move { create_on(local, topic, options).await })).await?;
+        Ok(Producer::from_link(link, self.schema, client.memory().clone(), self.settings, Some(slot)))
     }
 }
 
@@ -223,9 +220,8 @@ impl<T: 'static> ProducerBuilder<T, Local> {
         let ApiClient::Local(client) = &self.client else { unreachable!() };
         let topic = normalize_topic(self.settings.topic.as_deref())?;
         let options = self.options(client.operation_timeout());
-        let memory = client.memory().clone();
-        let link = create_on(client.clone(), topic, options, memory.clone()).await?;
-        Ok(Producer::from_link(link, self.schema, memory, self.settings, None))
+        let link = create_on(client.clone(), topic, options).await?;
+        Ok(Producer::from_link(link, self.schema, client.memory().clone(), self.settings, None))
     }
 }
 
@@ -238,21 +234,16 @@ pub(crate) struct Link {
 
 /// Creates a producer on `client`'s loop: opens the layout watch, starts the producer's task, and waits for it to
 /// be created.
-async fn create_on(
-    client: local::PulsarClient,
-    topic: String,
-    options: ProducerOptions,
-    memory: Arc<MemoryLimit>,
-) -> Result<Link> {
+async fn create_on(client: local::PulsarClient, topic: String, options: ProducerOptions) -> Result<Link> {
     let watch = client.watches().open(&client, &topic).await?;
     let machine = Machine::new(options, watch.current(), Instant::now());
     let resolved = machine.topic().to_string();
     let (requests, receiver) = mpsc::unbounded();
     let (created, is_created) = oneshot::channel();
     let last_sequence = Arc::new(AtomicI64::new(-1));
-    let task = Task::new(machine, client.clone(), watch, receiver, memory, last_sequence.clone(), created);
+    let task = Task::new(machine, client.clone(), watch, receiver, last_sequence.clone(), created);
     client.adopt(requests.clone(), task.run())?;
-    is_created.await.map_err(|_| Error::closed())??;
+    is_created.await.map_err(producer_closed)??;
     Ok(Link { requests, topic: resolved, last_sequence })
 }
 
@@ -279,6 +270,25 @@ impl Drop for Shared {
     fn drop(&mut self) {
         let _ = self.link.requests.unbounded_send(Request::Close { reply: None });
     }
+}
+
+impl Shared {
+    /// Queues a message on the producer's task, once it has room under the memory limit, and waits for it to be
+    /// stored.
+    async fn send(&self, message: OutgoingMessage) -> Result<MessageId> {
+        let room = message.payload.len() as u64 + PER_MESSAGE_OVERHEAD;
+        let room = self.memory.reserve(room, self.block_if_queue_full).await?;
+        let (reply, done) = oneshot::channel();
+        // A request the task never takes gives its room back as it drops.
+        let request = Request::Send { message, publish_time: now_millis(), room, reply };
+        self.link.requests.unbounded_send(request).map_err(producer_closed)?;
+        done.await.map_err(producer_closed)?
+    }
+}
+
+/// The error of an operation on a closed producer: its task is gone, or went before answering.
+fn producer_closed<E>(_: E) -> Error {
+    Error::new(ErrorKind::AlreadyClosed, "the producer is closed")
 }
 
 impl<T, Api> Clone for Producer<T, Api> {
@@ -342,8 +352,8 @@ impl<T: 'static, Api> Producer<T, Api> {
     /// Waits for every message sent before the call to be stored, and fails if one of them failed.
     pub async fn flush(&self) -> Result<()> {
         let (reply, done) = oneshot::channel();
-        self.shared.link.requests.unbounded_send(Request::Flush { reply }).map_err(|_| Error::closed())?;
-        done.await.map_err(|_| Error::closed())?
+        self.shared.link.requests.unbounded_send(Request::Flush { reply }).map_err(producer_closed)?;
+        done.await.map_err(producer_closed)?
     }
 
     /// Closes the producer: waits for the messages the brokers already have, fails those still waiting with
@@ -361,15 +371,7 @@ impl<T: 'static, Api> Producer<T, Api> {
     async fn dispatch(&self, value: Option<T>, mut message: OutgoingMessage) -> Result<MessageId> {
         let value = value.ok_or_else(|| Error::new(ErrorKind::InvalidConfiguration, "a message needs a value"))?;
         message.payload = self.schema.encode(&value)?;
-        let reserved = message.payload.len() as u64 + PER_MESSAGE_OVERHEAD;
-        self.shared.memory.reserve(reserved, self.shared.block_if_queue_full).await?;
-        let (reply, done) = oneshot::channel();
-        let request = Request::Send { message, publish_time: now_millis(), reserved, reply };
-        if self.shared.link.requests.unbounded_send(request).is_err() {
-            self.shared.memory.release(reserved);
-            return Err(Error::new(ErrorKind::AlreadyClosed, "the producer is closed"));
-        }
-        done.await.map_err(|_| Error::new(ErrorKind::AlreadyClosed, "the producer is closed"))?
+        self.shared.send(message).await
     }
 }
 

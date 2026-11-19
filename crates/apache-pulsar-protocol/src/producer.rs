@@ -249,8 +249,8 @@ pub struct Producer {
     sends: BTreeMap<SendId, Pending>,
     /// New sends held while segments retire, in call order.
     held: VecDeque<SendId>,
-    /// The retiring segments since the hold started, with the layout each was active in, or `None` when unknown.
-    hold_scopes: Vec<(u64, Option<Rc<Layout>>)>,
+    /// The retiring segments since the hold started, with the layout each was active in.
+    hold_scopes: Vec<(u64, Rc<Layout>)>,
     holding: bool,
     /// Segments whose producers must all register before `create` completes.
     awaiting_create: Vec<u64>,
@@ -546,16 +546,12 @@ impl Producer {
         let Some(s) = self.segments.get_mut(&segment) else { return };
         match s.link {
             Link::Closing { generation: g } if g == generation => self.on_producer_closed(segment, generation, now),
-            Link::Ready { generation: g, .. } | Link::Connecting { generation: g } if g == generation => {
+            // A registration in progress fails instead, and a segment the layout dropped is closing.
+            Link::Ready { generation: g, .. } if g == generation => {
                 for queued in &mut s.queue {
                     queued.sent = false;
                 }
-                if s.dropped {
-                    // The layout dropped it: nothing it had unacknowledged was stored after the close.
-                    self.retire_queue(segment, now);
-                } else {
-                    self.retry_later(segment, now);
-                }
+                self.retry_later(segment, now);
             }
             _ => {}
         }
@@ -612,12 +608,11 @@ impl Producer {
             s.retirement_check = None;
             let failed: Vec<SendId> = match s.link {
                 Link::Ready { generation, .. } => {
-                    // What was written waits for its receipt; what wasn't won't be written.
-                    let unsent = s.queue.iter().filter(|q| !q.sent).map(|q| q.send).collect();
-                    s.queue.retain(|q| q.sent);
+                    // Everything it has is written, and waits for its receipt or the close's answer.
+                    debug_assert!(s.queue.iter().all(|q| q.sent), "a ready segment writes what it queues");
                     s.link = Link::Closing { generation };
                     self.actions.push_back(Action::CloseProducer { segment: id, generation });
-                    unsent
+                    Vec::new()
                 }
                 // A registration still running is closed when it completes (`on_registered`).
                 Link::Connecting { .. } | Link::Closing { .. } => s.queue.drain(..).map(|q| q.send).collect(),
@@ -724,9 +719,7 @@ impl Producer {
                 message: format!("segment {segment} is gone"),
             };
             self.park(id, segment, error);
-            if !self.segments[&segment].retiring {
-                self.start_retiring(segment, now);
-            }
+            self.start_retiring(segment, now);
             return;
         }
         let deadline = send_timeout.filter(|_| s.registered_once).map(|timeout| now + timeout);
@@ -853,9 +846,7 @@ impl Producer {
         for send in queued {
             self.park(send, id, error.clone());
         }
-        if !self.segments[&id].retiring {
-            self.start_retiring(id, now);
-        }
+        self.start_retiring(id, now);
         self.release(now);
     }
 
@@ -867,7 +858,7 @@ impl Producer {
         let idle = s.queue.is_empty() && s.parked.is_empty() && !s.retiring;
         if !s.retiring && !idle {
             s.retiring = true;
-            self.hold_scopes.push((id, Some(old.clone())));
+            self.hold_scopes.push((id, old.clone()));
             self.holding = true;
         }
         let s = self.segments.get_mut(&id).unwrap();
@@ -875,8 +866,8 @@ impl Producer {
         match s.link {
             Link::Ready { generation, .. } => {
                 s.link = Link::Closing { generation };
+                // Everything it has is written: what the broker didn't store comes back with the close's answer.
                 self.actions.push_back(Action::CloseProducer { segment: id, generation });
-                self.retire_unsent(id, now);
             }
             Link::Connecting { .. } => self.retire_queue(id, now),
             Link::Idle { .. } => {
@@ -886,17 +877,6 @@ impl Producer {
             Link::Gone | Link::Closing { .. } | Link::Closed => {}
         }
         self.forget_if_done(id);
-    }
-
-    /// Parks the messages of a retiring segment that are not written on its registration.
-    fn retire_unsent(&mut self, id: u64, _now: Instant) {
-        let s = self.segments.get_mut(&id).unwrap();
-        let unsent: Vec<SendId> = s.queue.iter().filter(|q| !q.sent).map(|q| q.send).collect();
-        s.queue.retain(|q| q.sent);
-        let error = gone_error(id);
-        for send in unsent {
-            self.park(send, id, error.clone());
-        }
     }
 
     /// Parks every message left on a retiring segment.
@@ -922,26 +902,29 @@ impl Producer {
     }
 
     /// A segment is gone while the layout may still have it: hold the new sends of its keys, and check on it.
+    ///
+    /// A segment the layout no longer has holds nothing back: it was idle when the layout dropped it (or it would be
+    /// retiring already), so none of its keys has a message waiting on it.
     fn start_retiring(&mut self, id: u64, now: Instant) {
-        let layout = self.layout.is_active(id).then(|| self.layout.clone());
+        let active = self.layout.is_active(id);
         let s = self.segments.get_mut(&id).unwrap();
-        s.retiring = true;
-        if layout.is_some() {
-            s.retirement_check = Some((1, now + retirement_delay(1)));
+        if std::mem::replace(&mut s.retiring, true) || !active {
+            return;
         }
-        self.hold_scopes.push((id, layout));
+        s.retirement_check = Some((1, now + retirement_delay(1)));
+        self.hold_scopes.push((id, self.layout.clone()));
         self.holding = true;
     }
 
+    /// A check is due only for a segment retiring while the layout has it: a layout that drops it, or a close,
+    /// cancels the check.
     fn check_retirement(&mut self, id: u64, now: Instant) {
-        let still_active = self.layout.is_active(id);
         let s = self.segments.get_mut(&id).unwrap();
         let Some((check, _)) = s.retirement_check else { return };
-        if !s.retiring || !still_active {
-            s.retirement_check = None;
-            return;
-        }
-        if check < MAX_SEND_ATTEMPTS || s.queue.iter().any(|q| q.sent) {
+        debug_assert!(s.retiring, "a retirement check for a segment not retiring");
+        // A gone segment queues nothing: its messages are parked.
+        debug_assert!(s.queue.is_empty(), "a gone segment with queued messages");
+        if check < MAX_SEND_ATTEMPTS {
             s.retirement_check = Some((check + 1, now + retirement_delay(check + 1)));
             return;
         }
@@ -950,7 +933,8 @@ impl Producer {
         s.retiring = false;
         let expired: Vec<SendId> = std::mem::take(&mut s.parked);
         for send in expired {
-            let error = self.sends[&send].last_error.clone().unwrap_or_else(|| gone_error(id));
+            let error =
+                self.sends[&send].last_error.clone().expect("a message is parked with the error that parked it");
             self.fail(send, error);
         }
     }
@@ -977,10 +961,8 @@ impl Producer {
     fn is_held_key(&self, key: Option<&str>) -> bool {
         let Some(key) = key else { return false };
         let hash = KeyHash::of(key.as_bytes());
-        self.hold_scopes.iter().any(|(segment, layout)| match layout {
-            None => true,
-            Some(layout) => layout.route_key(hash).is_ok_and(|s| s == *segment) || layout.route_key(hash).is_err(),
-        })
+        // A key a layout can't route is held, rather than risk its order.
+        self.hold_scopes.iter().any(|(segment, layout)| !layout.route_key(hash).is_ok_and(|s| s != *segment))
     }
 
     /// Routes again the parked messages of the segments that have retired, in call order, then, once no segment is
@@ -1020,11 +1002,10 @@ impl Producer {
             }
             // Retired segments of a merge interleave: restore the call order.
             batch.sort_unstable();
+            // Parked and held sends are waiting, so they are all here.
             for send in batch {
-                if let Some(pending) = self.sends.get_mut(&send) {
-                    pending.place = Place::Nowhere;
-                    self.dispatch(send, true, now);
-                }
+                self.sends.get_mut(&send).expect("a waiting send").place = Place::Nowhere;
+                self.dispatch(send, true, now);
             }
         }
     }
@@ -1037,9 +1018,9 @@ impl Producer {
     // --- Completion ---
 
     fn finish(&mut self, send: SendId, result: Result<MessageId, SendError>) {
-        if self.sends.remove(&send).is_some() {
-            self.actions.push_back(Action::Done { send, result });
-        }
+        let finished = self.sends.remove(&send);
+        debug_assert!(finished.is_some(), "send {send} finished twice");
+        self.actions.push_back(Action::Done { send, result });
     }
 
     fn fail(&mut self, send: SendId, error: SendError) {
@@ -1137,428 +1118,4 @@ pub fn encode_message(
     payload.put_slice(&single.encode_to_vec());
     payload.put_slice(&message.payload);
     (metadata, payload.freeze())
-}
-
-#[cfg(test)]
-mod tests {
-    //! Edge paths of the state machine, driven by hand. The scenarios against a simulated cluster are in
-    //! `apache-pulsar-testkit`'s `tests/producer.rs`.
-
-    use super::*;
-    use crate::proto::{MessageIdData, ScalableTopicDAG, SegmentInfoProto, SegmentState};
-
-    const TOPIC: &str = "topic://t/n/x";
-
-    /// A layout: `(id, start, end, active)` per segment.
-    fn layout(epoch: u64, segments: &[(u64, u32, u32, bool)]) -> Rc<Layout> {
-        let segments = segments
-            .iter()
-            .map(|&(id, start, end, active)| SegmentInfoProto {
-                segment_id: id,
-                hash_start: start,
-                hash_end: end,
-                state: if active { SegmentState::ACTIVE } else { SegmentState::SEALED },
-                ..Default::default()
-            })
-            .collect();
-        Rc::new(Layout::from_dag(&ScalableTopicDAG { epoch, segments, ..Default::default() }, TOPIC).unwrap())
-    }
-
-    fn options(mode: ProducerAccessMode) -> ProducerOptions {
-        ProducerOptions {
-            name: Some("p".into()),
-            access_mode: mode,
-            send_timeout: None,
-            initial_sequence_id: None,
-            properties: Vec::new(),
-            schema: None,
-            operation_timeout: Duration::from_secs(30),
-        }
-    }
-
-    fn keyed(key: &str) -> OutgoingMessage {
-        OutgoingMessage { key: Some(key.into()), payload: Bytes::from_static(b"x"), ..Default::default() }
-    }
-
-    fn keyless() -> OutgoingMessage {
-        OutgoingMessage { payload: Bytes::from_static(b"x"), ..Default::default() }
-    }
-
-    /// A key routed to `[start, end]`.
-    fn key_in(start: u16, end: u16) -> String {
-        (0..)
-            .map(|i| format!("k{i}"))
-            .find(|k| (start..=end).contains(&KeyHash::of(k.as_bytes()).segment_hash()))
-            .unwrap()
-    }
-
-    struct Test {
-        producer: Producer,
-        now: Instant,
-    }
-
-    impl Test {
-        fn new(mode: ProducerAccessMode, layout: Rc<Layout>) -> Self {
-            let now = Instant::now();
-            Self { producer: Producer::new(options(mode), layout, now), now }
-        }
-
-        fn actions(&mut self) -> Vec<Action> {
-            std::iter::from_fn(|| self.producer.poll_action()).collect()
-        }
-
-        /// The `(segment, generation)` of each connect among `actions`.
-        fn connects(actions: &[Action]) -> Vec<(u64, u64)> {
-            actions
-                .iter()
-                .filter_map(|a| match a {
-                    Action::Connect { segment, generation, .. } => Some((*segment, *generation)),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn sent(actions: &[Action]) -> Vec<(u64, u64)> {
-            actions
-                .iter()
-                .filter_map(|a| match a {
-                    Action::Send { segment, command, .. } => Some((*segment, command.send.sequence_id)),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn done(actions: &[Action]) -> Vec<(SendId, Result<MessageId, SendError>)> {
-            actions
-                .iter()
-                .filter_map(|a| match a {
-                    Action::Done { send, result } => Some((*send, result.clone())),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn send(&mut self, message: OutgoingMessage) -> SendId {
-            self.producer.send(message, 0, self.now).unwrap()
-        }
-
-        fn register(&mut self, segment: u64, generation: u64, producer_id: u64) {
-            let success = CommandProducerSuccess { producer_name: format!("p-seg-{segment}"), ..Default::default() };
-            self.producer.on_registered(segment, generation, producer_id, &success, usize::MAX, self.now);
-        }
-
-        fn receipt(&mut self, segment: u64, generation: u64, sequence_id: u64, entry: Option<u64>) {
-            let receipt = CommandSendReceipt {
-                sequence_id,
-                message_id: entry.map(|e| MessageIdData { ledgerId: 1, entryId: e, ..Default::default() }).into(),
-                ..Default::default()
-            };
-            self.producer.on_receipt(segment, generation, &receipt, self.now);
-        }
-
-        fn send_error(&mut self, segment: u64, generation: u64, sequence_id: u64, error: ServerError) {
-            let error = CommandSendError { sequence_id, error, message: "refused".into(), ..Default::default() };
-            self.producer.on_send_error(segment, generation, &error, self.now);
-        }
-
-        fn advance(&mut self, by: Duration) {
-            self.now += by;
-            self.producer.handle_timeout(self.now);
-        }
-    }
-
-    fn one_segment() -> Rc<Layout> {
-        layout(1, &[(0, 0, 0xffff, true)])
-    }
-
-    #[test]
-    fn receipts_are_matched_against_the_head_of_the_queue() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        let first = t.send(keyless());
-        let actions = t.actions();
-        let [(0, generation)] = Test::connects(&actions)[..] else { panic!("{actions:?}") };
-        t.register(0, generation, 7);
-        let second = t.send(keyless());
-        assert_eq!(Test::sent(&t.actions()), [(0, 0), (0, 1)]);
-        // A receipt past the head: the two sides disagree, the connection is closed to start over.
-        t.receipt(0, generation, 5, Some(1));
-        assert_eq!(t.actions(), [Action::Disconnect { segment: 0, generation }]);
-        // The head's receipt completes it; one without a position completes as earliest.
-        t.receipt(0, generation, 0, Some(10));
-        t.receipt(0, generation, 1, None);
-        let done = Test::done(&t.actions());
-        assert_eq!(done.len(), 2);
-        assert_eq!(done[0].0, first);
-        assert_eq!(done[0].1.as_ref().unwrap().entry.entry_id, 10);
-        assert_eq!((done[1].0, done[1].1.as_ref().unwrap().entry), (second, EntryId::EARLIEST));
-        // A late receipt, behind the head, is dropped; so is one for another registration.
-        let third = t.send(keyless());
-        t.actions();
-        t.receipt(0, generation, 1, Some(11));
-        t.receipt(0, generation + 1, 2, Some(12));
-        assert!(t.actions().is_empty());
-        t.receipt(0, generation, 2, Some(12));
-        assert_eq!(Test::done(&t.actions())[0].0, third);
-        assert_eq!(t.producer.last_sequence_id(), 2);
-    }
-
-    #[test]
-    fn send_errors() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        let first = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        t.register(0, generation, 7);
-        let second = t.send(keyless());
-        t.actions();
-        // NotAllowed fails the head only, and only if it is the one meant.
-        t.send_error(0, generation, 1, ServerError::NotAllowedError);
-        assert!(t.actions().is_empty());
-        t.send_error(0, generation, 0, ServerError::NotAllowedError);
-        let done = Test::done(&t.actions());
-        assert_eq!(done.len(), 1);
-        assert!(
-            matches!(&done[0], (send, Err(SendError::Server { error: ServerError::NotAllowedError, .. })) if *send == first)
-        );
-        // Anything else but a terminated topic: register again and write everything again.
-        t.send_error(0, generation, 1, ServerError::ChecksumError);
-        assert_eq!(t.actions(), [Action::Disconnect { segment: 0, generation }]);
-        // For another registration: ignored.
-        t.send_error(0, generation + 1, 1, ServerError::TopicTerminatedError);
-        assert!(t.actions().is_empty());
-        // A terminated topic: the segment is gone, its messages wait for the next layout.
-        t.send_error(0, generation, 1, ServerError::TopicTerminatedError);
-        assert!(Test::done(&t.actions()).is_empty());
-        assert_eq!(t.producer.sends_parked_or_held(), 1);
-        assert!(t.producer.poll_timeout().is_some(), "a retirement check is due");
-        // The next layout moves it to the successor.
-        t.producer.on_layout(layout(2, &[(0, 0, 0xffff, false), (1, 0, 0xffff, true)]), t.now);
-        let actions = t.actions();
-        let [(1, next)] = Test::connects(&actions)[..] else { panic!("{actions:?}") };
-        t.register(1, next, 8);
-        assert_eq!(Test::sent(&t.actions()), [(1, 0)]);
-        t.receipt(1, next, 0, Some(1));
-        assert_eq!(Test::done(&t.actions())[0].0, second);
-    }
-
-    #[test]
-    fn registration_failures() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        let refused = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        // For another registration: ignored.
-        t.producer.on_register_failed(0, generation + 1, RegisterError::Unavailable("x".into()), t.now);
-        assert!(t.actions().is_empty());
-        // Refused for good: its messages fail, and the next send registers again.
-        let denied = RegisterError::Server { error: ServerError::AuthorizationError, message: "no".into() };
-        t.producer.on_register_failed(0, generation, denied, t.now);
-        let done = Test::done(&t.actions());
-        assert!(
-            matches!(&done[..], [(send, Err(SendError::Server { error: ServerError::AuthorizationError, .. }))] if *send == refused)
-        );
-        let retried = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        // Worth retrying, within the first registration's time: after a backoff.
-        let busy = RegisterError::Server { error: ServerError::ServiceNotReady, message: "later".into() };
-        t.producer.on_register_failed(0, generation, busy, t.now);
-        assert!(t.actions().is_empty());
-        t.advance(Duration::from_secs(1));
-        let generation = Test::connects(&t.actions())[0].1;
-        // Past it: the messages fail.
-        t.advance(Duration::from_secs(30));
-        t.producer.on_register_failed(0, generation, RegisterError::Unavailable("down".into()), t.now);
-        let done = Test::done(&t.actions());
-        assert!(matches!(&done[..], [(send, Err(SendError::Unavailable(_)))] if *send == retried));
-        let late = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        let busy = RegisterError::Server { error: ServerError::ServiceNotReady, message: "later".into() };
-        t.producer.on_register_failed(0, generation, busy, t.now);
-        let done = Test::done(&t.actions());
-        assert!(matches!(&done[..], [(send, Err(SendError::Unavailable(_)))] if *send == late));
-        // A terminated topic: gone, and the message waits.
-        let waits = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        let gone = RegisterError::Server { error: ServerError::TopicTerminatedError, message: "sealed".into() };
-        t.producer.on_register_failed(0, generation, gone, t.now);
-        assert!(Test::done(&t.actions()).is_empty());
-        assert_eq!(t.producer.outstanding(), 1);
-        assert_eq!(t.producer.oldest_outstanding(), Some(waits));
-    }
-
-    #[test]
-    fn a_message_is_parked_at_most_ten_times() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        let send = t.send(keyless());
-        let mut segment = 0;
-        for epoch in 2..=12 {
-            let generation = Test::connects(&t.actions()).last().copied().unwrap().1;
-            let gone = RegisterError::Server { error: ServerError::TopicTerminatedError, message: "sealed".into() };
-            t.producer.on_register_failed(segment, generation, gone, t.now);
-            if epoch == 12 {
-                break;
-            }
-            // Each time, a layout seals it and the message moves to the successor, which is gone too.
-            segment += 1;
-            let segments: Vec<_> =
-                (0..segment).map(|id| (id, 0, 0xffff, false)).chain([(segment, 0, 0xffff, true)]).collect();
-            t.producer.on_layout(layout(epoch, &segments), t.now);
-        }
-        let done = Test::done(&t.actions());
-        assert!(
-            matches!(&done[..], [(s, Err(SendError::Server { error: ServerError::TopicTerminatedError, .. }))] if *s == send),
-            "{done:?}"
-        );
-    }
-
-    #[test]
-    fn a_layout_drops_a_ready_segment_once_its_producer_is_closed() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        let send = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        t.register(0, generation, 7);
-        t.actions();
-        // Sealed with the message written and no receipt yet: close the producer, and wait for its answer.
-        t.producer.on_layout(layout(2, &[(0, 0, 0xffff, false), (1, 0, 0xffff, true)]), t.now);
-        assert_eq!(t.actions(), [Action::CloseProducer { segment: 0, generation }]);
-        // The answer: what wasn't stored goes to the successor.
-        t.producer.on_disconnected(0, generation, t.now);
-        let actions = t.actions();
-        let [(1, next)] = Test::connects(&actions)[..] else { panic!("{actions:?}") };
-        t.register(1, next, 8);
-        t.actions();
-        t.receipt(1, next, 0, Some(3));
-        let done = Test::done(&t.actions());
-        assert_eq!(done[0].0, send);
-        assert_eq!(done[0].1.as_ref().unwrap().segment_id, 1);
-    }
-
-    #[test]
-    fn a_dropped_segment_that_disconnects_parks_its_messages() {
-        let mut t =
-            Test::new(ProducerAccessMode::Shared, layout(1, &[(0, 0, 0x7fff, true), (1, 0x8000, 0xffff, true)]));
-        let key = key_in(0, 0x7fff);
-        let send = t.send(keyed(&key));
-        let generation = Test::connects(&t.actions())[0].1;
-        // Still registering when the layout drops it: its message moves at once.
-        t.producer
-            .on_layout(layout(2, &[(0, 0, 0x7fff, false), (1, 0x8000, 0xffff, true), (2, 0, 0x7fff, true)]), t.now);
-        let actions = t.actions();
-        assert_eq!(Test::connects(&actions).iter().map(|c| c.0).collect::<Vec<_>>(), [2]);
-        // The late registration is closed unused.
-        t.register(0, generation, 7);
-        assert_eq!(t.actions(), [Action::CloseProducer { segment: 0, generation }]);
-        t.producer.on_producer_closed(0, generation, t.now);
-        assert!(t.actions().is_empty());
-        assert_eq!(t.producer.oldest_outstanding(), Some(send));
-    }
-
-    #[test]
-    fn close_closes_registrations_that_complete_late() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        let send = t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        t.producer.close(t.now);
-        let actions = t.actions();
-        assert!(actions.contains(&Action::Closed), "a registration still running doesn't hold close up");
-        assert!(matches!(&Test::done(&actions)[..], [(s, Err(SendError::AlreadyClosed))] if *s == send));
-        t.register(0, generation, 7);
-        assert_eq!(t.actions(), [Action::CloseProducer { segment: 0, generation }]);
-        t.producer.on_producer_closed(0, generation, t.now);
-        assert!(t.actions().is_empty());
-        // Closing again does nothing.
-        t.producer.close(t.now);
-        assert!(t.actions().is_empty());
-    }
-
-    #[test]
-    fn close_while_creating_fails_create() {
-        let mut t = Test::new(ProducerAccessMode::Exclusive, one_segment());
-        t.actions();
-        t.producer.close(t.now);
-        let actions = t.actions();
-        assert!(actions.contains(&Action::Created(Err(SendError::AlreadyClosed))));
-        assert!(actions.contains(&Action::Closed));
-    }
-
-    #[test]
-    fn exclusive_producers_claim_new_segments_from_a_layout() {
-        let mut t = Test::new(ProducerAccessMode::Exclusive, one_segment());
-        let generation = Test::connects(&t.actions())[0].1;
-        t.register(0, generation, 7);
-        assert_eq!(t.actions(), [Action::Created(Ok(()))]);
-        t.producer
-            .on_layout(layout(2, &[(0, 0, 0xffff, false), (1, 0, 0x7fff, true), (2, 0x8000, 0xffff, true)]), t.now);
-        let actions = t.actions();
-        let mut claimed: Vec<u64> = Test::connects(&actions).iter().map(|c| c.0).collect();
-        claimed.sort();
-        assert_eq!(claimed, [1, 2]);
-        // A stale or equal layout changes nothing.
-        t.producer.on_layout(one_segment(), t.now);
-        assert!(t.actions().is_empty());
-    }
-
-    #[test]
-    fn an_idle_segment_reconnects_only_when_needed() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        t.register(0, generation, 7);
-        t.actions();
-        t.receipt(0, generation, 0, Some(1));
-        t.actions();
-        t.producer.on_disconnected(0, generation, t.now);
-        // Nothing to send when the backoff ends: no new registration until something is.
-        t.advance(Duration::from_secs(1));
-        assert!(Test::connects(&t.actions()).is_empty());
-        t.send(keyless());
-        assert_eq!(Test::connects(&t.actions()).len(), 1);
-    }
-
-    #[test]
-    fn a_key_no_segment_covers_fails_its_send() {
-        let mut t = Test::new(ProducerAccessMode::Shared, layout(1, &[(0, 0, 0x7fff, true)]));
-        let key = key_in(0x8000, 0xffff);
-        let send = t.send(keyed(&key));
-        let done = Test::done(&t.actions());
-        assert!(matches!(&done[..], [(s, Err(SendError::Routing(LayoutError::Uncovered(_))))] if *s == send));
-    }
-
-    #[test]
-    fn an_exclusive_create_follows_a_split_that_lands_meanwhile() {
-        let mut t = Test::new(ProducerAccessMode::Exclusive, one_segment());
-        let generation = Test::connects(&t.actions())[0].1;
-        // The segment splits before the claim is answered: create waits for its children instead.
-        t.producer
-            .on_layout(layout(2, &[(0, 0, 0xffff, false), (1, 0, 0x7fff, true), (2, 0x8000, 0xffff, true)]), t.now);
-        let actions = t.actions();
-        let children = Test::connects(&actions);
-        assert_eq!(children.iter().map(|c| c.0).collect::<Vec<_>>(), [1, 2]);
-        // The sealed segment's claim fails: it is gone, and doesn't fail the create.
-        let gone = RegisterError::Server { error: ServerError::TopicTerminatedError, message: "sealed".into() };
-        t.producer.on_register_failed(0, generation, gone, t.now);
-        assert!(t.actions().is_empty());
-        // The gone segment had left the layout already: a keyed send goes to its child, written once registered.
-        let send = t.send(keyed("k"));
-        t.register(1, children[0].1, 8);
-        assert!(t.actions().is_empty(), "still waiting for the other child");
-        t.register(2, children[1].1, 9);
-        let actions = t.actions();
-        assert!(actions.contains(&Action::Created(Ok(()))), "{actions:?}");
-        assert_eq!(Test::sent(&actions).len(), 1);
-        assert_eq!(t.producer.oldest_outstanding(), Some(send));
-    }
-
-    #[test]
-    fn a_retirement_check_ends_when_the_layout_moves_on() {
-        let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
-        t.send(keyless());
-        let generation = Test::connects(&t.actions())[0].1;
-        let gone = RegisterError::Server { error: ServerError::TopicTerminatedError, message: "sealed".into() };
-        t.producer.on_register_failed(0, generation, gone, t.now);
-        assert!(t.producer.poll_timeout().is_some());
-        // The layout drops the segment before the check is due: the message moves on, and the check is void.
-        t.producer.on_layout(layout(2, &[(0, 0, 0xffff, false), (1, 0, 0xffff, true)]), t.now);
-        assert_eq!(Test::connects(&t.actions()).iter().map(|c| c.0).collect::<Vec<_>>(), [1]);
-        t.advance(Duration::from_secs(1));
-        assert!(Test::done(&t.actions()).is_empty());
-    }
 }

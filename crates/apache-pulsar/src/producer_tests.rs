@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
+use apache_pulsar_protocol::hash::KeyHash;
 use apache_pulsar_protocol::lookup::HostPort;
 use apache_pulsar_protocol::proto::FeatureFlags;
 use apache_pulsar_protocol::proto::base_command::Type;
@@ -308,6 +309,17 @@ fn a_broker_without_scalable_topics_is_refused() {
         assert_eq!(error.kind(), ErrorKind::UnsupportedBroker, "{error}");
         // Nothing scalable was sent to it (C15).
         assert_eq!(server.received(Type::SCALABLE_TOPIC_LOOKUP), 0);
+        // Not even when asked to: the connection keeps the command, and stays up.
+        let address = client.lookup(TOPIC).await.unwrap();
+        let connection = client.connection(&address).await.unwrap();
+        let close = apache_pulsar_protocol::proto::BaseCommand {
+            r#type: Type::SCALABLE_TOPIC_CLOSE.into(),
+            ..Default::default()
+        };
+        connection.send(close).unwrap();
+        client.lookup(TOPIC).await.unwrap();
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_CLOSE), 0);
+        assert!(!connection.is_closed());
         client.close().await.unwrap();
     });
 }
@@ -778,10 +790,13 @@ fn a_send_after_close_fails() {
         let client = local_client(&server).await;
         let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
         producer.send("first".to_string()).await.unwrap();
+        let error = producer.new_message().key("k").send().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidConfiguration, "{error}");
         // Polled in that order: the close is queued before the send.
         let (closed, sent) = futures_util::join!(producer.close(), producer.send("late".to_string()));
         closed.unwrap();
         assert_eq!(sent.unwrap_err().kind(), ErrorKind::AlreadyClosed);
+        assert_eq!(producer.flush().await.unwrap_err().kind(), ErrorKind::AlreadyClosed);
         assert_eq!(client.memory().used(), 0);
         client.close().await.unwrap();
     });
@@ -918,4 +933,137 @@ fn the_blocking_api_has_the_whole_producer() {
     worker.join().unwrap();
     let stored = rt.block_on(async { server.world.borrow().stored(TOPIC) });
     assert_eq!(stored[0].metadata.replicate_to, ["here"]);
+}
+
+/// An exclusive-with-fencing producer takes the topic from the exclusive one holding it, which is fenced: its
+/// sends fail from then on.
+#[test]
+fn exclusive_with_fencing_takes_the_topic() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let exclusive = |mode| client.new_producer(Schema::string()).topic(TOPIC).access_mode(mode).create();
+        let fenced = exclusive(ProducerAccessMode::Exclusive).await.unwrap();
+        fenced.send("before".to_string()).await.unwrap();
+        let fencing = exclusive(ProducerAccessMode::ExclusiveWithFencing).await.unwrap();
+        fencing.send("mine now".to_string()).await.unwrap();
+        let error = fenced.send("too late".to_string()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ProducerFenced, "{error}");
+        assert_eq!(stored_by_key(&server)[""], ["before", "mine now"]);
+        client.close().await.unwrap();
+    });
+}
+
+/// A wait-for-exclusive producer still in line when its client closes fails to create, and leaves the broker's
+/// line: the producer the broker queued is closed.
+#[test]
+fn a_waiting_producer_leaves_the_line_when_its_client_closes() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let holder_client = local_client(&server).await;
+        let holder = holder_client
+            .new_producer(Schema::string())
+            .topic(TOPIC)
+            .access_mode(ProducerAccessMode::Exclusive)
+            .create()
+            .await
+            .unwrap();
+        let client = local_client(&server).await;
+        let waiting = {
+            let client = client.clone();
+            compio::runtime::spawn(async move {
+                let builder = client.new_producer(Schema::string()).topic(TOPIC);
+                builder.access_mode(ProducerAccessMode::WaitForExclusive).create().await
+            })
+        };
+        wait_until("the broker queues the waiting producer", || server.received(Type::PRODUCER) == 2).await;
+        client.close().await.unwrap();
+        assert_eq!(waiting.await.unwrap().unwrap_err().kind(), ErrorKind::AlreadyClosed);
+        assert_eq!(server.received(Type::CLOSE_PRODUCER), 1, "the queued producer is closed");
+        // Nobody is in line: the holder's topic goes to no one when it closes.
+        holder.close().await.unwrap();
+        assert_eq!(server.received(Type::PRODUCER), 2);
+        holder_client.close().await.unwrap();
+    });
+}
+
+/// A watch held while its client closes stops, rather than open its session again.
+#[test]
+fn a_held_watch_stops_with_its_client() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let watch = client.watches().open(&client, TOPIC).await.unwrap();
+        assert!(watch.is_running());
+        client.close().await.unwrap();
+        wait_until("the watch stops", || !watch.is_running()).await;
+    });
+}
+
+/// A watch whose connection breaks opens its session again, with backoff, through the lookups that fail
+/// meanwhile, and keeps its layout throughout.
+#[test]
+fn a_watch_reopens_its_session_through_failed_lookups() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let watch = client.watches().open(&client, TOPIC).await.unwrap();
+        let lookups = server.received(Type::LOOKUP);
+        let refused = LookupAnswer::Fail {
+            error: apache_pulsar_protocol::proto::ServerError::AuthorizationError,
+            message: "not now".into(),
+        };
+        let answer = server.with(|w| {
+            for conn in w.open_connections() {
+                w.kill(conn);
+            }
+            std::mem::replace(&mut w.lookup, refused)
+        });
+        wait_until("a lookup is refused", || server.received(Type::LOOKUP) > lookups).await;
+        assert_eq!(watch.current().epoch(), 0);
+        server.with(|w| w.lookup = answer);
+        wait_until("the session is open again", || server.received(Type::SCALABLE_TOPIC_LOOKUP) == 2).await;
+        assert!(watch.is_running());
+        client.close().await.unwrap();
+    });
+}
+
+/// A flush waits for the last send before it, even while the ones before that complete: here a message on a
+/// segment whose producer is registered already, while the next waits for its segment's producer.
+#[test]
+fn flush_outlasts_the_sends_that_complete_first() {
+    run(async {
+        let server = WorldServer::start(world(2)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        let key_in = |range: std::ops::RangeInclusive<u16>| {
+            (0..).map(|i| format!("k{i}")).find(|k| range.contains(&KeyHash::of(k.as_bytes()).segment_hash())).unwrap()
+        };
+        let (low, high) = (key_in(0..=0x7fff), key_in(0x8000..=0xffff));
+        producer.new_message().key(&low).value("warm".to_string()).send().await.unwrap();
+        let first = producer.new_message().key(&low).value("first".to_string()).send();
+        let last = producer.new_message().key(&high).value("last".to_string()).send();
+        let (first, last, flushed) = futures_util::join!(first, last, producer.flush());
+        first.unwrap();
+        last.unwrap();
+        flushed.unwrap();
+        assert_eq!(server.received(Type::PRODUCER), 2);
+        client.close().await.unwrap();
+    });
+}
+
+/// A broker-side error on a watch's session, after its first layout, passes: the session stays, and the next
+/// layout comes through it.
+#[test]
+fn a_watch_outlives_an_error_on_its_session() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let watch = client.watches().open(&client, TOPIC).await.unwrap();
+        server.with(|w| w.fail_watchers(TOPIC, apache_pulsar_protocol::proto::ServerError::ServiceNotReady));
+        server.with(|w| w.split(TOPIC, 0));
+        wait_until("the split's layout is applied", || watch.current().epoch() == 1).await;
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_LOOKUP), 1);
+        client.close().await.unwrap();
+    });
 }

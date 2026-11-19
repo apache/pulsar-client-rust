@@ -93,3 +93,25 @@ fn errors_print_their_kind_and_message_and_keep_their_source() {
     assert_eq!(error.source().unwrap().to_string(), "no CONNECTED within the handshake timeout");
     assert!(Error::new(ErrorKind::Other, "plain").source().is_none());
 }
+
+/// The broker's refusal in an error, which a producer's registration reports as such; anything else leaves the
+/// producer without a broker to ask, for now.
+#[test]
+fn the_brokers_refusal_is_found_in_an_error() {
+    use apache_pulsar_protocol::producer::RegisterError;
+
+    let refusal = |error| RequestError::Server { error, message: "no".into() };
+    let refused = Error::from(refusal(EnumValue::Known(ServerError::ProducerBusy)));
+    assert_eq!(refused.server_error(), Some((ServerError::ProducerBusy, "no".into())));
+    let lookup = LookupError::Server { error: EnumValue::Known(ServerError::TopicNotFound), message: "gone".into() };
+    assert_eq!(Error::from(lookup).server_error(), Some((ServerError::TopicNotFound, "gone".into())));
+    // A code this client doesn't know, a failure that isn't the broker's, and an error with no source.
+    assert_eq!(Error::from(refusal(EnumValue::Unknown(9999))).server_error(), None);
+    assert_eq!(Error::from(RequestError::Timeout).server_error(), None);
+    assert_eq!(Error::closed().server_error(), None);
+
+    let registration = RegisterError::from(refused);
+    assert!(matches!(registration, RegisterError::Server { error: ServerError::ProducerBusy, .. }), "{registration:?}");
+    let registration = RegisterError::from(Error::closed());
+    assert!(matches!(&registration, RegisterError::Unavailable(m) if m.contains("closed")), "{registration:?}");
+}
