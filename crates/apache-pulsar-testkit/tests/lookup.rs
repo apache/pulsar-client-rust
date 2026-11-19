@@ -17,10 +17,15 @@
 
 //! Lookups across redirects and proxies, against simulated brokers.
 
-use apache_pulsar_protocol::lookup::{BrokerAddress, Lookup, LookupError, MAX_LOOKUP_REDIRECTS, ServiceUrl};
-use apache_pulsar_protocol::proto::ServerError;
+use apache_pulsar_protocol::frame::{Frame, FrameDecoder};
+use apache_pulsar_protocol::lookup::{
+    BrokerAddress, HostPort, Lookup, LookupError, LookupStep, MAX_LOOKUP_REDIRECTS, ServiceUrl, parse_broker_url,
+};
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_testkit::{LookupAnswer, SimBroker, SimCluster, hp};
+use apache_pulsar_protocol::proto::command_lookup_topic_response::LookupType;
+use apache_pulsar_protocol::proto::{BaseCommand, CommandLookupTopicResponse, ServerError};
+use apache_pulsar_testkit::{LookupAnswer, SimBroker, SimCluster, frame, hp, reply};
+use bytes::{Bytes, BytesMut};
 
 const TOPIC: &str = "segment://t/n/x/0000-ffff-1";
 
@@ -100,4 +105,75 @@ fn service_urls() {
     assert!(ServiceUrl::parse("http://a:8080").is_err());
     assert!(ServiceUrl::parse("pulsar://a:x").is_err());
     assert!(ServiceUrl::parse("pulsar://").is_err());
+}
+
+fn as_frame(command: &BaseCommand) -> Frame {
+    FrameDecoder::default().decode(&mut BytesMut::from(&frame(command)[..])).unwrap().unwrap()
+}
+
+fn answer(response: CommandLookupTopicResponse) -> Frame {
+    as_frame(&BaseCommand {
+        r#type: Type::LOOKUP_RESPONSE.into(),
+        lookupTopicResponse: response.into(),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn a_lookup_tracks_its_topic_and_redirects() {
+    let mut lookup = Lookup::new(TOPIC, hp("svc:6650"), false);
+    assert_eq!(lookup.topic(), TOPIC);
+    assert_eq!(lookup.redirects(), 0);
+    let redirect = as_frame(&reply::lookup(0, &LookupAnswer::Redirect { broker: hp("b1:6650"), authoritative: false }));
+    assert_eq!(lookup.on_response(&redirect).unwrap(), LookupStep::Ask(BrokerAddress::direct(hp("b1:6650"))));
+    assert_eq!(lookup.redirects(), 1);
+    assert_eq!(lookup.target(), &BrokerAddress::direct(hp("b1:6650")));
+}
+
+#[test]
+fn answers_a_lookup_cannot_follow() {
+    let lookup = || Lookup::new(TOPIC, hp("svc:6650"), false);
+    // Not a lookup response, or not a command at all.
+    assert_eq!(lookup().on_response(&as_frame(&reply::success(0))), Err(LookupError::EmptyResponse));
+    let garbage = Frame { command: Bytes::from_static(&[0xff, 0xff]), payload: None };
+    assert!(matches!(lookup().on_response(&garbage), Err(LookupError::Decode(_))));
+    // Failed without saying why, or no answer type at all.
+    let failed = CommandLookupTopicResponse { response: Some(LookupType::Failed), ..Default::default() };
+    assert_eq!(lookup().on_response(&answer(failed)), Err(LookupError::EmptyResponse));
+    assert_eq!(lookup().on_response(&answer(CommandLookupTopicResponse::default())), Err(LookupError::EmptyResponse));
+
+    // A broker to connect to, without the URL the lookup needs, or with one that isn't a broker URL.
+    let connect = |plain: Option<&str>, tls: Option<&str>| {
+        answer(CommandLookupTopicResponse {
+            response: Some(LookupType::Connect),
+            brokerServiceUrl: plain.map(String::from),
+            brokerServiceUrlTls: tls.map(String::from),
+            ..Default::default()
+        })
+    };
+    let only_tls = connect(None, Some("pulsar+ssl://b:6651"));
+    assert_eq!(lookup().on_response(&only_tls), Err(LookupError::MissingUrl("plaintext")));
+    let mut tls = Lookup::new(TOPIC, hp("svc:6651"), true);
+    assert_eq!(tls.on_response(&connect(Some("pulsar://b:6650"), None)), Err(LookupError::MissingUrl("TLS")));
+    assert!(matches!(lookup().on_response(&connect(Some("http://b:8080"), None)), Err(LookupError::Url(_))));
+}
+
+#[test]
+fn malformed_urls() {
+    let reason = |url| ServiceUrl::parse(url).unwrap_err().reason;
+    assert_eq!(reason("pulsar://a:6650/path"), "a service URL has no path");
+    assert_eq!(reason("pulsar://[::1"), "bad host or port");
+    assert_eq!(reason("pulsar://[::1]:x"), "bad host or port");
+    assert_eq!(reason("pulsar://[::1]6650"), "bad host or port");
+    assert_eq!(reason("pulsar://:6650"), "bad host or port");
+    assert_eq!(parse_broker_url("pulsar://a:6650,b:6650").unwrap_err().reason, "expected a single host");
+    assert!(parse_broker_url("http://a:8080").is_err());
+}
+
+#[test]
+fn ipv6_hosts() {
+    let v6 = HostPort { host: "::1".into(), port: 6650 };
+    assert_eq!(ServiceUrl::parse("pulsar://[::1]").unwrap().hosts, vec![v6.clone()]);
+    assert_eq!(v6.to_string(), "[::1]:6650");
+    assert_eq!(parse_broker_url("pulsar://[::1]:6650").unwrap(), v6);
 }
