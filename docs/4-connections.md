@@ -21,6 +21,10 @@ connects to. They are the same unless the lookup answered `proxy_through_service
 client connects to the service URL and sets `CommandConnect.proxy_to_broker_url` to the logical address,
 which is how a Pulsar proxy knows where to forward.
 
+A Pulsar proxy answers lookups this way. So does a standalone broker whose advertised address is a loopback
+address (`TopicLookupBase.shouldRedirectThroughServiceUrl`): the client then connects to the service URL, and the
+broker ignores `proxy_to_broker_url`.
+
 The pool is keyed by (logical, physical), with one connection per key by default, as in the Java client
 (`connectionsPerBroker = 1`). The client never resolves or connects to a logical address it got this way, and
 TLS verifies the physical host.
@@ -82,6 +86,6 @@ and a provider call is async so that it can fetch a token.
 
 ## 7. Open questions
 
-1. **rustls crypto provider:** `aws-lc-rs` or `ring` by default.
+1. **rustls crypto provider:** `aws-lc-rs` or `ring` by default. Leaning: `ring`, which milestone 1 uses.
 2. **OAuth2 transport:** `cyper`, or a minimal HTTP/1.1 POST for the token endpoint only.
 3. **SNI-based proxy routing** (`proxyServiceUrl` with SNI in the Java client): needed early, or later?

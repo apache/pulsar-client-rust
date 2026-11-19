@@ -39,6 +39,10 @@ ignore = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # Unmaintained, no replacement yet; testcontainers (a dev-dependency, the integration tests) needs it.
+    { id = "RUSTSEC-2026-0440", reason = "dev-only, through testcontainers 0.28; revisit when it moves off" },
+]
 
 [bans]
 multiple-versions = "warn"

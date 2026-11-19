@@ -15,4 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Placeholder.
+//! Apache Pulsar client for scalable topics.
+//!
+//! Status: milestone 1. The client connects, authenticates and looks up topics; producers and consumers come
+//! next. See `DESIGN.md` and `PLAN.md` in the repository.
+
+// The connection layer is used by tests until producers and consumers use it (milestone 2).
+#![cfg_attr(not(test), allow(dead_code))]
+
+pub mod auth;
+mod client;
+mod config;
+mod conn;
+mod error;
+pub mod local;
+mod net;
+mod pool;
+
+pub use auth::{Authentication, TlsAuthentication, Token};
+pub use client::PulsarClient;
+pub use config::{ClientBuilder, Local, ThreadSafe};
+pub use error::{Error, ErrorKind, Result};
+
+#[cfg(test)]
+mod tests;

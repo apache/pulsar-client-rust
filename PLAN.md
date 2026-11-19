@@ -39,8 +39,8 @@ checks pass on all three setups, or the design is adjusted where they don't.
 - The per-loop pool keyed by logical and physical address; lookup with redirects and proxies; reconnection with
   backoff and coalescing ([4](docs/4-connections.md)).
 - The simulated broker's skeleton in `apache-pulsar-testkit`.
-- The local client, and the thread-safe client over N loops: placement, the hop, admission counters, close
-  ([2](docs/2-architecture.md) §4).
+- The local client, and the thread-safe client over N loops: the hop, close and drop
+  ([2](docs/2-architecture.md) §4). Placement and the admission counters need producers, so they moved to M2.
 
 **Checks:** lookups against the container, directly and through a Pulsar proxy. Disconnect and timeout scenarios
 pass on the simulated broker.
@@ -53,6 +53,8 @@ pass on the simulated broker.
 - The barrier that keeps per-key order across splits and merges.
 - Routing over a synthetic legacy layout, for `persistent://` topics.
 - MessageId encoding, errors, and the producer in the default, local and blocking APIs ([7](docs/7-api.md)).
+- Placement of producers on loops, and the admission counters for the queue and memory limits
+  ([2](docs/2-architecture.md) §4.1), moved here from M1.
 
 **Checks:** C1–C6 and the producer side of C12–C15. Ported scenarios from `ScalableTopicProducerTest`,
 `ScalableTopicProducerOrderingTest`, `V5ProducerSegmentGoneTest`, `V5ProducerLayoutChangeOrderingTest`,
