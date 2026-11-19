@@ -20,10 +20,12 @@
 //! This crate is an implementation detail of `apache-pulsar`. Its API is not stable: `apache-pulsar` depends
 //! on an exact version of it.
 
+pub mod backoff;
 pub mod connection;
 pub mod defaults;
 pub mod frame;
 pub mod hash;
+pub mod lookup;
 
 /// Generated from the vendored `PulsarApi.proto` by `cargo run -p xtask -- codegen`.
 ///

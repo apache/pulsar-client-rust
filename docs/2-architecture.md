@@ -131,8 +131,11 @@ A namespace consumer keeps all its per-topic consumers on its own loop.
 5. **Never drop a read or a write in flight.** Dropping a completed read loses the bytes it read. That happens
    under `compio::time::timeout`, whose select is random, on every driver, and on io_uring even under a select
    that polls the read first, because the kernel can finish the receive before the cancel. A dropped
-   `write_all` can leave half a frame on the wire. So each connection has one long-lived read loop and one
-   writer, neither ever wrapped in a timeout or a select. Keepalive and request deadlines are separate timers.
+   `write_all` can leave half a frame on the wire. So one task owns each connection's stream, and polls its
+   reads and writes from a single future through compio's poll-based adapters (`compat::AsyncStream`, and
+   `TlsStream`), which keep an operation and its buffer inside the stream between polls. A read stays parked
+   while frames go out, with no lock, and nothing is cancelled. Keepalive and request deadlines are the
+   connection state machine's own timers, polled from the same future (milestone 1, `conn.rs`).
 6. **Dropping a `JoinHandle` cancels its task**, unlike tokio, where it detaches it. An owner keeps the handle
    of each task it runs.
 7. **The driver choice is silent (proposed: make it explicit).** With compio's `polling` feature, Linux uses
@@ -151,8 +154,8 @@ with io_uring and with epoll (in Docker Desktop's VM, aarch64) and on macOS.
 ## 5. Open questions
 
 1. **Default number of loops.** The Java client defaults its I/O threads to the number of cores. Since each
-   loop has its own connection pool, a small default (1, or `min(cores, 4)`) seems better. To be decided
-   with benchmarks.
+   loop has its own connection pool, a small default (1, or `min(cores, 4)`) seems better. Leaning: 1, until
+   benchmarks say otherwise.
 2. **Placement.** Least loaded by count is simple, but it ignores throughput, and it opens a second watch
    for a topic already watched on another loop. Do we need more than that?
 3. **Task granularity on a loop.** One task per object is the starting point. Measure whether the per-segment
@@ -161,4 +164,4 @@ with io_uring and with epoll (in Docker Desktop's VM, aarch64) and on macOS.
    bare-metal and x86_64 Linux, older kernels, a stressed write-side cancel, wake latency under a busy loop, and
    channel choice inside a loop and across loops.
 5. **DNS resolver.** A shared bounded pool behind compio's resolution, or a resolver of our own with a timeout.
-   Decide with milestone 1.
+   Leaning, for now: compio's resolution, bounded by the connect timeout.

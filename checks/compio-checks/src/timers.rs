@@ -32,9 +32,13 @@ use compio::{
 use crate::{CheckResult, ensure, note, percentile, rt, summarize};
 
 const CONCURRENT: usize = 10_000;
-/// Overshoot bounds. Generous on purpose: this checks "sane", not "precise".
-const P99_BOUND: Duration = Duration::from_millis(20);
-const MAX_BOUND: Duration = Duration::from_millis(100);
+/// Overshoot bounds. Generous on purpose: this checks "sane", not "precise". The median catches a timer with a
+/// coarse tick; the maximum only catches one that is broken, since shared CI machines (macOS runners especially)
+/// stall a thread for tens of milliseconds now and then.
+const P50_BOUND: Duration = Duration::from_millis(5);
+const MAX_BOUND: Duration = Duration::from_millis(250);
+/// With 10,000 timers the 99th percentile is meaningful.
+const CONCURRENT_P99_BOUND: Duration = Duration::from_millis(50);
 
 pub fn run(cfg: &rt::Config) -> CheckResult {
     let rt = rt::build(cfg, "loop")?;
@@ -58,7 +62,7 @@ pub fn run(cfg: &rt::Config) -> CheckResult {
             }
             let s = summarize(&mut over);
             note(format!("sleep({d:?}) overshoot: {s}"));
-            ensure!(percentile(&over, 0.99) <= P99_BOUND, "sleep({d:?}) overshoot too high: {s}");
+            ensure!(percentile(&over, 0.5) <= P50_BOUND, "sleep({d:?}) overshoot too high: {s}");
             ensure!(*over.last().unwrap() <= MAX_BOUND, "sleep({d:?}) overshoot too high: {s}");
         }
 
@@ -123,7 +127,7 @@ pub fn run(cfg: &rt::Config) -> CheckResult {
         ensure!(lat.len() == CONCURRENT, "{} of {CONCURRENT} timers fired", lat.len());
         let s = summarize(&mut lat);
         note(format!("{CONCURRENT} concurrent timers over 1s: all fired, none early, lateness {s}, total {total:?}"));
-        ensure!(percentile(&lat, 0.99) <= P99_BOUND, "concurrent timers too late: {s}");
+        ensure!(percentile(&lat, 0.99) <= CONCURRENT_P99_BOUND, "concurrent timers too late: {s}");
         ensure!(*lat.last().unwrap() <= MAX_BOUND, "concurrent timers too late: {s}");
 
         Ok(())

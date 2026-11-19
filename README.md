@@ -23,16 +23,17 @@ A Rust client for [Apache Pulsar](https://pulsar.apache.org) scalable topics, bu
 [Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) on the
 [compio](https://github.com/compio-rs/compio) runtime.
 
-**Status:** milestone 0, foundations. Nothing here is usable as a client yet. The design is in
+**Status:** milestone 1. The client connects, authenticates (token, mTLS) and looks topics up, directly and
+through a proxy; producers and consumers come next. Nothing here is usable as a client yet. The design is in
 [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `crates/apache-pulsar` | The client. Empty for now. |
+| `crates/apache-pulsar` | The client: connections, the pool, lookup, authentication, TLS, the local and thread-safe clients. |
 | `crates/apache-pulsar-protocol` | The sans-IO protocol core: generated protobuf code, framing, the connection state machine, routing hashes. Internal; not a stable API. |
-| `crates/apache-pulsar-testkit` | Test support (the simulated broker, later). Not published. |
+| `crates/apache-pulsar-testkit` | The simulated broker, and the deterministic tests of the protocol state machines. Not published. |
 | `checks/` | Milestone 0 checks: compio behavior, and the handshake against a real broker. |
 | `tools/java-vectors` | Generates test vectors from the Java client. |
 | `xtask` | Repository tasks: protobuf code generation. |
@@ -59,6 +60,13 @@ docker run -d --rm --name pulsar -p 6650:6650 -p 8080:8080 apachepulsar/pulsar:5
 
 ```bash
 cargo run -p first-contact -- 127.0.0.1:6650
+```
+
+The integration tests start a broker and a proxy in Docker, with TLS, token and mTLS authentication, and remove
+them when they finish. `cargo test` skips them; they need Docker running:
+
+```bash
+cargo test -p apache-pulsar --test integration
 ```
 
 ## License

@@ -101,3 +101,11 @@ jobs:
           exit 1
       - name: CONNECT handshake, with scalable topics advertised
         run: cargo run -p first-contact -- 127.0.0.1:6650
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Integration tests, against a broker and a proxy that the harness starts in Docker
+        run: cargo test -p apache-pulsar --test integration

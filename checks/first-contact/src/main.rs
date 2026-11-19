@@ -24,7 +24,7 @@
 //! Exits with 0 if the broker answered `CONNECTED` and advertises `supports_scalable_topics`, 1 otherwise.
 
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apache_pulsar_protocol::connection::{ConnectOptions, Connection, Event};
 use compio::BufResult;
@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
 
 async fn handshake(address: &str) -> Result<(), String> {
     let mut stream = TcpStream::connect(address).await.map_err(|e| format!("connect: {e}"))?;
-    let mut connection = Connection::new(&ConnectOptions::default());
+    let mut connection = Connection::new(ConnectOptions::default(), Instant::now());
     let mut buf = Vec::with_capacity(64 * 1024);
     loop {
         while let Some(bytes) = connection.poll_transmit() {
@@ -71,6 +71,7 @@ async fn handshake(address: &str) -> Result<(), String> {
                     }
                 }
                 Event::Closed(error) => Err(error.to_string()),
+                other => Err(format!("unexpected event before CONNECTED: {other:?}")),
             };
         }
         buf.clear();
@@ -78,7 +79,7 @@ async fn handshake(address: &str) -> Result<(), String> {
         buf = returned;
         match result.map_err(|e| format!("read: {e}"))? {
             0 => return Err("the broker closed the connection".into()),
-            _ => connection.handle_input(&buf),
+            _ => connection.handle_input(&buf, Instant::now()),
         }
     }
 }

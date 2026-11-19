@@ -91,7 +91,8 @@ Init ──CONNECT──► AwaitConnected ──CONNECTED──► Ready ──
 - **Requests:** each connection allocates request ids and keeps a table of pending requests with deadlines.
   Responses (`CommandSuccess`, `CommandError`, `CommandProducerSuccess`, `CommandLookupTopicResponse`, and so on)
   complete them by request id.
-- **Pushed commands** reach the object registered for their id:
+- **Pushed commands** come out of the connection state machine as they are, and the layer above routes them to
+  the object registered for their id:
 
   | Id | Commands |
   |---|---|
@@ -122,7 +123,7 @@ connection to frame.
 - **Writing:** commands are encoded straight into the connection's write buffer, and many frames go out in one
   write. The buffer is handed to compio and comes back when the write completes, so a dropped future is memory-safe.
   It is not lossless: a dropped read can lose bytes it already read, and a dropped write can leave half a frame,
-  hence one read loop and one writer per connection ([2](2-architecture.md) §4.4, rule 5).
+  hence one task that owns each connection's stream ([2](2-architecture.md) §4.4, rule 5).
 
 ## 6. Compression codecs
 

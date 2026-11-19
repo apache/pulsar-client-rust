@@ -27,3 +27,8 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+apache-pulsar-protocol.workspace = true
+buffa.workspace = true
+bytes.workspace = true
