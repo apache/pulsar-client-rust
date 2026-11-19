@@ -88,6 +88,22 @@ impl Error {
     pub(crate) fn closed() -> Self {
         Self::new(ErrorKind::AlreadyClosed, "the client is closed")
     }
+
+    /// The broker's error code, when the broker refused the operation.
+    pub(crate) fn server_error(&self) -> Option<(ServerError, String)> {
+        let source = self.source.as_deref()?;
+        let (error, message) = if let Some(RequestError::Server { error, message }) = source.downcast_ref() {
+            (*error, message)
+        } else if let Some(LookupError::Server { error, message }) = source.downcast_ref() {
+            (*error, message)
+        } else {
+            return None;
+        };
+        match error {
+            EnumValue::Known(error) => Some((error, message.clone())),
+            EnumValue::Unknown(_) => None,
+        }
+    }
 }
 
 impl fmt::Debug for Error {

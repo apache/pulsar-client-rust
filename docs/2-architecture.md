@@ -90,9 +90,10 @@ The spec requires the client, producers and consumers to be safe to use from man
 - Its handle is `Send + Sync`. An operation travels to the loop over a channel and completes through a
   oneshot. The futures depend on no runtime, so any executor can await them. Payloads move to the loop;
   they aren't copied.
-- Admission is decided on the caller's side. The pending-message and memory limits are counters that the
-  handle reserves before the hop and the loop releases when the broker answers. So "queue full", or waiting
-  for room, is decided without a round trip. These counters are the only shared atomics on this path.
+- Admission is decided on the caller's side. The client's memory limit, the only bound on what producers hold
+  (as in Java V5), is a counter that the handle reserves before the hop and the loop releases when the send
+  completes. So "full", or waiting for room, is decided without a round trip. This counter is the only shared
+  atomic on this path.
 
 The price is one channel hop per operation between the caller's thread and the loop.
 
@@ -109,7 +110,7 @@ Pinning keeps almost everything on one loop. These are the exceptions, and how e
 
 | State | Handling |
 |---|---|
-| Client-wide memory limit | One shared counter in the thread-safe API, reserved at admission (§4.1). Each local client under it runs without a limit of its own. A local client used directly enforces its own limit, without atomics. |
+| Client-wide memory limit | One shared counter in the thread-safe API, reserved at admission (§4.1); its loops' local clients share it. A local client used directly has its own: the same code, with atomics that are never contended. |
 | Connections | Each loop has its own pool, so a client can open up to N connections to one broker. |
 | Layout watches | Each loop watches the topics its own producers and consumers use. Two loops using one topic both watch it. |
 | Transactions | A transaction is pinned to a loop like a producer, along with its coordinator handler. A producer or consumer on another loop registers its segment with the transaction through that loop before sending or acking in it. Only transactional operations pay for this. |
@@ -158,8 +159,9 @@ with io_uring and with epoll (in Docker Desktop's VM, aarch64) and on macOS.
    benchmarks say otherwise.
 2. **Placement.** Least loaded by count is simple, but it ignores throughput, and it opens a second watch
    for a topic already watched on another loop. Do we need more than that?
-3. **Task granularity on a loop.** One task per object is the starting point. Measure whether the per-segment
-   producer should share its scalable producer's task to save a local hop per message.
+3. **Task granularity on a loop.** One task per object is the starting point. A producer is one task that holds
+   all its per-segment producers, with one channel hop from the handle and one to the connection's task per
+   message (milestone 2). Measure whether those hops matter.
 4. **compio behavior, verified in milestone 0** ([Plan](../PLAN.md)): see §4.4, rules 5–8. Still unverified:
    bare-metal and x86_64 Linux, older kernels, a stressed write-side cancel, wake latency under a busy loop, and
    channel choice inside a loop and across loops.

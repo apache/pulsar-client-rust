@@ -30,7 +30,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
 use ring::rand::{SecureRandom, SystemRandom};
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
@@ -116,6 +116,37 @@ impl Env {
         self.dir.join("client.key.pem")
     }
 
+    /// Runs `pulsar-admin` in the broker container, as the admin, and returns what it printed.
+    pub fn admin(&self, args: &[&str]) -> String {
+        let mut command = vec!["bin/pulsar-admin", "--admin-url", "http://localhost:8080"];
+        command.extend(TOKEN_AUTH);
+        command.extend(args);
+        self.exec(&command)
+    }
+
+    /// Reads `count` messages of `topic` from the beginning with the Java client in the broker container (its V5
+    /// client for a `topic://` topic, a Queue consumer), as the admin, and returns them as it printed them.
+    pub fn consume(&self, topic: &str, count: usize) -> Vec<Consumed> {
+        let count = count.to_string();
+        let subscription = format!("it-{}", std::process::id());
+        let mut command = vec!["bin/pulsar-client", "--url", "pulsar://localhost:6650"];
+        command.extend(TOKEN_AUTH);
+        // `-mp` prints each message's id too.
+        command.extend(["consume", "-s", &subscription, "-p", "Earliest", "-mp", "-n", &count, topic]);
+        let output = self.exec(&command);
+        output.lines().filter_map(Consumed::parse).collect()
+    }
+
+    fn exec(&self, command: &[&str]) -> String {
+        let exec = ExecCommand::new(command.iter().copied()).with_cmd_ready_condition(CmdWaitFor::exit());
+        let mut result = self.broker.exec(exec).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+        let stdout = String::from_utf8_lossy(&result.stdout_to_vec().unwrap()).into_owned();
+        let stderr = String::from_utf8_lossy(&result.stderr_to_vec().unwrap()).into_owned();
+        let code = result.exit_code().unwrap();
+        assert_eq!(code, Some(0), "{command:?} failed:\n{stdout}\n{stderr}");
+        stdout
+    }
+
     /// Prints the last lines of both containers' logs, for a failed run.
     pub fn print_logs(&self) {
         for (name, container) in [(BROKER, &self.broker), (PROXY, &self.proxy)] {
@@ -127,6 +158,44 @@ impl Env {
                 eprintln!("{line}");
             }
         }
+    }
+}
+
+/// The Java CLIs' options to authenticate as the admin.
+const TOKEN_AUTH: [&str; 4] = [
+    "--auth-plugin",
+    "org.apache.pulsar.client.impl.auth.AuthenticationToken",
+    "--auth-params",
+    "file:///it/admin.token",
+];
+
+/// A message as `pulsar-client consume` printed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Consumed {
+    pub key: Option<String>,
+    pub value: String,
+    /// The position it was stored at: `(segment, ledger, entry)`, from the V5 message id.
+    pub position: Option<(u64, i64, i64)>,
+}
+
+impl Consumed {
+    /// Parses `…key:[k], properties:[…], content:v, message-id:MessageIdV5{segment=s, id=l:e:…}…`.
+    fn parse(line: &str) -> Option<Consumed> {
+        let key = line.split_once("key:[")?.1.split_once(']')?.0;
+        let content = line.split_once("content:")?.1;
+        // With `-mp`, the V5 client prints the message id next, and the v4 client the event time.
+        let end = [", message-id:", ", event-time:"].iter().filter_map(|field| content.find(field)).min();
+        let value = &content[..end.unwrap_or(content.len())];
+        let position = line.split_once("segment=").and_then(|(_, rest)| {
+            let (segment, rest) = rest.split_once(", id=")?;
+            let mut id = rest.split(':');
+            Some((segment.parse().ok()?, id.next()?.parse().ok()?, id.next()?.parse().ok()?))
+        });
+        Some(Consumed {
+            key: (key != "null" && !key.is_empty()).then(|| key.to_string()),
+            value: value.trim_end().to_string(),
+            position,
+        })
     }
 }
 

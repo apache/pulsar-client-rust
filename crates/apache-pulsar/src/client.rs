@@ -34,6 +34,9 @@ use futures_util::stream::FuturesUnordered;
 use crate::config::{ClientBuilder, ClientConfig, ThreadSafe};
 use crate::error::{Error, ErrorKind, Result};
 use crate::local;
+use crate::memory::MemoryLimit;
+use crate::producer::ProducerBuilder;
+use crate::schema::Schema;
 
 type Job = Box<dyn FnOnce(local::PulsarClient) -> LocalBoxFuture<'static, ()> + Send>;
 
@@ -49,6 +52,18 @@ struct Loop {
     load: AtomicUsize,
 }
 
+/// A producer's or consumer's place on a loop: it counts toward the loop's load until dropped.
+pub(crate) struct LoopSlot {
+    client: Arc<Inner>,
+    index: usize,
+}
+
+impl Drop for LoopSlot {
+    fn drop(&mut self) {
+        self.client.loops[self.index].load.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A Pulsar client. `Send + Sync`, and cheap to clone: clones are the same client.
 #[derive(Clone)]
 pub struct PulsarClient {
@@ -59,6 +74,8 @@ struct Inner {
     loops: Vec<Loop>,
     closed: AtomicBool,
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    memory: Arc<MemoryLimit>,
+    operation_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for PulsarClient {
@@ -95,11 +112,30 @@ impl PulsarClient {
         Ok(())
     }
 
-    /// The loop for a new producer or consumer: the least loaded.
-    #[allow(dead_code)]
-    pub(crate) fn place(&self) -> usize {
+    /// A producer, in the topic's layout, that publishes values with `schema`. See [`ProducerBuilder`].
+    pub fn new_producer<T: 'static>(&self, schema: Schema<T>) -> ProducerBuilder<T> {
+        ProducerBuilder::new(self.clone(), schema)
+    }
+
+    /// The loop for a new producer or consumer: the least loaded, by count. The slot counts it there until dropped.
+    pub(crate) fn place(&self) -> (LoopSlot, usize) {
         let loads = self.inner.loops.iter().map(|l| l.load.load(Ordering::Relaxed));
-        loads.enumerate().min_by_key(|(_, load)| *load).map(|(i, _)| i).unwrap_or(0)
+        let index = loads.enumerate().min_by_key(|(_, load)| *load).map(|(i, _)| i).unwrap_or(0);
+        self.inner.loops[index].load.fetch_add(1, Ordering::Relaxed);
+        (LoopSlot { client: self.inner.clone(), index }, index)
+    }
+
+    pub(crate) fn memory(&self) -> &Arc<MemoryLimit> {
+        &self.inner.memory
+    }
+
+    pub(crate) fn operation_timeout(&self) -> std::time::Duration {
+        self.inner.operation_timeout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loads(&self) -> Vec<usize> {
+        self.inner.loops.iter().map(|l| l.load.load(Ordering::Relaxed)).collect()
     }
 
     /// Runs `job` on loop `index`, with that loop's local client, and returns its result.
@@ -153,6 +189,7 @@ impl ClientBuilder<ThreadSafe> {
         let mut handles = Vec::with_capacity(loops);
         let mut threads = Vec::with_capacity(loops);
         let mut started = Vec::with_capacity(loops);
+        let config_for_client = config.clone();
         for index in 0..loops {
             let (sender, receiver) = mpsc::unbounded();
             let (ready, is_ready) = oneshot::channel();
@@ -166,7 +203,13 @@ impl ClientBuilder<ThreadSafe> {
             started.push(is_ready);
         }
         let client = PulsarClient {
-            inner: Arc::new(Inner { loops: handles, closed: AtomicBool::new(false), threads: Mutex::new(threads) }),
+            inner: Arc::new(Inner {
+                loops: handles,
+                closed: AtomicBool::new(false),
+                threads: Mutex::new(threads),
+                memory: config_for_client.memory.clone(),
+                operation_timeout: config_for_client.operation_timeout,
+            }),
         };
         for is_ready in started {
             if let Err(error) =

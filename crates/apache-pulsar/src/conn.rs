@@ -29,10 +29,12 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use apache_pulsar_protocol::connection::{BrokerInfo, ConnectOptions, Connection, ConnectionError, Event, State};
+use apache_pulsar_protocol::connection::{
+    BrokerInfo, ConnectOptions, Connection, ConnectionError, Event, IdKind, State, push_target,
+};
 use apache_pulsar_protocol::frame::Frame;
 use apache_pulsar_protocol::lookup::BrokerAddress;
-use apache_pulsar_protocol::proto::BaseCommand;
+use apache_pulsar_protocol::proto::{BaseCommand, MessageMetadata};
 use bytes::Bytes;
 use compio::runtime::JoinHandle;
 use futures_channel::{mpsc, oneshot};
@@ -47,13 +49,41 @@ type Build = Box<dyn FnOnce(u64) -> BaseCommand>;
 type Sleep = Pin<Box<dyn Future<Output = ()>>>;
 
 enum Command {
-    Request { build: Build, reply: oneshot::Sender<Result<Frame>> },
+    Request {
+        build: Build,
+        reply: oneshot::Sender<Result<Frame>>,
+    },
+    /// A command with no response, or a `CommandSend` with its metadata and payload. Boxed: a `BaseCommand` holds
+    /// every command inline.
+    Send {
+        command: Box<BaseCommand>,
+        payload: Option<(Box<MessageMetadata>, Bytes)>,
+    },
+    /// Allocates an id of `kind`, and routes the commands pushed for it to `sink`.
+    Register {
+        kind: IdKind,
+        sink: mpsc::UnboundedSender<Push>,
+        reply: oneshot::Sender<u64>,
+    },
+    Unregister {
+        kind: IdKind,
+        id: u64,
+    },
     Close,
+}
+
+/// What a connection delivers to a registered producer, consumer, session or watch.
+#[derive(Debug)]
+pub(crate) enum Push {
+    /// A command the broker pushed for it.
+    Command(Frame),
+    /// The connection closed. Nothing more comes; the owner re-establishes itself on a new connection.
+    Closed(Error),
 }
 
 /// A handle to a connection task. Cheap to clone; the task stops when the last handle is dropped.
 #[derive(Clone)]
-pub struct ConnHandle {
+pub(crate) struct ConnHandle {
     inner: Rc<Inner>,
 }
 
@@ -72,6 +102,7 @@ impl std::fmt::Debug for ConnHandle {
 }
 
 impl ConnHandle {
+    #[cfg(test)]
     pub fn address(&self) -> &BrokerAddress {
         &self.inner.address
     }
@@ -92,6 +123,42 @@ impl ConnHandle {
             .unbounded_send(Command::Request { build: Box::new(build), reply })
             .map_err(|_| not_connected())?;
         response.await.map_err(|_| not_connected())?
+    }
+
+    /// Allocates an id of `kind` on this connection, and returns it with the commands the broker pushes for it.
+    /// After the connection closes, the receiver gets [`Push::Closed`] and ends. Ids are per connection: an owner
+    /// that moves to another connection registers again there.
+    pub async fn register(&self, kind: IdKind) -> Result<(u64, mpsc::UnboundedReceiver<Push>)> {
+        let (sink, pushes) = mpsc::unbounded();
+        let (reply, id) = oneshot::channel();
+        self.inner.commands.unbounded_send(Command::Register { kind, sink, reply }).map_err(|_| not_connected())?;
+        let id = id.await.map_err(|_| not_connected())?;
+        Ok((id, pushes))
+    }
+
+    /// Stops routing the commands pushed for `id`. The id is not reused.
+    pub fn unregister(&self, kind: IdKind, id: u64) {
+        let _ = self.inner.commands.unbounded_send(Command::Unregister { kind, id });
+    }
+
+    /// Sends a command that has no response. It fails only if the connection is gone; a broker's later answer, if
+    /// any, comes as a [`Push`].
+    pub fn send(&self, command: BaseCommand) -> Result<()> {
+        let send = Command::Send { command: Box::new(command), payload: None };
+        self.inner.commands.unbounded_send(send).map_err(|_| not_connected())
+    }
+
+    /// Sends a `CommandSend` with its metadata and payload.
+    pub fn send_payload(
+        &self,
+        command: Box<BaseCommand>,
+        metadata: Box<MessageMetadata>,
+        payload: Bytes,
+    ) -> Result<()> {
+        self.inner
+            .commands
+            .unbounded_send(Command::Send { command, payload: Some((metadata, payload)) })
+            .map_err(|_| not_connected())
     }
 
     /// Closes the connection and waits for its task to end.
@@ -144,6 +211,7 @@ pub(crate) async fn open(address: BrokerAddress, config: &ClientConfig) -> Resul
         connection,
         inbox,
         waiters: HashMap::new(),
+        owners: HashMap::new(),
         outgoing: None,
         read_buf: vec![0; 64 * 1024],
         timer: None,
@@ -164,6 +232,8 @@ struct Driver {
     connection: Connection,
     inbox: mpsc::UnboundedReceiver<Command>,
     waiters: HashMap<u64, oneshot::Sender<Result<Frame>>>,
+    /// Where the commands pushed for each registered id go.
+    owners: HashMap<(IdKind, u64), mpsc::UnboundedSender<Push>>,
     /// Bytes taken from the connection but not all written yet.
     outgoing: Option<Bytes>,
     read_buf: Vec<u8>,
@@ -215,6 +285,25 @@ impl Driver {
                         let _ = reply.send(Err(error.into()));
                     }
                 },
+                Some(Command::Send { command, payload }) => {
+                    let result = match &payload {
+                        None => self.connection.send(&command),
+                        Some((metadata, payload)) => self.connection.send_payload(&command, metadata, payload),
+                    };
+                    // Nobody waits for the outcome: a refused command is a bug in the layer above, or a race with
+                    // the connection closing, which the owner learns from its pushes.
+                    if let Err(error) = result {
+                        tracing::warn!(address = %self.address.physical, %error, "command not sent");
+                    }
+                }
+                Some(Command::Register { kind, sink, reply }) => {
+                    let id = self.connection.allocate_id(kind);
+                    self.owners.insert((kind, id), sink);
+                    let _ = reply.send(id);
+                }
+                Some(Command::Unregister { kind, id }) => {
+                    self.owners.remove(&(kind, id));
+                }
                 // Closing locally; or every handle is gone.
                 Some(Command::Close) | None => {
                     self.connection.close(ConnectionError::Closed);
@@ -327,8 +416,14 @@ impl Driver {
                     }
                 }
                 Event::Command(frame) => {
-                    // Producers, consumers and watches register for these from milestone 2 on.
-                    tracing::trace!(address = %self.address.physical, len = frame.command.len(), "pushed command");
+                    let target = frame.command_view().ok().and_then(|command| push_target(&command));
+                    match target.and_then(|target| self.owners.get(&target)) {
+                        Some(owner) => {
+                            let _ = owner.unbounded_send(Push::Command(frame));
+                        }
+                        // For an owner that has gone, or a command with no owner: nothing to do.
+                        None => tracing::trace!(address = %self.address.physical, ?target, "pushed command dropped"),
+                    }
                 }
                 Event::AuthChallenge { refresh, challenge } => match &self.auth_provider {
                     Some(provider) => {
@@ -345,6 +440,9 @@ impl Driver {
                     }
                     for (_, waiter) in self.waiters.drain() {
                         let _ = waiter.send(Err(error.clone()));
+                    }
+                    for (_, owner) in self.owners.drain() {
+                        let _ = owner.unbounded_send(Push::Closed(error.clone()));
                     }
                     self.inbox.close();
                 }

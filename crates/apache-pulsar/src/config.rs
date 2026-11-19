@@ -28,6 +28,7 @@ use compio::rustls::{self, pki_types};
 
 use crate::auth::Authentication;
 use crate::error::{Error, ErrorKind, Result};
+use crate::memory::MemoryLimit;
 
 /// Marks a builder for the thread-safe client.
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +37,10 @@ pub enum ThreadSafe {}
 /// Marks a builder for the local client.
 #[derive(Debug, Clone, Copy)]
 pub enum Local {}
+
+/// Marks a builder for the blocking client.
+#[derive(Debug, Clone, Copy)]
+pub enum Blocking {}
 
 /// Builds a client. `PulsarClient::builder()` and `local::PulsarClient::builder()` both return one; the type
 /// parameter only decides which client `build` makes.
@@ -49,6 +54,7 @@ pub struct ClientBuilder<Api> {
     connect_timeout: Duration,
     operation_timeout: Duration,
     keepalive_interval: Duration,
+    memory_limit: u64,
     pub(crate) event_loops: usize,
     _api: PhantomData<Api>,
 }
@@ -75,6 +81,8 @@ impl<Api> Default for ClientBuilder<Api> {
             connect_timeout: Duration::from_secs(10),
             operation_timeout: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(30),
+            // Java's default.
+            memory_limit: 64 << 20,
             // Leaning: one loop until benchmarks say otherwise (docs/2-architecture.md §5).
             event_loops: 1,
             _api: PhantomData,
@@ -136,6 +144,32 @@ impl<Api> ClientBuilder<Api> {
         self
     }
 
+    /// How many bytes the client's producers may hold, waiting to be sent and stored: each message counts its
+    /// payload plus 1 KiB. 64 MiB by default; 0 for no limit. It is the only bound on what producers hold
+    /// (see [`crate::ProducerBuilder::block_if_queue_full`]).
+    pub fn memory_limit(mut self, bytes: u64) -> Self {
+        self.memory_limit = bytes;
+        self
+    }
+
+    /// The same settings, for another client model.
+    pub(crate) fn retype<Other>(self) -> ClientBuilder<Other> {
+        ClientBuilder {
+            service_url: self.service_url,
+            authentication: self.authentication,
+            tls_trust_certs_file: self.tls_trust_certs_file,
+            tls_trust_platform_roots: self.tls_trust_platform_roots,
+            allow_insecure_connection: self.allow_insecure_connection,
+            tls_hostname_verification: self.tls_hostname_verification,
+            connect_timeout: self.connect_timeout,
+            operation_timeout: self.operation_timeout,
+            keepalive_interval: self.keepalive_interval,
+            memory_limit: self.memory_limit,
+            event_loops: self.event_loops,
+            _api: PhantomData,
+        }
+    }
+
     pub(crate) fn into_config(self) -> Result<ClientConfig> {
         let url =
             self.service_url.ok_or_else(|| Error::new(ErrorKind::InvalidConfiguration, "a service URL is required"))?;
@@ -167,6 +201,7 @@ impl<Api> ClientBuilder<Api> {
             connect_timeout: self.connect_timeout,
             operation_timeout: self.operation_timeout,
             keepalive_interval: self.keepalive_interval,
+            memory: Arc::new(MemoryLimit::new(self.memory_limit)),
         })
     }
 }
@@ -188,6 +223,8 @@ pub(crate) struct ClientConfig {
     pub connect_timeout: Duration,
     pub operation_timeout: Duration,
     pub keepalive_interval: Duration,
+    /// Shared by every loop of a thread-safe client.
+    pub memory: Arc<MemoryLimit>,
 }
 
 impl fmt::Debug for ClientConfig {

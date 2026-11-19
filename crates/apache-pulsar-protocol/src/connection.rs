@@ -224,7 +224,8 @@ pub struct Connection {
     broker: Option<BrokerInfo>,
     handshake_deadline: Instant,
     next_request_id: u64,
-    pending: HashMap<u64, Instant>,
+    /// Each pending request's deadline; `None` for one that waits without one (see [`Connection::handle_input`]).
+    pending: HashMap<u64, Option<Instant>>,
     deadlines: BTreeSet<(Instant, u64)>,
     ids: HashMap<IdKind, u64>,
     next_keepalive: Option<Instant>,
@@ -290,7 +291,7 @@ impl Connection {
         self.check_feature(&command)?;
         self.next_request_id += 1;
         let deadline = now + self.options.operation_timeout;
-        self.pending.insert(request_id, deadline);
+        self.pending.insert(request_id, Some(deadline));
         self.deadlines.insert((deadline, request_id));
         self.write(&command);
         Ok(request_id)
@@ -538,7 +539,17 @@ impl Connection {
         if let Some(request_id) = response_request_id(&command) {
             // A response after its deadline, or to an unknown id, is dropped.
             if let Some(deadline) = self.pending.remove(&request_id) {
-                self.deadlines.remove(&(deadline, request_id));
+                if let Some(deadline) = deadline {
+                    self.deadlines.remove(&(deadline, request_id));
+                }
+                // A wait-for-exclusive producer is queued behind the current one: the broker answers "not ready"
+                // now, and again on the same request id once the producer gets the topic, which can take any time.
+                let queued = kind == EnumValue::Known(Type::PRODUCER_SUCCESS)
+                    && command.producer_success.as_option().is_some_and(|c| !c.producer_ready());
+                if queued {
+                    self.pending.insert(request_id, None);
+                    return Ok(());
+                }
                 let result = match command.error.as_option() {
                     Some(error) if kind == EnumValue::Known(Type::ERROR) => Err(RequestError::Server {
                         error: EnumValue::Known(error.error),
@@ -589,6 +600,39 @@ pub fn response_request_id(command: &BaseCommandView<'_>) -> Option<u64> {
         Type::WATCH_TOPIC_LIST_SUCCESS => id!(watchTopicListSuccess),
         Type::SCALABLE_TOPIC_SUBSCRIBE_RESPONSE => id!(scalableTopicSubscribeResponse),
         Type::ACK_RESPONSE => command.ackResponse.as_option().and_then(|c| c.request_id),
+        _ => None,
+    }
+}
+
+/// The producer, consumer, session or watch a pushed command is for: the owner the driver hands it to.
+pub fn push_target(command: &BaseCommandView<'_>) -> Option<(IdKind, u64)> {
+    use crate::proto::command_topic_migrated::ResourceType;
+    let EnumValue::Known(kind) = command.r#type else { return None };
+    macro_rules! id {
+        ($kind:expr, $field:ident . $id:ident) => {
+            command.$field.as_option().map(|c| ($kind, c.$id))
+        };
+    }
+    match kind {
+        Type::SEND_RECEIPT => id!(IdKind::Producer, send_receipt.producer_id),
+        Type::SEND_ERROR => id!(IdKind::Producer, send_error.producer_id),
+        Type::CLOSE_PRODUCER => id!(IdKind::Producer, close_producer.producer_id),
+        Type::MESSAGE => id!(IdKind::Consumer, message.consumer_id),
+        Type::ACTIVE_CONSUMER_CHANGE => id!(IdKind::Consumer, active_consumer_change.consumer_id),
+        Type::REACHED_END_OF_TOPIC => id!(IdKind::Consumer, reachedEndOfTopic.consumer_id),
+        Type::CLOSE_CONSUMER => id!(IdKind::Consumer, close_consumer.consumer_id),
+        Type::SCALABLE_TOPIC_ASSIGNMENT_UPDATE => id!(IdKind::Consumer, scalableTopicAssignmentUpdate.consumer_id),
+        Type::SCALABLE_TOPIC_UPDATE => id!(IdKind::Session, scalableTopicUpdate.session_id),
+        Type::WATCH_SCALABLE_TOPICS_UPDATE => id!(IdKind::Watch, watchScalableTopicsUpdate.watch_id),
+        Type::WATCH_TC_ASSIGNMENTS_UPDATE => id!(IdKind::Watch, watchTcAssignmentsUpdate.watch_id),
+        Type::WATCH_TOPIC_UPDATE => id!(IdKind::Watch, watchTopicUpdate.watcher_id),
+        Type::TOPIC_MIGRATED => command.topicMigrated.as_option().map(|c| {
+            let kind = match c.resource_type {
+                ResourceType::Consumer => IdKind::Consumer,
+                ResourceType::Producer => IdKind::Producer,
+            };
+            (kind, c.resource_id)
+        }),
         _ => None,
     }
 }

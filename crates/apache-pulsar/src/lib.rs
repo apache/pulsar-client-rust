@@ -17,25 +17,34 @@
 
 //! Apache Pulsar client for scalable topics.
 //!
-//! Status: milestone 1. The client connects, authenticates and looks up topics; producers and consumers come
-//! next. See `DESIGN.md` and `PLAN.md` in the repository.
-
-// The connection layer is used by tests until producers and consumers use it (milestone 2).
-#![cfg_attr(not(test), allow(dead_code))]
+//! Status: milestone 2. Producers publish to scalable topics, and to regular topics through the migration bridge,
+//! in the thread-safe ([`PulsarClient`]), [`local`] and [`blocking`] APIs; consumers come next. See `DESIGN.md`
+//! and `PLAN.md` in the repository.
 
 pub mod auth;
+pub mod blocking;
 mod client;
 mod config;
 mod conn;
 mod error;
 pub mod local;
+mod memory;
+mod message_id;
 mod net;
 mod pool;
+mod producer;
+mod schema;
+mod watch;
 
 pub use auth::{Authentication, TlsAuthentication, Token};
 pub use client::PulsarClient;
-pub use config::{ClientBuilder, Local, ThreadSafe};
+pub use config::{Blocking, ClientBuilder, Local, ThreadSafe};
 pub use error::{Error, ErrorKind, Result};
+pub use message_id::MessageId;
+pub use producer::{MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder};
+pub use schema::Schema;
 
+#[cfg(test)]
+mod producer_tests;
 #[cfg(test)]
 mod tests;
