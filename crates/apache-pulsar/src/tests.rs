@@ -44,6 +44,8 @@ use crate::error::ErrorKind;
 use crate::{PulsarClient, Token, local};
 
 mod driver;
+mod errors;
+mod options;
 
 /// How the server treats one accepted connection.
 struct Behavior {
