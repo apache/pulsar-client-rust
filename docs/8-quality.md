@@ -70,6 +70,10 @@ a layout change. It is written so that it could later grow into a suite every SD
 - `rustfmt`, `clippy` (with `await_holding_refcell_ref` denied), docs, and the minimum Rust version.
 - `cargo-deny` for licenses (ASF third-party policy) and advisories.
 - Integration tests against the broker container.
+- Test coverage, measured with `cargo llvm-cov` on a pinned compiler, without the generated protobuf code. The
+  job lists the lines and regions no test runs, such as the error branch of a `?`, and fails a pull request whose
+  line coverage is below its base's. A drop needs a test for what the change added, or a reason in the pull
+  request for leaving the line unreached.
 
 ## 5. Releases
 
