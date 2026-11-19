@@ -137,3 +137,56 @@ fn jobs_run_on_their_loop_until_the_client_closes() {
     stop_tx.send(()).unwrap();
     broker.join().unwrap();
 }
+
+/// Builds a thread-safe client with two event loops, started by `starter`, and returns why it failed.
+fn build_failure(starter: crate::client::LoopStarter) -> crate::Error {
+    let builder = PulsarClient::builder().service_url("pulsar://127.0.0.1:1").event_loops(2);
+    match futures_executor::block_on(builder.build_with(starter)) {
+        Ok(_) => panic!("the client started"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn a_loop_thread_that_cannot_be_spawned_fails_the_build() {
+    use crate::client::LoopStarter;
+    let starter = LoopStarter {
+        // The first loop starts; the second one's thread can't be spawned.
+        spawn: |name, run| {
+            if name.ends_with("-1") {
+                Err(std::io::Error::other("no more threads"))
+            } else {
+                (LoopStarter::SYSTEM.spawn)(name, run)
+            }
+        },
+        ..LoopStarter::SYSTEM
+    };
+    let error = build_failure(starter);
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert!(error.to_string().contains("can't start an event loop thread"), "{error}");
+}
+
+#[test]
+fn a_loop_without_a_runtime_fails_the_build() {
+    use crate::client::LoopStarter;
+    let starter = LoopStarter { runtime: || Err(std::io::Error::other("no I/O driver")), ..LoopStarter::SYSTEM };
+    let error = build_failure(starter);
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert!(error.to_string().contains("can't start an event loop"), "{error}");
+    assert!(std::error::Error::source(&error).unwrap().to_string().contains("no I/O driver"));
+}
+
+#[test]
+fn a_loop_thread_that_exits_without_answering_fails_the_build() {
+    use crate::client::LoopStarter;
+    let starter = LoopStarter {
+        spawn: |name, run| {
+            drop(run);
+            std::thread::Builder::new().name(name).spawn(|| {})
+        },
+        ..LoopStarter::SYSTEM
+    };
+    let error = build_failure(starter);
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert!(error.to_string().contains("an event loop failed to start"), "{error}");
+}
