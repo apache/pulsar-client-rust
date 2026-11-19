@@ -174,43 +174,54 @@ fn a_java_consumer_reads_what_was_produced(env: &Env) {
 
 /// Java's `V5ProducerLayoutChangeOrderingTest`, against the real broker: a split while sends are in flight, and
 /// every key's messages stored in send order, the parent's before the children's.
+///
+/// The producer keeps going until the split has completed, and some more, however long `pulsar-admin` takes.
 fn keys_keep_their_order_across_a_split(env: &Env) {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let name = unique("split");
     let topic = format!("topic://public/default/{name}");
     let keys: Vec<String> = (0..16).map(|i| format!("k{i}")).collect();
-    let rounds = 60;
-    let split = std::thread::scope(|scope| {
+    let split_done = AtomicBool::new(false);
+    let rounds = std::thread::scope(|scope| {
         let (started, split_now) = std::sync::mpsc::channel();
-        let admin = scope.spawn(move || {
+        let split_done = &split_done;
+        scope.spawn(move || {
             // Split once the first sends are in; the producer keeps sending meanwhile.
             split_now.recv().unwrap();
-            env.admin(&["scalable-topics", "split-segment", "-s", "0", &format!("public/default/{name}")])
+            env.admin(&["scalable-topics", "split-segment", "-s", "0", &format!("public/default/{name}")]);
+            split_done.store(true, Ordering::Release);
         });
         run(async {
             let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
             let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
             let mut sends = FuturesOrdered::new();
-            for round in 0..rounds {
+            let (mut round, mut after_split) = (0, 0);
+            // Twenty rounds after the split, or a bound that only a stuck split reaches.
+            while after_split < 20 && round < 3000 {
                 if round == 5 {
                     started.send(()).unwrap();
                 }
                 for key in &keys {
-                    sends.push_back(producer.new_message().key(key.clone()).value(format!("{key}-{round:03}")).send());
+                    sends.push_back(producer.new_message().key(key.clone()).value(format!("{key}-{round:04}")).send());
                 }
-                // Keep about two rounds in flight, and pace the rounds so the split lands mid-stream.
+                // Keep about two rounds in flight.
                 while sends.len() > 2 * keys.len() {
                     sends.next().await.unwrap().unwrap();
                 }
-                compio::time::sleep(Duration::from_millis(50)).await;
+                if split_done.load(Ordering::Acquire) {
+                    after_split += 1;
+                }
+                round += 1;
+                compio::time::sleep(Duration::from_millis(20)).await;
             }
             while let Some(result) = sends.next().await {
                 result.unwrap();
             }
             client.close().await.unwrap();
-        });
-        admin.join().unwrap()
+            assert!(split_done.load(Ordering::Acquire), "the split did not complete");
+            round
+        })
     });
-    let _ = split;
     let consumed = env.consume(&topic, keys.len() * rounds);
     // Children have higher segment ids than their parent: segment, then position, is the order stored.
     let mut by_key: BTreeMap<String, Vec<((u64, i64, i64), String)>> = BTreeMap::new();
@@ -223,7 +234,7 @@ fn keys_keep_their_order_across_a_split(env: &Env) {
     for (key, mut messages) in by_key {
         messages.sort();
         let values: Vec<String> = messages.into_iter().map(|(_, value)| value).collect();
-        let expected: Vec<String> = (0..rounds).map(|round| format!("{key}-{round:03}")).collect();
+        let expected: Vec<String> = (0..rounds).map(|round| format!("{key}-{round:04}")).collect();
         assert_eq!(values, expected, "key {key}");
     }
 }

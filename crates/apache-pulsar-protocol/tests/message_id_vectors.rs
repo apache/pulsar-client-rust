@@ -154,3 +154,53 @@ fn rejects_malformed_bytes() {
     bytes.truncate(bytes.len() - 2); // the cross-topic count is cut
     assert_eq!(MessageId::from_bytes(&bytes), Err(MessageIdError::Truncated));
 }
+
+#[test]
+fn ids_hash_and_order_as_they_compare() {
+    use std::collections::{BTreeSet, HashSet};
+    let entry = |batch_index, batch_size| EntryId { ledger_id: 1, entry_id: 2, partition: -1, batch_index, batch_size };
+    // The batch size is carried, not compared: the same entry in a set once.
+    let entries: HashSet<EntryId> = [entry(0, 1), entry(0, 5), entry(1, 5)].into_iter().collect();
+    assert_eq!(entries.len(), 2);
+    let ordered: BTreeSet<EntryId> = [entry(1, 5), entry(-1, 0), entry(0, 1)].into_iter().collect();
+    assert_eq!(ordered.iter().map(|e| e.batch_index).collect::<Vec<_>>(), [-1, 0, 1]);
+    assert!(entry(0, 1).partial_cmp(&entry(1, 1)).unwrap().is_lt());
+    let ids: HashSet<MessageId> =
+        [MessageId::new(1, entry(0, 1)), MessageId::new(1, entry(0, 9)), MessageId::new(2, entry(0, 1))]
+            .into_iter()
+            .collect();
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn rejects_malformed_trailing_sections() {
+    let mut base = MessageId::new(3, EntryId::EARLIEST);
+    base.parent_topic = Some("topic://t/n/x".into());
+    let bytes = base.to_bytes();
+    // A parent topic that isn't UTF-8.
+    let topic_at = bytes.len() - 4 - "topic://t/n/x".len();
+    let mut bad = bytes.clone();
+    bad[topic_at] = 0xff;
+    assert_eq!(MessageId::from_bytes(&bad), Err(MessageIdError::Utf8));
+    // A cross-topic vector with a negative topic length.
+    let mut with_topics = base.clone();
+    with_topics.topics = Some([("topic://t/n/y".to_string(), SegmentVector::new())].into_iter().collect());
+    let mut bad = with_topics.to_bytes();
+    let count_at = bytes.len() - 4;
+    bad[count_at + 4..count_at + 8].copy_from_slice(&(-5i32).to_be_bytes());
+    assert_eq!(MessageId::from_bytes(&bad), Err(MessageIdError::Length("topic")));
+    // A position vector whose entry runs past the end.
+    let mut with_positions = MessageId::new(3, EntryId::EARLIEST);
+    with_positions.positions.insert(4, EntryId::LATEST);
+    let mut bad = with_positions.to_bytes();
+    let entry_length_at = 12 + EntryId::EARLIEST.to_bytes().len() + 4 + 8;
+    bad[entry_length_at..entry_length_at + 4].copy_from_slice(&1000i32.to_be_bytes());
+    assert_eq!(MessageId::from_bytes(&bad), Err(MessageIdError::Length("position")));
+    // A position that isn't a MessageIdData.
+    let mut bad = MessageId::new(3, EntryId::EARLIEST).to_bytes();
+    bad.truncate(12);
+    bad[8..12].copy_from_slice(&0i32.to_be_bytes());
+    bad.extend_from_slice(&[0, 0, 0, 0]);
+    assert!(MessageId::from_bytes(&bad).is_ok(), "an empty position decodes with defaults");
+    assert!(matches!(EntryId::from_bytes(&[0xff, 0xff]), Err(MessageIdError::Protobuf(_))));
+}

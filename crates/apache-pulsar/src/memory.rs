@@ -176,6 +176,8 @@ mod tests {
         assert_eq!(limit.used(), 0);
         let unlimited = MemoryLimit::new(0);
         assert!(unlimited.reserve(u64::MAX / 2, false).now_or_never().unwrap().is_ok());
+        unlimited.release(u64::MAX / 2);
+        assert_eq!(unlimited.used(), 0);
     }
 
     #[test]

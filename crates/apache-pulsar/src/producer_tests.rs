@@ -694,3 +694,228 @@ fn sends_wait_for_room_at_the_memory_limit() {
         client.close().await.unwrap();
     });
 }
+
+/// Every field of a message, and of the producer, reaches the wire as Java writes it.
+#[test]
+fn every_message_field_reaches_the_wire() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let builder = client
+            .new_producer(Schema::string())
+            .topic(TOPIC)
+            .producer_name("fields")
+            .property("team", "orders")
+            .initial_sequence_id(41);
+        assert!(format!("{builder:?}").contains("fields"));
+        let producer = builder.create().await.unwrap();
+        assert_eq!(producer.producer_name(), Some("fields"));
+        assert_eq!(producer.last_sequence_id(), 41);
+        assert!(format!("{producer:?}").contains(TOPIC));
+        let event_time = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let deliver_at = UNIX_EPOCH + Duration::from_millis(1_900_000_000_000);
+        let message = producer
+            .new_message()
+            .key("k")
+            .value("v".to_string())
+            .property("a", "1")
+            .property("b", "2")
+            .event_time(event_time)
+            .sequence_id(100)
+            .deliver_at(deliver_at)
+            .replication_clusters(["east", "west"]);
+        assert!(format!("{message:?}").contains("\"k\""));
+        message.send().await.unwrap();
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        producer.new_message().value("later".to_string()).deliver_after(Duration::from_secs(60)).send().await.unwrap();
+
+        {
+            let world = server.world.borrow();
+            let stored = world.stored(TOPIC);
+            let (first, second) = (&stored[0], &stored[1]);
+            let single = first.single.as_ref().unwrap();
+            assert_eq!((first.metadata.sequence_id, single.sequence_id), (100, Some(100)));
+            assert_eq!(first.metadata.partition_key.as_deref(), Some("k"));
+            assert_eq!(single.event_time, Some(1_700_000_000_123));
+            let properties: Vec<(&str, &str)> =
+                single.properties.iter().map(|p| (p.key.as_str(), p.value.as_str())).collect();
+            assert_eq!(properties, [("a", "1"), ("b", "2")]);
+            assert_eq!(first.metadata.deliver_at_time, Some(1_900_000_000_000));
+            assert_eq!(first.metadata.replicate_to, ["east", "west"]);
+            // The application's id doesn't move the counter: the next is the one after the initial.
+            assert_eq!(second.metadata.sequence_id, 42);
+            assert!(second.metadata.deliver_at_time.unwrap() >= before + 60_000);
+            let registration = &world.received(Type::PRODUCER)[0].producer;
+            assert!(registration.metadata.iter().any(|kv| kv.key == "team" && kv.value == "orders"));
+        }
+        client.close().await.unwrap();
+    });
+}
+
+/// A send the broker refuses with a checksum error is written again after the producer registers again.
+#[test]
+fn a_refused_send_is_written_again() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        producer.send("first".to_string()).await.unwrap();
+        server.with(|w| w.fail_sends.push_back(apache_pulsar_protocol::proto::ServerError::ChecksumError));
+        producer.send("second".to_string()).await.unwrap();
+        let values: Vec<String> =
+            server.world.borrow().stored(TOPIC).iter().map(|s| String::from_utf8(s.value.to_vec()).unwrap()).collect();
+        assert_eq!(values, ["first", "second"]);
+        assert_eq!(server.received(Type::PRODUCER), 2, "registered again");
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn a_send_after_close_fails() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        producer.send("first".to_string()).await.unwrap();
+        // Polled in that order: the close is queued before the send.
+        let (closed, sent) = futures_util::join!(producer.close(), producer.send("late".to_string()));
+        closed.unwrap();
+        assert_eq!(sent.unwrap_err().kind(), ErrorKind::AlreadyClosed);
+        assert_eq!(client.memory().used(), 0);
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn a_message_above_the_brokers_limit_fails() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap();
+        let error = producer.send(vec![0; 6 << 20]).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other, "{error}");
+        producer.send(b"fine".to_vec()).await.unwrap();
+        assert_eq!(client.memory().used(), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// A lookup the broker refuses fails the sends routed to the segment, with the broker's category.
+#[test]
+fn a_refused_segment_lookup_fails_the_send() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap();
+        server.with(|w| {
+            w.lookup = LookupAnswer::Fail {
+                error: apache_pulsar_protocol::proto::ServerError::AuthorizationError,
+                message: "not you".into(),
+            }
+        });
+        let error = producer.send(b"x".to_vec()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authorization, "{error}");
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn a_layout_that_never_comes_times_create_out() {
+    run(async {
+        let mut world = world(1);
+        world.silent_lookups = true;
+        let server = WorldServer::start(world).await;
+        let client = quick_client(&server).await;
+        let error = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+        // The watch closes its session, once.
+        wait_until("the watch closes its session", || server.received(Type::SCALABLE_TOPIC_CLOSE) == 1).await;
+        client.close().await.unwrap();
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_CLOSE), 1);
+    });
+}
+
+/// A layout pushed again with the epoch already applied is ignored, and the producer carries on.
+#[test]
+fn a_repeated_layout_is_ignored() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap();
+        producer.send(b"a".to_vec()).await.unwrap();
+        server.with(|w| w.repush_layout(TOPIC));
+        producer.send(b"b".to_vec()).await.unwrap();
+        assert_eq!(server.received(Type::PRODUCER), 1, "nothing was re-created");
+        client.close().await.unwrap();
+    });
+}
+
+/// `Debug` names things without leaking secrets, for every handle.
+#[test]
+fn debug_output() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        assert!(format!("{client:?}").contains("local::PulsarClient"));
+        let address = client.lookup(TOPIC).await.unwrap();
+        let connection = client.connection(&address).await.unwrap();
+        assert!(format!("{connection:?}").contains("ConnHandle"));
+        assert!(format!("{:?}", Schema::string()).contains("String"));
+        assert_eq!(format!("{:?}", Schema::bytes()), "Schema(bytes)");
+        let id = crate::MessageId::earliest();
+        assert_eq!(format!("{id:?}"), id.to_string());
+        let watch = client.watches().open(&client, TOPIC).await.unwrap();
+        assert!(format!("{watch:?}").contains(TOPIC));
+        // A closed connection's handle refuses work.
+        connection.close().await;
+        let refused = connection.register(apache_pulsar_protocol::connection::IdKind::Producer).await;
+        assert_eq!(refused.unwrap_err().kind(), ErrorKind::NotConnected);
+        assert_eq!(connection.send(Default::default()).unwrap_err().kind(), ErrorKind::NotConnected);
+        drop(watch);
+        client.close().await.unwrap();
+    });
+}
+
+#[test]
+fn the_blocking_api_has_the_whole_producer() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let rt = compio::runtime::Runtime::new().unwrap();
+    let (server, url) = rt.block_on(async {
+        let server = WorldServer::start(world(1)).await;
+        let url = server.url();
+        (server, url)
+    });
+    let worker = std::thread::spawn(move || {
+        let client = crate::blocking::PulsarClient::builder().service_url(url).event_loops(1).build().unwrap();
+        assert!(format!("{client:?}").contains("PulsarClient"));
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).producer_name("sync").create().unwrap();
+        let clone = producer.clone();
+        assert!(format!("{clone:?}").contains(TOPIC));
+        assert_eq!((producer.topic(), producer.producer_name()), (TOPIC, Some("sync")));
+        let message = producer
+            .new_message()
+            .key("k")
+            .value("all".to_string())
+            .property("a", "1")
+            .event_time(UNIX_EPOCH + Duration::from_secs(1))
+            .sequence_id(7)
+            .deliver_after(Duration::from_secs(1))
+            .deliver_at(SystemTime::now())
+            .replication_clusters(["here"]);
+        assert!(format!("{message:?}").contains("\"k\""));
+        message.send().unwrap();
+        producer.flush().unwrap();
+        assert_eq!(producer.last_sequence_id(), 7);
+        producer.close().unwrap();
+        client.close().unwrap();
+    });
+    rt.block_on(async {
+        while !worker.is_finished() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    worker.join().unwrap();
+    let stored = rt.block_on(async { server.world.borrow().stored(TOPIC) });
+    assert_eq!(stored[0].metadata.replicate_to, ["here"]);
+}

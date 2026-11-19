@@ -133,11 +133,6 @@ impl Layout {
         self.segments.get(&id)
     }
 
-    /// Every segment, active and sealed, by id.
-    pub fn segments(&self) -> impl Iterator<Item = &Segment> {
-        self.segments.values()
-    }
-
     /// The active segments, by hash-range start.
     pub fn active(&self) -> impl Iterator<Item = &Segment> {
         self.active.iter().map(|id| &self.segments[id])
@@ -250,6 +245,7 @@ mod tests {
         assert_eq!(gap.route_key(high), Err(LayoutError::Uncovered(high.segment_hash())));
         let sealed = layout(vec![info(1, 0, 0xffff, false)]);
         assert_eq!(sealed.route_keyless(0), Err(LayoutError::NoActiveSegment));
+        assert_eq!(sealed.route_key(KeyHash::of(b"k")), Err(LayoutError::NoActiveSegment));
         let dag = ScalableTopicDAG { segments: vec![info(1, 0, 0x1_0000, true)], ..Default::default() };
         assert!(matches!(Layout::from_dag(&dag, "topic://a/b/c"), Err(LayoutError::HashRange { .. })));
         // A managed segment needs a topic:// parent for its name; a legacy one doesn't.

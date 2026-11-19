@@ -462,3 +462,109 @@ fn a_legacy_topic_routes_like_v4_partitions() {
     assert!(registration.topic.starts_with("persistent://acme/orders/legacy-partition-"));
     assert!(registration.metadata.iter().any(|kv| kv.key == "__pulsar.v5.managed" && kv.value == "true"));
 }
+
+// --- Send errors ---
+
+/// A checksum error, or any refusal but a terminated topic or a forbidden message: the producer registers again
+/// and writes the message again, and it is stored once.
+#[test]
+fn a_refused_send_is_written_again_after_registering_again() {
+    let mut h = Harness::new(world(1), TOPIC, options());
+    h.send(None, "first");
+    h.world.fail_sends.push_back(ServerError::ChecksumError);
+    let refused = h.send(None, "second");
+    h.run_until(Duration::from_secs(5), |h| h.result(refused).is_some());
+    assert!(h.result(refused).unwrap().is_ok());
+    assert_eq!(values_in(&h, 0), ["first", "second"]);
+    assert_eq!(h.registrations[&0], 2, "registered again");
+}
+
+#[test]
+fn a_forbidden_message_fails_alone() {
+    let mut h = Harness::new(world(1), TOPIC, options());
+    h.world.fail_sends.push_back(ServerError::NotAllowedError);
+    let forbidden = h.send(None, "forbidden");
+    let fine = h.send(None, "fine");
+    assert!(matches!(h.result(forbidden), Some(Err(SendError::Server { error: ServerError::NotAllowedError, .. }))));
+    assert!(h.result(fine).unwrap().is_ok());
+    assert_eq!(values_in(&h, 0), ["fine"]);
+}
+
+/// A send refused because its segment's topic was terminated: the message moves to the successor once the layout
+/// says so.
+#[test]
+fn a_send_refused_by_a_terminated_topic_waits_for_the_layout() {
+    let mut h = Harness::new(world(1), TOPIC, options());
+    h.send(None, "first");
+    h.world.fail_sends.push_back(ServerError::TopicTerminatedError);
+    let refused = h.send(None, "moved");
+    assert!(h.result(refused).is_none());
+    let (low, high) = h.world.split(TOPIC, 0);
+    h.pump();
+    h.run_until(Duration::from_secs(5), |h| h.result(refused).is_some());
+    assert!([low, high].contains(&h.segment_of(refused)));
+}
+
+// --- Access modes, continued ---
+
+/// A newer producer with `ExclusiveWithFencing` fences the older one out: the older one's return, with the epoch
+/// it was given, is refused, and its sends fail.
+#[test]
+fn exclusive_with_fencing_fences_the_older_producer() {
+    let mut older = Harness::new(world(1), TOPIC, exclusive(ProducerAccessMode::ExclusiveWithFencing));
+    older.send(None, "before");
+    let mut newer =
+        Harness::new(std::mem::take(&mut older.world), TOPIC, exclusive(ProducerAccessMode::ExclusiveWithFencing));
+    assert_eq!(newer.created, Some(Ok(())));
+    older.world = std::mem::take(&mut newer.world);
+    older.pump();
+    let late = older.send(None, "after");
+    older.run_until(Duration::from_secs(5), |h| h.result(late).is_some());
+    assert!(
+        matches!(older.result(late), Some(Err(SendError::Server { error: ServerError::ProducerFenced, .. }))),
+        "{:?}",
+        older.result(late)
+    );
+    newer.world = std::mem::take(&mut older.world);
+    let mine = newer.send(None, "mine");
+    assert!(newer.result(mine).unwrap().is_ok());
+    assert_eq!(values_in(&newer, 0), ["before", "mine"]);
+}
+
+/// A shared producer can't write while an exclusive one holds the topic.
+#[test]
+fn a_shared_producer_is_refused_while_an_exclusive_one_holds_the_topic() {
+    let mut holder = Harness::new(world(1), TOPIC, exclusive(ProducerAccessMode::Exclusive));
+    let mut shared = Harness::new(std::mem::take(&mut holder.world), TOPIC, options());
+    let refused = shared.send(None, "refused");
+    assert!(matches!(shared.result(refused), Some(Err(SendError::Server { error: ServerError::ProducerBusy, .. }))));
+}
+
+/// A producer waiting for exclusive access leaves the line when its connection drops, and joins it again.
+#[test]
+fn a_waiting_producer_that_reconnects_waits_again() {
+    let mut holder = Harness::new(world(1), TOPIC, exclusive(ProducerAccessMode::Exclusive));
+    let mut waiting =
+        Harness::new(std::mem::take(&mut holder.world), TOPIC, exclusive(ProducerAccessMode::WaitForExclusive));
+    waiting.drop_connection();
+    waiting.run_until(Duration::from_secs(5), |h| h.registrations[&0] >= 2);
+    assert_eq!(waiting.created, None);
+    holder.world = std::mem::take(&mut waiting.world);
+    holder.close();
+    waiting.world = std::mem::take(&mut holder.world);
+    waiting.pump();
+    assert_eq!(waiting.created, Some(Ok(())));
+}
+
+#[test]
+fn a_non_partitioned_legacy_topic_is_one_segment() {
+    let topic = "persistent://acme/orders/plain";
+    let mut w = World::default();
+    w.create_legacy_topic(topic, 0);
+    let mut h = Harness::new(w, topic, options());
+    for key in ["a", "b", "c"] {
+        let send = h.send(Some(key), key);
+        assert_eq!(h.segment_of(send), 0);
+    }
+    assert_eq!(h.world.received(Type::PRODUCER)[0].producer.topic, topic);
+}

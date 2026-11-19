@@ -222,15 +222,10 @@ impl Task {
                         let _ = reply.send(Ok(()));
                     }
                 },
+                // The task ends once closed, so a close comes before that; closing again is a no-op.
                 Some(Request::Close { reply }) => {
-                    if self.closed {
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Ok(()));
-                        }
-                    } else {
-                        self.close_replies.extend(reply);
-                        self.producer.close(now);
-                    }
+                    self.close_replies.extend(reply);
+                    self.producer.close(now);
                 }
                 // Every handle is gone: close in the background.
                 None => {

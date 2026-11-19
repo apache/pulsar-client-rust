@@ -235,6 +235,9 @@ async fn session(shared: &Weak<Shared>, client: &local::PulsarClient, topic: &st
             match compio::time::timeout(operation_timeout, pushes.next()).await {
                 Ok(push) => push,
                 Err(_) => {
+                    if let Some(watch) = shared.upgrade() {
+                        watch.state.borrow_mut().session = None;
+                    }
                     close_session(&connection, session_id);
                     let error = Error::new(ErrorKind::Timeout, format!("no layout for {topic} within the timeout"));
                     return Ended::Failed(error);

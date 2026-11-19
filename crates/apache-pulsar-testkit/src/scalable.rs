@@ -70,6 +70,8 @@ struct Segment {
     exclusive: bool,
     /// Wait-for-exclusive producers queued behind the current one: `(connection, producer id, request id, name)`.
     waiting: VecDeque<(ConnId, u64, u64, String)>,
+    /// Bumped by each exclusive producer; a producer that comes back with an older one was fenced.
+    topic_epoch: u64,
     /// The highest sequence id stored per producer name, for deduplication.
     last_sequence: HashMap<String, i64>,
 }
@@ -110,6 +112,10 @@ pub struct World {
     pub hold_receipts: bool,
     /// While set, sends are not processed, as if still on the way, until [`World::release_sends`].
     pub hold_sends: bool,
+    /// Errors to answer the next sends with, one each, instead of storing them.
+    pub fail_sends: VecDeque<ServerError>,
+    /// While set, scalable-topic lookups get no answer.
+    pub silent_lookups: bool,
     /// Every command received, per connection.
     pub log: Vec<(ConnId, BaseCommand)>,
     topics: BTreeMap<String, Topic>,
@@ -137,6 +143,8 @@ impl Default for World {
             dedup: false,
             hold_receipts: false,
             hold_sends: false,
+            fail_sends: VecDeque::new(),
+            silent_lookups: false,
             log: Vec::new(),
             topics: BTreeMap::new(),
             conns: BTreeMap::new(),
@@ -196,10 +204,6 @@ impl World {
     /// What the broker sends on `conn` next.
     pub fn output(&mut self, conn: ConnId) -> Bytes {
         self.conns.get_mut(&conn).map(|c| c.out.split().freeze()).unwrap_or_default()
-    }
-
-    pub fn has_output(&self, conn: ConnId) -> bool {
-        self.conns.get(&conn).is_some_and(|c| !c.out.is_empty())
     }
 
     /// The commands of `kind` the client sent, on any connection.
@@ -326,9 +330,9 @@ impl World {
         self.topic(topic).segments[&segment].entries.clone()
     }
 
-    /// The topic's current layout.
-    pub fn layout(&self, topic: &str) -> ScalableTopicDAG {
-        self.dag(topic)
+    /// Pushes the topic's layout again to every watch, with the epoch it already has.
+    pub fn repush_layout(&mut self, topic: &str) {
+        self.push_layout(topic);
     }
 
     /// Sends the receipts held while [`World::hold_receipts`] was set.
@@ -445,6 +449,7 @@ impl World {
                     self.push(conn, answer);
                 }
             }
+            Type::SCALABLE_TOPIC_LOOKUP if self.silent_lookups => {}
             Type::SCALABLE_TOPIC_LOOKUP => self.scalable_lookup(conn, &command),
             Type::SCALABLE_TOPIC_CLOSE => {
                 if let Some(c) = self.conns.get_mut(&conn) {
@@ -537,6 +542,12 @@ impl World {
             self.push(conn, error);
             return;
         }
+        // A producer coming back with the epoch it was given, after a newer one took the topic, was fenced.
+        if producer.topic_epoch.is_some_and(|epoch| epoch < seg.topic_epoch) {
+            let error = reply::error(request_id, ServerError::ProducerFenced, "the producer was fenced");
+            self.push(conn, error);
+            return;
+        }
         let conflict = seg.exclusive || !seg.waiting.is_empty();
         match mode {
             ProducerAccessMode::Shared if conflict => {
@@ -570,12 +581,18 @@ impl World {
         }
         let seg = self.topics.get_mut(&topic).unwrap().segments.get_mut(&segment).unwrap();
         seg.exclusive = mode != ProducerAccessMode::Shared;
+        let topic_epoch = seg.exclusive.then(|| {
+            seg.topic_epoch += 1;
+            seg.topic_epoch
+        });
         seg.producers.push((conn, producer.producer_id, name.clone()));
         let last = if dedup { seg.last_sequence.get(&name).copied().unwrap_or(-1) } else { -1 };
         if let Some(c) = self.conns.get_mut(&conn) {
             c.producers.insert(producer.producer_id, (topic, segment));
         }
-        self.push(conn, producer_success(request_id, &name, last, true));
+        let mut success = producer_success(request_id, &name, last, true);
+        success.producer_success.get_or_insert_default().topic_epoch = topic_epoch;
+        self.push(conn, success);
     }
 
     fn remove_producer(&mut self, conn: ConnId, producer_id: u64, topic: &str, segment: u64) {
@@ -586,11 +603,15 @@ impl World {
             // The first wait-for-exclusive producer in line gets the topic.
             if let Some((c, id, request_id, name)) = seg.waiting.pop_front() {
                 seg.exclusive = true;
+                seg.topic_epoch += 1;
+                let topic_epoch = seg.topic_epoch;
                 seg.producers.push((c, id, name.clone()));
                 if let Some(cs) = self.conns.get_mut(&c) {
                     cs.producers.insert(id, (topic.to_string(), segment));
                 }
-                self.push(c, producer_success(request_id, &name, -1, true));
+                let mut success = producer_success(request_id, &name, -1, true);
+                success.producer_success.get_or_insert_default().topic_epoch = Some(topic_epoch);
+                self.push(c, success);
             }
         }
     }
@@ -610,12 +631,14 @@ impl World {
         assert_eq!(section.checksum_valid, Some(true), "a send with a bad checksum");
         let metadata = MessageMetadata::decode_from_slice(&section.metadata).expect("undecodable metadata");
         let seg = self.topics.get_mut(&topic).unwrap().segments.get_mut(&segment).unwrap();
-        if seg.terminated {
+        let refusal =
+            if seg.terminated { Some(ServerError::TopicTerminatedError) } else { self.fail_sends.pop_front() };
+        if let Some(error) = refusal {
             let error = CommandSendError {
                 producer_id: send.producer_id,
                 sequence_id: send.sequence_id,
-                error: ServerError::TopicTerminatedError,
-                message: "the topic was terminated".into(),
+                error,
+                message: format!("the broker refused the send: {error:?}"),
                 ..Default::default()
             };
             self.push(
@@ -674,6 +697,7 @@ impl Segment {
             producers: Vec::new(),
             exclusive: false,
             waiting: VecDeque::new(),
+            topic_epoch: 0,
             last_sequence: HashMap::new(),
         }
     }
