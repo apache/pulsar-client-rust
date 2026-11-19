@@ -181,9 +181,35 @@ impl Drop for Inner {
     }
 }
 
+/// How an event loop starts: the thread it runs on, and its runtime. `build` uses the system's; tests swap them to
+/// make a loop fail to start.
+#[derive(Clone, Copy)]
+pub(crate) struct LoopStarter {
+    pub spawn: SpawnLoop,
+    pub runtime: MakeRuntime,
+}
+
+/// Spawns the thread named by the first argument, running the second.
+pub(crate) type SpawnLoop = fn(String, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>;
+
+/// Creates an event loop's runtime.
+pub(crate) type MakeRuntime = fn() -> std::io::Result<compio::runtime::Runtime>;
+
+impl LoopStarter {
+    pub const SYSTEM: Self = Self {
+        spawn: |name, run| thread::Builder::new().name(name).spawn(run),
+        runtime: compio::runtime::Runtime::new,
+    };
+}
+
 impl ClientBuilder<ThreadSafe> {
     /// Starts the event loops and creates the client.
     pub async fn build(self) -> Result<PulsarClient> {
+        self.build_with(LoopStarter::SYSTEM).await
+    }
+
+    /// [`ClientBuilder::build`], starting the event loops with `starter`.
+    pub(crate) async fn build_with(self, starter: LoopStarter) -> Result<PulsarClient> {
         let loops = self.event_loops;
         let config = self.into_config()?;
         let mut handles = Vec::with_capacity(loops);
@@ -194,9 +220,9 @@ impl ClientBuilder<ThreadSafe> {
             let (sender, receiver) = mpsc::unbounded();
             let (ready, is_ready) = oneshot::channel();
             let config = config.clone();
-            let thread = thread::Builder::new()
-                .name(format!("pulsar-loop-{index}"))
-                .spawn(move || run_loop(index, config, receiver, ready))
+            let runtime = starter.runtime;
+            let run = Box::new(move || run_loop(index, runtime, config, receiver, ready));
+            let thread = (starter.spawn)(format!("pulsar-loop-{index}"), run)
                 .map_err(|e| Error::with_source(ErrorKind::Other, "can't start an event loop thread", e))?;
             handles.push(Loop { sender, load: AtomicUsize::new(0) });
             threads.push(thread);
@@ -225,11 +251,12 @@ impl ClientBuilder<ThreadSafe> {
 
 fn run_loop(
     index: usize,
+    runtime: MakeRuntime,
     config: ClientConfig,
     mut receiver: mpsc::UnboundedReceiver<Message>,
     ready: oneshot::Sender<Result<()>>,
 ) {
-    let runtime = match compio::runtime::Runtime::new() {
+    let runtime = match runtime() {
         Ok(runtime) => runtime,
         Err(e) => {
             let _ = ready.send(Err(Error::with_source(ErrorKind::Other, "can't start an event loop", e)));

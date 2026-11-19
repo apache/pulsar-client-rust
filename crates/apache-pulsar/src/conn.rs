@@ -384,22 +384,22 @@ impl Driver {
             self.timer = None;
             return false;
         };
-        let now = Instant::now();
-        if deadline <= now {
-            self.timer = None;
-            self.connection.handle_timeout(now);
-            return true;
+        // A sleep only completes once its deadline has passed: either way, the deadline is reached.
+        if deadline > Instant::now() && self.poll_sleep(deadline, cx).is_pending() {
+            return false;
         }
+        self.timer = None;
+        self.connection.handle_timeout(Instant::now());
+        true
+    }
+
+    /// Polls the sleep until `deadline`, starting a new one when the deadline changed.
+    fn poll_sleep(&mut self, deadline: Instant, cx: &mut Context<'_>) -> Poll<()> {
         if self.timer.as_ref().is_none_or(|(at, _)| *at != deadline) {
             self.timer = Some((deadline, Box::pin(compio::time::sleep_until(deadline))));
         }
         let (_, sleep) = self.timer.as_mut().unwrap();
-        if sleep.as_mut().poll(cx).is_ready() {
-            self.timer = None;
-            self.connection.handle_timeout(Instant::now());
-            return true;
-        }
-        false
+        sleep.as_mut().poll(cx)
     }
 
     fn drain_events(&mut self) {

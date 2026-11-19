@@ -256,3 +256,112 @@ fn scalable_lookup(session_id: u64) -> BaseCommand {
         ..Default::default()
     }
 }
+
+#[test]
+fn the_handshake_rejects_anything_but_connected() {
+    let mut broker = SimBroker::new();
+    broker.mute = true;
+    let mut link = Link::new(ConnectOptions::default(), broker);
+    link.pump();
+    let now = link.clock.now();
+    assert_eq!(link.client.request(now, ping_like).unwrap_err(), ConnectionError::NotReady);
+    // Time short of the handshake deadline changes nothing.
+    link.client.handle_timeout(now + Duration::from_secs(5));
+    assert_eq!(link.client.state(), State::AwaitConnected);
+
+    let events = link.push(&reply::success(0));
+    assert_eq!(closed_with(&events), Some(&ConnectionError::Unexpected(EnumValue::Known(Type::SUCCESS))));
+}
+
+#[test]
+fn a_closed_connection_ignores_everything() {
+    let mut link = connected();
+    let now = link.clock.now();
+    link.client.close(ConnectionError::Closed);
+    link.client.close(ConnectionError::KeepaliveTimeout);
+    link.client.auth_response(b"late".to_vec());
+    link.client.handle_input(&apache_pulsar_testkit::frame(&reply::ping()), now);
+    link.client.handle_timeout(now + Duration::from_secs(3600));
+    assert_eq!(link.client.poll_timeout(), None);
+    assert_eq!(link.client.poll_transmit(), None);
+    assert_eq!(link.pump(), vec![Event::Closed(ConnectionError::Closed)]);
+}
+
+#[test]
+fn a_provider_that_fails_closes_the_connection() {
+    let mut link = connected();
+    link.push(&reply::auth_challenge(AUTH_REFRESH_SENTINEL));
+    link.client.auth_failed("token expired".into());
+    let events = link.pump();
+    let error = closed_with(&events).unwrap();
+    assert_eq!(error, &ConnectionError::Authentication("token expired".into()));
+    assert!(!error.is_retryable());
+}
+
+#[test]
+fn a_keepalive_tick_leaves_later_request_deadlines() {
+    let options = ConnectOptions { operation_timeout: Duration::from_secs(60), ..Default::default() };
+    let mut link = Link::new(options, SimBroker::new());
+    link.pump();
+    let id = link.client.request(link.clock.now(), ping_like).unwrap();
+    assert!(link.advance(Duration::from_secs(30)).is_empty());
+    assert_eq!(link.broker.received_of(Type::PING).len(), 1);
+    assert_eq!(link.client.pending_requests(), 1);
+    let events = link.advance(Duration::from_secs(30));
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Response { request_id, result: Err(RequestError::Timeout) } if *request_id == id)
+        )
+    );
+}
+
+#[test]
+fn transaction_coordinator_watches_need_the_broker_feature() {
+    let watch = BaseCommand {
+        r#type: Type::WATCH_TC_ASSIGNMENTS.into(),
+        watchTcAssignments: apache_pulsar_protocol::proto::CommandWatchTcAssignments {
+            watch_id: 0,
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    };
+    let mut link = connected();
+    assert_eq!(
+        link.client.send(&watch).unwrap_err(),
+        ConnectionError::UnsupportedBroker("transaction coordinator discovery")
+    );
+
+    let features = FeatureFlags { supports_tc_metadata_discovery: Some(true), ..Default::default() };
+    let mut link = Link::new(ConnectOptions::default(), SimBroker::with_features(features));
+    link.pump();
+    assert!(link.client.send(&watch).is_ok());
+}
+
+#[test]
+fn which_failures_are_worth_reconnecting_for() {
+    let refused = |error| ConnectionError::Refused { error: EnumValue::Known(error), message: String::new() };
+    assert!(refused(ServerError::ServiceNotReady).is_retryable());
+    assert!(!refused(ServerError::AuthorizationError).is_retryable());
+    assert!(!refused(ServerError::NotAllowedError).is_retryable());
+    assert!(ConnectionError::KeepaliveTimeout.is_retryable());
+    assert!(ConnectionError::Disconnected("reset".into()).is_retryable());
+    assert!(!ConnectionError::TooManyAuthRounds.is_retryable());
+}
+
+#[test]
+fn the_simulated_broker_answers_other_commands_through_its_responder() {
+    let broker = SimBroker {
+        on_command: Some(Box::new(|command| {
+            let request_id = command.unsubscribe.as_option().map(|u| u.request_id).unwrap();
+            vec![reply::success(request_id)]
+        })),
+        ..Default::default()
+    };
+    let mut link = Link::new(ConnectOptions::default(), broker);
+    link.pump();
+    let id = link.client.request(link.clock.now(), ping_like).unwrap();
+    let events = link.pump();
+    assert!(matches!(events.as_slice(), [Event::Response { request_id, result: Ok(_) }] if *request_id == id));
+    assert!(format!("{:?}", link.broker).contains("received: 2"));
+}
