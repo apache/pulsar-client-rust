@@ -43,6 +43,8 @@ use compio::tls::TlsAcceptor;
 use crate::error::ErrorKind;
 use crate::{PulsarClient, Token, local};
 
+mod clients;
+mod driver;
 mod errors;
 mod options;
 
