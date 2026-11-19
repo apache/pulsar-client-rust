@@ -100,6 +100,11 @@ fn the_builder_refuses_incomplete_or_contradictory_options() {
     let builder = PulsarClient::builder().service_url("pulsar://broker:6650").event_loops(0);
     let error = error_of(futures_executor::block_on(builder.build()));
     assert_eq!(error.kind(), ErrorKind::InvalidConfiguration, "{error}");
+    // The local builder has no setter for the loop count, but runs the same validation. The coverage report counts
+    // each instantiation of the generic `into_config` on its own, so the local one is checked here too.
+    let mut builder = local::PulsarClient::builder().service_url("pulsar://broker:6650");
+    builder.event_loops = 0;
+    assert_eq!(error_of(builder.into_config()).kind(), ErrorKind::InvalidConfiguration);
 }
 
 #[test]
