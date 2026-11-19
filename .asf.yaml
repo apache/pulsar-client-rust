@@ -42,6 +42,8 @@ github:
   pull_requests:
     # Show the "Update branch" button on pull requests that are behind the base branch.
     allow_update_branch: true
+    # Delete the head branch after a pull request is merged.
+    del_branch_on_merge: true
   protected_branches:
     main:
       # squash or rebase must be allowed in the repo for this setting to be set to true.
