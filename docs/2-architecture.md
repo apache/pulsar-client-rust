@@ -128,6 +128,25 @@ A namespace consumer keeps all its per-topic consumers on its own loop.
 3. Every spawned task belongs to an object that owns it and stops it on close: no detached tasks.
 4. I/O uses owned buffers, so a future dropped while an operation is in flight leaves the buffer alive until
    the operation completes ([3](3-protocol.md)).
+5. **Never drop a read or a write in flight.** Dropping a completed read loses the bytes it read. That happens
+   under `compio::time::timeout`, whose select is random, on every driver, and on io_uring even under a select
+   that polls the read first, because the kernel can finish the receive before the cancel. A dropped
+   `write_all` can leave half a frame on the wire. So each connection has one long-lived read loop and one
+   writer, neither ever wrapped in a timeout or a select. Keepalive and request deadlines are separate timers.
+6. **Dropping a `JoinHandle` cancels its task**, unlike tokio, where it detaches it. An owner keeps the handle
+   of each task it runs.
+7. **The driver choice is silent (proposed: make it explicit).** With compio's `polling` feature, Linux uses
+   io_uring when it is available and falls back to epoll without a word, for example under Docker's default
+   seccomp profile. Without the feature, a blocked io_uring makes the runtime fail to start, and a request for
+   polling is ignored. Proposed: the client enables `polling`, makes the driver a client option, and each loop
+   logs the driver it got.
+8. **DNS goes through a blocking pool.** compio resolves names with `getaddrinfo` on its per-runtime pool of up
+   to 256 threads. A resolution can't be cancelled, and when the pool is full the loop thread itself spins.
+   Options: share one bounded pool across loops, or a resolver of our own with a cap and a timeout (open
+   question 5).
+
+The findings behind rules 5–8 come from [`checks/compio-checks`](../checks/compio-checks/README.md). They pass on Linux
+with io_uring and with epoll (in Docker Desktop's VM, aarch64) and on macOS.
 
 ## 5. Open questions
 
@@ -138,10 +157,8 @@ A namespace consumer keeps all its per-topic consumers on its own loop.
    for a topic already watched on another loop. Do we need more than that?
 3. **Task granularity on a loop.** One task per object is the starting point. Measure whether the per-segment
    producer should share its scalable producer's task to save a local hop per message.
-4. **compio behavior to verify in milestone 0** ([Plan](../PLAN.md)):
-   - waking a loop from another thread;
-   - timers and their resolution;
-   - which channels to use inside a loop and across loops;
-   - what happens to an in-flight operation when its future is dropped;
-   - DNS resolution;
-   - TLS through `compio-tls` with rustls.
+4. **compio behavior, verified in milestone 0** ([Plan](../PLAN.md)): see §4.4, rules 5–8. Still unverified:
+   bare-metal and x86_64 Linux, older kernels, a stressed write-side cancel, wake latency under a busy loop, and
+   channel choice inside a loop and across loops.
+5. **DNS resolver.** A shared bounded pool behind compio's resolution, or a resolver of our own with a timeout.
+   Decide with milestone 1.

@@ -1,0 +1,46 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "compio-checks"
+description = "Milestone 0 checks of compio behavior"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[features]
+# With `polling` on, Linux gets compio's fusion driver: io_uring when available, epoll otherwise, and
+# `--driver` can force either one. Without it (`--no-default-features`), Linux has io_uring only and
+# building a runtime fails when io_uring is blocked.
+default = ["polling"]
+polling = ["compio/polling"]
+
+[dependencies]
+bytes = { workspace = true }
+# The `rustls` and `ring` features go through compio's own dependency on compio-tls, which turns off
+# compio-tls's default `native-tls`.
+compio = { workspace = true, features = ["io", "net", "time", "bytes", "rustls", "ring"] }
+flume = "0.12"
+futures = "0.3"
+rcgen = "0.14"
+socket2 = "0.6"
+
+[lints]
+workspace = true

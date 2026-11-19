@@ -1,0 +1,8 @@
+PulsarApi.proto is vendored unchanged from Apache Pulsar:
+
+  repository: https://github.com/apache/pulsar
+  path:       pulsar-common/src/main/proto/PulsarApi.proto
+  commit:     2fe3a4deb644a250732559fd8b9902439c4811ec (master, 2026-11-18)
+
+To update: replace the file, change the commit above, run `cargo run -p xtask -- codegen`,
+and commit the proto, this file and the regenerated src/proto/ together.

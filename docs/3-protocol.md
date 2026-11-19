@@ -40,9 +40,9 @@ into a caller's buffer with a size pass first, which framing needs. In buffa tha
 
 1. **proto2 defaults.** buffa doesn't apply `[default = …]` to absent optional fields: `partition` comes back
    `None`, where prost returns −1. The proto has 12 optional fields with non-zero defaults, for example
-   `partition = -1`, `CommandSend.num_messages = 1` and `durable = true`. The protocol crate wraps them in
-   accessors that apply the default, and a test reads every `[default]` in the vendored proto and checks that it
-   has one.
+   `partition = -1`, `CommandSend.num_messages = 1` and `durable = true`, and 4 enum fields whose default is
+   their first value. The protocol crate wraps all 16 in accessors that apply the default, and a test reads every
+   `[default]` in the vendored proto and checks that it has one.
 2. **Unknown enum values.** By default buffa turns an unknown `BaseCommand.type` into the first variant
    (`CONNECT`). Codegen uses `open_enums_in` for that field, so an unknown command is seen as unknown.
 3. **Required fields.** Neither library rejects a missing `required` field: an absent `ledgerId` decodes as 0.
@@ -120,8 +120,9 @@ connection to frame.
 - **Memory:** a payload slice keeps its frame's allocation alive until the application drops the message. Memory
   accounting therefore counts frames, not payloads.
 - **Writing:** commands are encoded straight into the connection's write buffer, and many frames go out in one
-  write. The buffer is handed to compio and comes back when the write completes, which is what makes a dropped
-  future safe ([2](2-architecture.md) §4.4).
+  write. The buffer is handed to compio and comes back when the write completes, so a dropped future is memory-safe.
+  It is not lossless: a dropped read can lose bytes it already read, and a dropped write can leave half a frame,
+  hence one read loop and one writer per connection ([2](2-architecture.md) §4.4, rule 5).
 
 ## 6. Compression codecs
 

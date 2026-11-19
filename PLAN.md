@@ -21,9 +21,11 @@ Settle what everything else depends on.
   - timers;
   - dropping a future while its operation is in flight;
   - DNS resolution.
-- **First contact:** the codec and the `CONNECT` handshake against a broker container built from
-  `apache/pulsar` master, reading the broker's feature flags.
-- **Vectors from Java:** a small Java program, run against the `apache/pulsar` build, generates:
+- **First contact:** the codec and the `CONNECT` handshake against the `apachepulsar/pulsar:5.0.1` image, the
+  first release with scalable topics, reading the broker's feature flags. A released image keeps CI from building
+  one from master; the proto is still vendored from a pinned master commit, which only adds fields to 5.0.1's.
+- **Vectors from Java:** a small Java program, run against the Pulsar 5.0.1 artifacts from Maven Central, generates
+  (`MessageIdV5`, `CheckpointV5`, `SegmentRouter` and `Murmur3_32Hash` are the same on master):
   - routing vectors for keys (raw hash, segment hash, bucket hash, and the v4 partition for N partitions);
   - golden bytes for `MessageIdV5` and `CheckpointV5`.
 
