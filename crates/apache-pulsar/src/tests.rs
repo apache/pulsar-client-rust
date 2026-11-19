@@ -43,6 +43,9 @@ use compio::tls::TlsAcceptor;
 use crate::error::ErrorKind;
 use crate::{PulsarClient, Token, local};
 
+mod errors;
+mod options;
+
 /// How the server treats one accepted connection.
 struct Behavior {
     broker: SimBroker,
