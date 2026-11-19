@@ -25,7 +25,10 @@ pub mod connection;
 pub mod defaults;
 pub mod frame;
 pub mod hash;
+pub mod layout;
 pub mod lookup;
+pub mod message_id;
+pub mod producer;
 
 /// Generated from the vendored `PulsarApi.proto` by `cargo run -p xtask -- codegen`.
 ///

@@ -48,13 +48,15 @@ pass on the simulated broker.
 ## M2: Producer, one message per batch
 
 - Every entry in the batch format, one message per batch, with its bucket stamp ([5](docs/5-segment-engine.md) §2).
+  Java sends a lone message as a plain entry; the batch format was kept anyway, for one encoding path.
 - The layout watch, routing, and the scalable producer: lazy per-segment producers, access modes, dedup, send
-  timeout, the queue and memory limits, flush and close ([6](docs/6-scalable-topics.md) §2–§3).
-- The barrier that keeps per-key order across splits and merges.
+  timeout, the memory limit, flush and close ([6](docs/6-scalable-topics.md) §2–§3). As in Java V5, the memory
+  limit is the only bound on what producers hold: there is no pending-message limit.
+- Per-key order across splits and merges: Java's retire, park and hold ([6](docs/6-scalable-topics.md) §3.3).
 - Routing over a synthetic legacy layout, for `persistent://` topics.
 - MessageId encoding, errors, and the producer in the default, local and blocking APIs ([7](docs/7-api.md)).
-- Placement of producers on loops, and the admission counters for the queue and memory limits
-  ([2](docs/2-architecture.md) §4.1), moved here from M1.
+- Placement of producers on loops, and the memory admission counter ([2](docs/2-architecture.md) §4.1), moved
+  here from M1.
 
 **Checks:** C1–C6 and the producer side of C12–C15. Ported scenarios from `ScalableTopicProducerTest`,
 `ScalableTopicProducerOrderingTest`, `V5ProducerSegmentGoneTest`, `V5ProducerLayoutChangeOrderingTest`,
@@ -62,6 +64,12 @@ pass on the simulated broker.
 `V5ScalableTopicAutoCreateTest`. Golden MessageId bytes round-trip with Java. A test confirms that the
 pipelining patterns in the rustdoc (`buffered`, `FuturesOrdered`, `join_all`) keep send order
 ([7](docs/7-api.md) §3.1).
+
+Ported so far: the ordering, segment-gone, access-mode and close scenarios on the simulated cluster
+(`crates/apache-pulsar-testkit/tests/producer.rs`), backpressure and pipelining over loopback, and on the real
+broker a split during traffic, auto-create and not-found, an exclusive conflict, a partitioned topic, and a Java
+consumer reading what Rust produced. The Java tests of Java-only internals (executors, hooks) have no Rust
+counterpart.
 
 ## M3: Queue consumer
 

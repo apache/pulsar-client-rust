@@ -33,9 +33,18 @@ Connecting ──registered──► Ready ──connection lost──► Reconn
 ## 2. Producer
 
 **Registration.** `CommandProducer` carries the topic, the producer name, the access mode, the schema and the
-producer's properties. The scalable layer names each per-segment producer `<producerName>-seg-<segmentId>`
-(*wire-protocol* §5). `CommandProducerSuccess` returns the last sequence id the broker has stored for that
-name, which dedup needs (C5). For `wait-for-exclusive` it can also say the producer isn't ready yet.
+producer's properties. The scalable layer names each per-segment producer `<producerName>-seg-<segmentId>` when
+the application named the producer (*wire-protocol* §5); otherwise the broker names it. A legacy segment's
+producer also carries the property `__pulsar.v5.managed=true`. `CommandProducerSuccess` returns the last sequence
+id the broker has stored for that name, which dedup needs (C5). For `wait-for-exclusive` it first answers "not
+ready", then again on the same request once the producer gets the topic; the request waits without a deadline
+meanwhile.
+
+**Sequence ids.** Each segment's producer has its own sequence ids, as Java's v4 producers do. They start after the
+configured initial id, or, without one, after the broker's last id for the name. A message gets its id when it is
+first written, keeps it, with its bytes, when it is written again after a reconnect, and takes a new one when it
+is routed to another segment. An id set by the application is used as is and doesn't move the counter. The
+producer's last sequence id is the highest the brokers confirmed, over its segments' producers.
 
 **Sending.** Messages flow through:
 
@@ -44,9 +53,12 @@ name, which dedup needs (C5). For `wait-for-exclusive` it can also say the produ
 ```
 
 - The **pending queue** keeps sent, unacknowledged entries in send order. Receipts (`CommandSendReceipt`)
-  complete them in order. After a reconnect the whole queue is resent, in order, before anything new.
+  complete them in order, matched against the head of the queue, as in Java: a receipt for an earlier sequence id
+  is late and ignored, one for a later id means the two sides disagree, and the connection is closed so that the
+  producer registers again. After a reconnect the whole queue is resent, in order, before anything new.
 - The **send timeout** fails each message whose deadline passes, without invalidating the producer
-  (*client-api* §2).
+  (*client-api* §2). A message's clock starts once its segment's producer is registered.
+- A message larger than the broker's `max_message_size` fails alone.
 - **Batch format, always.** Every entry is a batch: `num_messages_in_batch` in the metadata, and a
   `SingleMessageMetadata` before each message. There is one encoding path, whatever the batch size.
 - **One message per batch first.** A one-message batch lies in one bucket by construction, so it is allowed
@@ -62,6 +74,16 @@ name, which dedup needs (C5). For `wait-for-exclusive` it can also say the produ
 **Segment gone.** When a send fails because the topic was terminated, or the producer is closed because its
 segment sealed, the engine hands its unacknowledged messages back to the scalable layer in their original
 order. The scalable layer re-routes them (*client-behavior* §4, [6](6-scalable-topics.md) §3).
+
+The broker writes what it stored before it terminates a topic, and before it answers `CommandCloseProducer`. So
+once a terminated segment's producer is closed, by the broker or by us, what it sent and never got a receipt for
+was not stored, and goes to the successors without being duplicated.
+
+**Close** sends `CommandCloseProducer` and waits for the answer, which comes once the broker has written what it
+had: those messages complete. What was never written fails with `AlreadyClosed`, as in Java.
+
+All of a scalable producer's segment producers are state in one sans-IO machine (`apache-pulsar-protocol`'s
+`producer` module), run by one task on its loop.
 
 ## 3. Consumer
 
@@ -112,7 +134,4 @@ producer like any other.
 
 ## 6. Open questions
 
-1. **Sequence ids across segments.** The scalable producer assigns sequence ids. How it seeds them when
-   per-segment producers are created lazily, each reporting its own last sequence id, has to follow the Java
-   client exactly, so that dedup works across clients. To be read from `ScalableTopicProducer`.
-2. **Ack timeout and redelivery backoff:** in the first consumer milestone, or later?
+1. **Ack timeout and redelivery backoff:** in the first consumer milestone, or later?

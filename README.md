@@ -23,17 +23,26 @@ A Rust client for [Apache Pulsar](https://pulsar.apache.org) scalable topics, bu
 [Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) on the
 [compio](https://github.com/compio-rs/compio) runtime.
 
-**Status:** milestone 1. The client connects, authenticates (token, mTLS) and looks topics up, directly and
-through a proxy; producers and consumers come next. Nothing here is usable as a client yet. The design is in
-[DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
+**Status:** milestone 2. Producers publish to scalable topics, keeping per-key order across segment splits and
+merges, and to regular `persistent://` topics through the migration bridge, in the thread-safe, local and
+blocking APIs, with token and mTLS authentication, directly or through a proxy. Consumers come next. The design is
+in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
+
+```rust
+let client = PulsarClient::builder().service_url("pulsar://localhost:6650").build().await?;
+let producer = client.new_producer(Schema::string()).topic("topic://public/default/orders").create().await?;
+let id = producer.new_message().key("user-42").value("hello".to_string()).send().await?;
+producer.close().await?;
+client.close().await?;
+```
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `crates/apache-pulsar` | The client: connections, the pool, lookup, authentication, TLS, the local and thread-safe clients. |
-| `crates/apache-pulsar-protocol` | The sans-IO protocol core: generated protobuf code, framing, the connection state machine, routing hashes. Internal; not a stable API. |
-| `crates/apache-pulsar-testkit` | The simulated broker, and the deterministic tests of the protocol state machines. Not published. |
+| `crates/apache-pulsar` | The client: producers, layout watches, connections, the pool, lookup, authentication, TLS, the memory limit, and the thread-safe, local and blocking APIs. |
+| `crates/apache-pulsar-protocol` | The sans-IO protocol core: generated protobuf code, framing, the connection and producer state machines, layouts and routing, message ids. Internal; not a stable API. |
+| `crates/apache-pulsar-testkit` | The simulated broker and cluster, and the deterministic tests of the protocol state machines. Not published. |
 | `checks/` | Milestone 0 checks: compio behavior, and the handshake against a real broker. |
 | `tools/java-vectors` | Generates test vectors from the Java client. |
 | `xtask` | Repository tasks: protobuf code generation. |

@@ -35,6 +35,7 @@ bytes.workspace = true
 # rustls crypto provider (Leaning, docs/4-connections.md §7).
 compio = { workspace = true, features = ["runtime", "net", "io", "io-compat", "time", "polling", "rustls", "ring"] }
 futures-channel = "0.3"
+futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 rustls-native-certs = "0.8"
 thiserror.workspace = true
@@ -42,7 +43,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 apache-pulsar-testkit = { path = "../apache-pulsar-testkit" }
-futures-executor = "0.3"
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 libtest-mimic = "0.8"
 rcgen = "0.14"

@@ -59,30 +59,40 @@ function. Both are checked against vectors generated from the Java client, befor
 - Under `exclusive`, `exclusive-with-fencing` and `wait-for-exclusive`, the producer attaches to every
   active segment while it is being created. A conflict then fails `create()`, not the first send. New
   segments from a later split are attached as soon as the layout arrives.
-- The last published sequence id (C5) is the highest one completed across segments.
+- Each has its own sequence ids ([5](5-segment-engine.md) §2). The last published sequence id (C5) is the highest
+  one completed across segments, as in Java.
+- A segment that is gone gets no new producer: messages routed to it wait for the next layout.
 
 ### 3.3 Order across splits and merges
 
-All sends of a producer go through one dispatch path on its loop, so they reach each segment's queue in call
-order (*client-behavior* §3).
+All sends of a producer go through one state machine, run by one task on its loop, so they reach each segment's
+queue in call order (*client-behavior* §3). The mechanism follows Java's `ScalableTopicProducer`: a segment that
+goes away **retires**.
 
-When a segment seals (a layout update, or a send failing because the segment was terminated), the producer:
+- It retires when its topic is terminated (a send or a registration fails with `TopicTerminated`), or when a layout
+  drops it while it still has messages.
+- Its messages that the broker didn't store are **parked**: at once for those never written, and for the written
+  ones once its producer is closed, since the broker answers the close only after writing what it stored
+  ([5](5-segment-engine.md) §2).
+- New sends whose key the retiring segment owned, in the layout it was active in, are **held**, in call order.
+  Other keys, and keyless sends, keep flowing.
+- Once the layout no longer has the segment and nothing of it is in flight, its parked messages are routed again
+  in call order, merging the parents of a merge, then the held ones. Each successor so gets a key's older
+  messages before its newer ones.
 
-1. stops routing to it;
-2. takes back its unacknowledged messages, in order ([5](5-segment-engine.md) §2);
-3. if the new layout hasn't arrived yet, waits for it, with bounded backoff;
-4. re-routes the taken-back messages to the active successors, **ahead of** any message that was sent after
-   them and routed to the same successors in the meantime.
-
-Step 4 is what keeps per-key order: until a sealed segment's messages are re-queued, its successors hold the
-newer messages for that range behind a barrier. Segments outside the range keep flowing. A merge waits for
-all its parents. After ten failed attempts for one message, its send fails with the last error, as in Java
-(*client-behavior* §4).
+A message is parked at most ten times; past that its send fails with the last error, as in Java
+(*client-behavior* §4). A segment that is gone while the layout still has it gets ten checks, `min(100 ms × n,
+500 ms)` apart (4 s in all), before its parked messages fail. Ported scenarios from
+`ScalableTopicProducerOrderingTest`, `V5ProducerSegmentGoneTest` and `V5ProducerLayoutChangeOrderingTest` check it,
+deterministically on the simulated broker and with a split during traffic on a real one.
 
 ### 3.4 Flush and close
 
-*Flush* waits for every message sent before the call, on every segment. *Close* flushes, closes every
-per-segment producer, releases its layout watch, and can be called again safely (*client-api* §3.3).
+*Flush* waits for every message sent before the call, on every segment, and fails if one of them failed, as
+Java's does. *Close* fails the sends still waiting (parked, held, or not written yet) with `AlreadyClosed`,
+closes every per-segment producer, which waits for what the brokers already have, releases its layout watch, and
+can be called again safely (*client-api* §3.3). It follows Java: it does not flush, and a registration still
+waiting for exclusive access doesn't hold it up. An application that wants everything published flushes first.
 
 ## 4. Queue consumer
 
@@ -195,9 +205,7 @@ transactions that span loops.
 
 ## 10. Open questions
 
-1. **The barrier in §3.3.** Check the design against Java's `ScalableTopicProducerOrderingTest` and
-   `V5ProducerLayoutChangeOrderingTest` scenarios before implementing it.
-2. **Parents first for managed assignments.** Does the controller assign a child only once its parents are
+1. **Parents first for managed assignments.** Does the controller assign a child only once its parents are
    drained, or must a Stream consumer gate it too ([spec gap 7](../DESIGN.md#spec-gaps-to-raise-upstream))?
-3. **Position vector cost** with many segments, and across topics for namespace consumers: measure the
+2. **Position vector cost** with many segments, and across topics for namespace consumers: measure the
    persistent map against plain copies at realistic segment counts.

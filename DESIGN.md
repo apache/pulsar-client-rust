@@ -66,6 +66,9 @@ here.
 | 6 | *key-shared* §9 says a client MUST gate producer stamping on observed broker support, but no signal for that support is defined. Java does not gate; it stamps whenever it batches. | Same as Java. | To raise |
 | 7 | Per-key order across a split for the ungrouped checkpoint consumer needs a sealed parent read to its end before its children. *client-behavior* §7 and *wire-protocol* §6.3 don't say so; Java does it from the layout's lineage. For managed assignments (Stream, grouped Checkpoint) the spec doesn't say who orders parents before children. | Parent-first for ungrouped readers; managed assignments as in Java. | To raise |
 | 8 | C15 requires refusing a broker without scalable-topic support, but *error-model* §2 has no category for that failure. Java raises `FeatureNotSupportedException`. | `ErrorKind::UnsupportedBroker`. | To raise |
+| 9 | *client-api* §2 and §3.3 say a graceful close awaits pending operations and completes pending publishes. Java V5's close waits for what the brokers already have, and fails with `AlreadyClosed` the sends still waiting for a layout, a connection or a segment producer; its tests pin that behavior. | Java's. | To raise |
+| 10 | *client-api* §3.1 and *error-model* §2 have a pending-send queue that can be full (`ProducerQueueFull`). Java V5 bounds producers by the client memory limit only, and never raises it. | Java's: the memory limit only; the kind exists, unused. | To raise |
+| 11 | *client-behavior* §1 says to apply a layout only if its epoch is greater than the last applied. Java's `DagWatchClient` applies every update it receives. | The spec's: `>`, as in gap 5. | To raise |
 
 ## Reference material
 

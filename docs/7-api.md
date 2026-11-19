@@ -13,7 +13,7 @@ The shapes below are proposals; details will move as the code is written.
 | Module | Types | For |
 |---|---|---|
 | `apache_pulsar` | `Send + Sync` handles. Futures that run on any executor. | Everyone; the default. |
-| `apache_pulsar::local` | `!Send` handles, used inside a compio runtime the caller runs. | Thread-per-core applications ([2](2-architecture.md) §4.2). |
+| `apache_pulsar::local` | A `!Send` client, used inside a compio runtime the caller runs; its producers run on that runtime. A producer's handle only holds a channel to its task, so it is `Send` too. | Thread-per-core applications ([2](2-architecture.md) §4.2). |
 | `apache_pulsar::blocking` | Blocking wrappers over the default API. | Code without an async runtime (*client-api* §1). |
 
 The three expose the same operations with the same names, and share one implementation. A blocking call must
@@ -40,8 +40,7 @@ let producer = client.new_producer(Schema::string())
     .topic("topic://acme/orders/events")
     .producer_name("orders-writer")
     .access_mode(ProducerAccessMode::Shared)
-    .batching(BatchingPolicy::default())
-    .compression(CompressionPolicy::lz4())
+    .send_timeout(Duration::from_secs(30))
     .create().await?;
 
 let id: MessageId = producer.new_message()
@@ -54,6 +53,8 @@ producer.send("no key".to_string()).await?;   // shortcut for a message with onl
 producer.flush().await?;
 producer.close().await?;
 ```
+
+Batching and compression policies come with multi-message batches ([Plan](../PLAN.md), M6).
 
 ### 3.1 Send ordering and pipelining
 
@@ -78,7 +79,7 @@ while let Some(result) = results.next().await {
 
 Collecting futures first (`join_all`, or pushing into `FuturesOrdered`) also works, but nothing is queued until
 the collection is first polled. That suits a known batch, not a continuous source. That these combinators make
-their first polls in creation order is checked by a test in M2 ([Plan](../PLAN.md)), not assumed.
+their first polls in creation order is checked by a test (`pipelining_combinators_keep_send_order`), not assumed.
 
 The pitfalls, which the rustdoc of `send` and the examples call out:
 
@@ -88,9 +89,12 @@ The pitfalls, which the rustdoc of `send` and the examples call out:
   message. It is already queued, and may still be published. Only its result is lost. The producer's send timeout
   is what bounds how long a message can wait.
 
-**Queue full.** When the pending-message or memory limit is reached, a send waits for room if the producer
-was built with `block_if_queue_full(true)`. Otherwise it fails with `ProducerQueueFull`, or with
-`MemoryBufferFull` for the client's memory limit. Waiting sends get room in the order they first polled.
+**Queue full.** The client's memory limit (`memory_limit`, 64 MiB by default) is the only bound on what
+producers hold, as in the Java V5 client: each message counts its payload plus 1 KiB, from its first poll until it
+completes. At the limit a send waits for room, by default (`block_if_queue_full(true)`, V5's default), or fails
+with `MemoryBufferFull`. Waiting sends get room in the order they first polled. As in Java, a reservation succeeds
+while usage is at or below the limit, so one message may go over it. There is no pending-message count limit, so
+nothing raises `ProducerQueueFull`; the kind stays for the spec's category.
 
 ## 4. Consumers
 
@@ -206,8 +210,9 @@ fails `create()` or `subscribe()` with `IncompatibleSchema`. Built-in schemas co
 
 - Producers and consumers stay valid until closed. They recover from transient failures by themselves
   (*client-api* §2).
-- `close()` is graceful, takes `&self`, and can be called again: a producer finishes its pending sends, and a
-  consumer flushes its pending acks.
+- `close()` is graceful, takes `&self`, and can be called again. A producer waits for the messages the brokers
+  already have and fails, with `AlreadyClosed`, those still waiting for a layout, a connection or a segment
+  producer, as Java's does; `flush()` first publishes everything. A consumer flushes its pending acks.
 - Rust has no async drop. Dropping the last handle starts the same graceful close in the background, on the
   loop, without waiting for it. Code that needs to know when the close is done calls `close().await`.
 
