@@ -35,7 +35,12 @@ const CONCURRENT: usize = 10_000;
 /// Overshoot bounds. Generous on purpose: this checks "sane", not "precise". The median catches a timer with a
 /// coarse tick; the maximum only catches one that is broken, since shared CI machines (macOS runners especially)
 /// stall a thread for tens of milliseconds now and then.
-const P50_BOUND: Duration = Duration::from_millis(5);
+///
+/// The median's bound is wider on macOS. Its runners measure a median of 0.4 to 2.5 ms, but one measured 7.5 ms for
+/// ten 100 ms sleeps, with all ten late by 7 to 10 ms, against Linux's 0.15 ms at worst. compio's timer queue is the
+/// same code on every platform, so the Linux runs keep the tight bound on it.
+const P50_BOUND: Duration =
+    if cfg!(target_os = "macos") { Duration::from_millis(20) } else { Duration::from_millis(5) };
 const MAX_BOUND: Duration = Duration::from_millis(250);
 /// With 10,000 timers the 99th percentile is meaningful.
 const CONCURRENT_P99_BOUND: Duration = Duration::from_millis(50);
