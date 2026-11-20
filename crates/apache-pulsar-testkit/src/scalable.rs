@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A simulated cluster for scalable topics: topics and their layouts, segments, and the producers and Shared
-//! subscriptions on them, over any number of connections.
+//! A simulated cluster for scalable topics: topics and their layouts, segments, and the producers, Shared
+//! subscriptions and readers on them, over any number of connections.
 //!
 //! [`World`] is sans IO like the rest of the testkit: a test, or a socket server, feeds each connection's bytes to
 //! [`World::input`] and writes out what [`World::output`] returns. Admin operations ([`World::split`],
@@ -31,6 +31,10 @@
 //! level, round robin. They outlive their consumers, take acks per message, batch indexes included, and tell their
 //! consumers when they acked everything of a terminated segment, with `CommandReachedEndOfTopic`.
 //!
+//! A reader's subscription isn't durable: it starts where the broker places such a cursor (the start id's entry,
+//! which goes out again), goes with its consumer, and is told the segment ended only if it starts at the end, since
+//! readers don't acknowledge. `CommandGetLastMessageId` is answered with the segment's last message id.
+//!
 //! Unlike the broker, the world hands a consumer one entry a turn, where the broker hands it up to
 //! `dispatcherMaxRoundRobinBatchSize`; and tells a consumer the topic ended once, where the broker tells it again on
 //! later acks and reads.
@@ -38,14 +42,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use apache_pulsar_protocol::frame::{Frame, FrameDecoder, encode_command, encode_payload_command};
+use apache_pulsar_protocol::hash::KeyHash;
+use apache_pulsar_protocol::layout::Layout;
 use apache_pulsar_protocol::proto::base_command::Type;
 use apache_pulsar_protocol::proto::command_ack::AckType;
 use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
 use apache_pulsar_protocol::proto::{
-    BaseCommand, CommandCloseConsumer, CommandCloseProducer, CommandMessage, CommandProducerSuccess,
-    CommandReachedEndOfTopic, CommandScalableTopicUpdate, CommandSendError, CommandSendReceipt, CompressionType,
-    FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG, SegmentInfoProto, SegmentState,
-    ServerError, SingleMessageMetadata,
+    BaseCommand, CommandCloseConsumer, CommandCloseProducer, CommandGetLastMessageIdResponse, CommandMessage,
+    CommandProducerSuccess, CommandReachedEndOfTopic, CommandScalableTopicUpdate, CommandSendError, CommandSendReceipt,
+    CompressionType, FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG,
+    SegmentInfoProto, SegmentState, ServerError, SingleMessageMetadata,
 };
 use buffa::{EnumValue, Message};
 use bytes::{Buf, Bytes, BytesMut};
@@ -99,9 +105,11 @@ struct Segment {
     last_sequence: HashMap<String, i64>,
 }
 
-/// A Shared subscription on a segment.
+/// A Shared subscription on a segment, or a reader's.
 #[derive(Debug, Default)]
 struct Subscription {
+    /// A reader's subscription: not durable, it goes with its consumer.
+    reader: bool,
     /// The entries not acked yet, from the subscription's initial position on, each with its batch indexes not
     /// acked yet.
     unacked: BTreeMap<u64, BTreeSet<u32>>,
@@ -181,6 +189,10 @@ pub struct World {
     /// Topics whose subscribes wait unanswered until [`World::release_subscribes`], as [`World::hold_subscribes`]
     /// makes every subscribe wait.
     pub hold_subscribes_to: BTreeSet<String>,
+    /// While set, `CommandGetLastMessageId` waits unanswered until [`World::release_last_message_ids`].
+    pub hold_last_message_ids: bool,
+    /// Errors to answer the next `CommandGetLastMessageId` with, one each.
+    pub fail_last_message_ids: VecDeque<ServerError>,
     /// While set, scalable-topic lookups get no answer.
     pub silent_lookups: bool,
     /// Every command received, per connection.
@@ -190,6 +202,7 @@ pub struct World {
     held: Vec<(ConnId, BaseCommand)>,
     held_sends: Vec<(ConnId, Frame)>,
     held_subscribes: Vec<(ConnId, BaseCommand)>,
+    held_last_message_ids: Vec<(ConnId, BaseCommand)>,
     next_conn: ConnId,
     next_ledger: u64,
     next_name: u64,
@@ -216,6 +229,8 @@ impl Default for World {
             fail_subscribes: VecDeque::new(),
             fail_subscribes_to: HashMap::new(),
             hold_subscribes_to: BTreeSet::new(),
+            hold_last_message_ids: false,
+            fail_last_message_ids: VecDeque::new(),
             silent_lookups: false,
             log: Vec::new(),
             topics: BTreeMap::new(),
@@ -223,6 +238,7 @@ impl Default for World {
             held: Vec::new(),
             held_sends: Vec::new(),
             held_subscribes: Vec::new(),
+            held_last_message_ids: Vec::new(),
             next_conn: 0,
             next_ledger: 100,
             next_name: 0,
@@ -434,6 +450,13 @@ impl World {
         }
     }
 
+    /// Answers the `CommandGetLastMessageId` held while [`World::hold_last_message_ids`] was set, in order.
+    pub fn release_last_message_ids(&mut self) {
+        for (conn, command) in std::mem::take(&mut self.held_last_message_ids) {
+            self.last_message_id(conn, &command);
+        }
+    }
+
     /// Processes the subscribes held while [`World::hold_subscribes`] was set, in order.
     pub fn release_subscribes(&mut self) {
         // A connection that went took its subscribes with it.
@@ -464,6 +487,12 @@ impl World {
     /// The consumers a subscription has: none before it exists.
     pub fn consumer_count(&self, topic: &str, segment: u64, subscription: &str) -> usize {
         self.topic(topic).segments[&segment].subscriptions.get(subscription).map_or(0, |s| s.consumers.len())
+    }
+
+    /// The active segment of a managed topic that a producer sends `key` to.
+    pub fn route(&self, topic: &str, key: &str) -> u64 {
+        let layout = Layout::from_dag(&self.dag(topic), topic).unwrap();
+        layout.route_key(KeyHash::of(key.as_bytes())).unwrap()
     }
 
     /// What the topic's segments stored: in the order a reader that drains parents before children would see,
@@ -683,8 +712,50 @@ impl World {
             Type::ACK => self.ack(conn, &command),
             Type::REDELIVER_UNACKNOWLEDGED_MESSAGES => self.redeliver(conn, &command),
             Type::CLOSE_CONSUMER => self.close_consumer(conn, &command),
+            Type::GET_LAST_MESSAGE_ID if self.hold_last_message_ids => self.held_last_message_ids.push((conn, command)),
+            Type::GET_LAST_MESSAGE_ID => self.last_message_id(conn, &command),
             _ => {}
         }
+    }
+
+    /// Answers `CommandGetLastMessageId` with the id of the segment's last message, as the broker does: the last
+    /// entry, with the index of its last message for a batch; `-1:-1` for an empty segment.
+    fn last_message_id(&mut self, conn: ConnId, command: &BaseCommand) {
+        let get = &command.getLastMessageId;
+        let place = self.conns.get(&conn).and_then(|c| c.consumers.get(&get.consumer_id)).cloned();
+        let refusal = match place {
+            None => Some(ServerError::ConsumerNotFound),
+            Some(_) => self.fail_last_message_ids.pop_front(),
+        };
+        if let Some(error) = refusal {
+            let error = reply::error(get.request_id, error, &format!("no last message id: {error:?}"));
+            return self.push(conn, error);
+        }
+        let (topic, segment, _) = place.expect("a consumer, for a request not refused");
+        let last = match self.topic(&topic).segments[&segment].entries.last() {
+            Some(stored) => MessageIdData {
+                ledgerId: stored.ledger_id,
+                entryId: stored.entry_id,
+                batch_index: Some(stored.metadata.num_messages_in_batch.map_or(-1, |count| count - 1)),
+                ..Default::default()
+            },
+            None => {
+                MessageIdData { ledgerId: u64::MAX, entryId: u64::MAX, batch_index: Some(-1), ..Default::default() }
+            }
+        };
+        let response = CommandGetLastMessageIdResponse {
+            last_message_id: last.into(),
+            request_id: get.request_id,
+            ..Default::default()
+        };
+        self.push(
+            conn,
+            BaseCommand {
+                r#type: Type::GET_LAST_MESSAGE_ID_RESPONSE.into(),
+                getLastMessageIdResponse: response.into(),
+                ..Default::default()
+            },
+        );
     }
 
     fn scalable_lookup(&mut self, conn: ConnId, command: &BaseCommand) {
@@ -906,10 +977,12 @@ impl World {
         let subscribe = &command.subscribe;
         let request_id = subscribe.request_id;
         let found = self.find_segment(&subscribe.topic);
+        // A subscription that isn't durable is a reader's.
+        let reader = subscribe.durable == Some(false);
         let refusal = match found {
             None => Some(ServerError::TopicNotFound),
-            // Only Shared subscriptions are simulated for now.
-            Some(_) if subscribe.subType != SubType::Shared => Some(ServerError::NotAllowedError),
+            // Only Shared subscriptions, and readers, are simulated for now.
+            Some(_) if subscribe.subType != SubType::Shared && !reader => Some(ServerError::NotAllowedError),
             Some(_) => match self.fail_subscribes_to.get_mut(&subscribe.topic).and_then(VecDeque::pop_front) {
                 Some(error) => Some(error),
                 None => self.fail_subscribes.pop_front(),
@@ -926,12 +999,21 @@ impl World {
         assert!(!self.conns[&conn].consumers.contains_key(&id), "consumer {id} is on connection {conn} already");
         let seg = self.topics.get_mut(&topic).unwrap().segments.get_mut(&segment).unwrap();
         // Where a new subscription starts. One that exists stays where it is.
-        let start = match subscribe.initialPosition() {
+        let initial = match subscribe.initialPosition() {
             InitialPosition::Latest => seg.entries.len(),
             InitialPosition::Earliest => 0,
         };
+        // A reader starts at its start id, as the broker places a cursor that isn't durable: the earliest id at the
+        // first entry; the id of a message at its entry, which goes out again, the reader leaving out what it read;
+        // the latest id at the initial position.
+        let start = match subscribe.start_message_id.as_option() {
+            Some(id) if id.ledgerId == u64::MAX => 0,
+            Some(id) if id.ledgerId == seg.ledger_id && id.entryId < seg.entries.len() as u64 => id.entryId as usize,
+            _ => initial,
+        };
         let entries = &seg.entries[start..];
         let sub = seg.subscriptions.entry(subscribe.subscription.clone()).or_insert_with(|| Subscription {
+            reader,
             unacked: entries.iter().map(|e| (e.entry_id, batch_indexes(e))).collect(),
             ..Default::default()
         });
@@ -1015,6 +1097,11 @@ impl World {
         sub.redeliver.extend(consumer.pending);
         if sub.consumers.is_empty() {
             sub.redeliveries.clear();
+            // A reader's subscription goes with its consumer.
+            if sub.reader {
+                let seg = self.topics.get_mut(topic).unwrap().segments.get_mut(segment).unwrap();
+                seg.subscriptions.remove(name);
+            }
         }
     }
 
