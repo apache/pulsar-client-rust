@@ -809,7 +809,7 @@ fn a_message_above_the_brokers_limit_fails() {
         let client = local_client(&server).await;
         let producer = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap();
         let error = producer.send(vec![0; 6 << 20]).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Other, "{error}");
+        assert_eq!(error.kind(), ErrorKind::MessageTooLarge, "{error}");
         producer.send(b"fine".to_vec()).await.unwrap();
         assert_eq!(client.memory().used(), 0);
         client.close().await.unwrap();

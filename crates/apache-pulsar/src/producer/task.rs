@@ -482,7 +482,35 @@ pub(crate) fn send_error(error: SendError) -> Error {
         SendError::AlreadyClosed => ErrorKind::AlreadyClosed,
         SendError::Timeout | SendError::Unavailable(_) => ErrorKind::Timeout,
         SendError::Server { error, .. } => server_error_kind(EnumValue::Known(*error)),
-        SendError::Routing(_) | SendError::TooLarge { .. } => ErrorKind::Other,
+        SendError::TooLarge { .. } => ErrorKind::MessageTooLarge,
+        SendError::Routing(_) => ErrorKind::Other,
     };
     Error::with_source(kind, error.to_string(), error)
+}
+
+#[cfg(test)]
+mod tests {
+    use apache_pulsar_protocol::layout::LayoutError;
+    use apache_pulsar_protocol::proto::ServerError;
+
+    use super::*;
+
+    #[test]
+    fn send_failures_map_to_kinds() {
+        let terminated = SendError::Server { error: ServerError::TopicTerminatedError, message: "sealed".into() };
+        let cases = [
+            (SendError::AlreadyClosed, ErrorKind::AlreadyClosed),
+            (SendError::Timeout, ErrorKind::Timeout),
+            (SendError::Unavailable("no broker".into()), ErrorKind::Timeout),
+            (terminated, ErrorKind::TopicTerminated),
+            (SendError::TooLarge { size: 6, limit: 5 }, ErrorKind::MessageTooLarge),
+            (SendError::Routing(LayoutError::NoActiveSegment), ErrorKind::Other),
+        ];
+        for (failure, kind) in cases {
+            let message = failure.to_string();
+            let error = send_error(failure);
+            assert_eq!(error.kind(), kind, "{message}");
+            assert_eq!(error.to_string(), format!("{kind:?}: {message}"));
+        }
+    }
 }

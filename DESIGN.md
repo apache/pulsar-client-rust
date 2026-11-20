@@ -69,6 +69,7 @@ here.
 | 9 | *client-api* §2 and §3.3 say a graceful close awaits pending operations and completes pending publishes. Java V5's close waits for what the brokers already have, and fails with `AlreadyClosed` the sends still waiting for a layout, a connection or a segment producer; its tests pin that behavior. | Java's. | To raise |
 | 10 | *client-api* §3.1 and *error-model* §2 have a pending-send queue that can be full (`ProducerQueueFull`). Java V5 bounds producers by the client memory limit only, and never raises it. | Java's: the memory limit only; the kind exists, unused. | To raise |
 | 11 | *client-behavior* §1 says to apply a layout only if its epoch is greater than the last applied. Java's `DagWatchClient` applies every update it receives. | The spec's: `>`, as in gap 5. | To raise |
+| 12 | A message larger than the broker's `max_message_size` can't be sent, but *error-model* §2 has no category for that failure. Java v4 raises `InvalidMessageException`, which Java V5 doesn't map: its send fails with a plain `PulsarClientException`. | `ErrorKind::MessageTooLarge`. | To raise |
 
 ## Reference material
 

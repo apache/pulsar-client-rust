@@ -149,7 +149,7 @@ impl Error { pub fn kind(&self) -> ErrorKind; }
 pub enum ErrorKind {
     NotFound, Authentication, Authorization, Timeout, AlreadyClosed,
     ProducerBusy, ProducerFenced, ConsumerBusy, IncompatibleSchema, TopicTerminated,
-    Connect, NotConnected, ProducerQueueFull, MemoryBufferFull, TransactionConflict,
+    Connect, NotConnected, ProducerQueueFull, MemoryBufferFull, MessageTooLarge, TransactionConflict,
     Crypto, InvalidConfiguration, InvalidServiceUrl, UnsupportedBroker,
 }
 ```
@@ -158,6 +158,9 @@ pub enum ErrorKind {
   The spec groups ProducerBusy and Fenced; they are separate kinds here.
 - `UnsupportedBroker` is the failure when a broker doesn't advertise scalable topics (C15). The spec has no
   category for it, and Java uses `FeatureNotSupportedException` ([spec gap 8](../DESIGN.md#spec-gaps-to-raise-upstream)).
+- `MessageTooLarge` is the failure of a message larger than the broker's `max_message_size`. It fails alone,
+  and the producer stays usable. The spec has no category for it, and Java V5 raises a plain
+  `PulsarClientException` ([spec gap 12](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - The spec's `Interrupted` has no Rust counterpart, since Rust threads are not interrupted.
 - An async operation never fails before its future exists: every failure comes out of the future
   (*error-model* §1). Nothing in the public API panics on bad input; that is an `InvalidConfiguration` error.
