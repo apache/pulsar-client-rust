@@ -15,22 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A simulated cluster for scalable topics: topics and their layouts, segments, and the producers on them, over
-//! any number of connections.
+//! A simulated cluster for scalable topics: topics and their layouts, segments, and the producers and Shared
+//! subscriptions on them, over any number of connections.
 //!
 //! [`World`] is sans IO like the rest of the testkit: a test, or a socket server, feeds each connection's bytes to
 //! [`World::input`] and writes out what [`World::output`] returns. Admin operations ([`World::split`],
 //! [`World::merge`], [`World::terminate`]) behave like the 5.0.1 broker's: sealing a segment terminates its topic,
 //! which disconnects its producers with `CommandCloseProducer`, then the new layout goes to every watch.
+//!
+//! A segment's subscriptions dispatch like the broker's Shared dispatcher: the entries to redeliver first, in
+//! position order, then the ones not read yet, each to the next consumer with permits on the highest priority
+//! level, round robin. They outlive their consumers, take acks per message, batch indexes included, and tell their
+//! consumers when they acked everything of a terminated segment, with `CommandReachedEndOfTopic`.
+//!
+//! Unlike the broker, the world hands a consumer one entry a turn, where the broker hands it up to
+//! `dispatcherMaxRoundRobinBatchSize`; and tells a consumer the topic ended once, where the broker tells it again on
+//! later acks and reads.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use apache_pulsar_protocol::frame::{Frame, FrameDecoder, encode_command};
+use apache_pulsar_protocol::frame::{Frame, FrameDecoder, encode_command, encode_payload_command};
 use apache_pulsar_protocol::proto::base_command::Type;
+use apache_pulsar_protocol::proto::command_ack::AckType;
+use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
 use apache_pulsar_protocol::proto::{
-    BaseCommand, CommandCloseProducer, CommandProducerSuccess, CommandScalableTopicUpdate, CommandSendError,
-    CommandSendReceipt, FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG,
-    SegmentInfoProto, SegmentState, ServerError, SingleMessageMetadata,
+    BaseCommand, CommandCloseConsumer, CommandCloseProducer, CommandMessage, CommandProducerSuccess,
+    CommandReachedEndOfTopic, CommandScalableTopicUpdate, CommandSendError, CommandSendReceipt, CompressionType,
+    FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG, SegmentInfoProto, SegmentState,
+    ServerError, SingleMessageMetadata,
 };
 use buffa::{EnumValue, Message};
 use bytes::{Buf, Bytes, BytesMut};
@@ -48,23 +60,27 @@ pub struct Stored {
     pub entry_id: u64,
     pub producer_name: String,
     pub sequence_id: u64,
-    /// The key of the entry's first message.
+    /// The key of the entry's first message. `None` in a compressed entry: the world doesn't decompress.
     pub key: Option<String>,
-    /// The payload of the entry's first message.
+    /// The payload of the entry's first message. Empty in a compressed entry.
     pub value: Bytes,
     pub metadata: MessageMetadata,
-    /// The first message's own metadata, in a batch.
+    /// The first message's own metadata, in a batch. `None` in a compressed entry.
     pub single: Option<SingleMessageMetadata>,
+    /// The entry's payload as it came: one message or a whole batch, compressed or not. Consumers get it as is.
+    pub payload: Bytes,
 }
 
 #[derive(Debug)]
 struct Segment {
     info: SegmentInfoProto,
-    /// The topic its producers attach to.
+    /// The topic its producers and consumers attach to.
     name: String,
     ledger_id: u64,
     entries: Vec<Stored>,
     terminated: bool,
+    /// Subscriptions by name. They outlive their consumers.
+    subscriptions: BTreeMap<String, Subscription>,
     /// Producers, in registration order: `(connection, producer id, name)`.
     producers: Vec<(ConnId, u64, String)>,
     exclusive: bool,
@@ -74,6 +90,38 @@ struct Segment {
     topic_epoch: u64,
     /// The highest sequence id stored per producer name, for deduplication.
     last_sequence: HashMap<String, i64>,
+}
+
+/// A Shared subscription on a segment.
+#[derive(Debug, Default)]
+struct Subscription {
+    /// The entries not acked yet, from the subscription's initial position on, each with its batch indexes not
+    /// acked yet.
+    unacked: BTreeMap<u64, BTreeSet<u32>>,
+    /// The next entry to read: the ones before it were dispatched already.
+    read: u64,
+    /// Entries to dispatch again, before reading more.
+    redeliver: BTreeSet<u64>,
+    /// How many times each entry was redelivered.
+    redeliveries: HashMap<u64, u32>,
+    /// In the order they subscribed.
+    consumers: Vec<Consumer>,
+    /// Where the round robin looks for the next consumer first.
+    next: usize,
+}
+
+#[derive(Debug)]
+struct Consumer {
+    conn: ConnId,
+    id: u64,
+    /// The lowest level is served first.
+    priority: i32,
+    /// The messages it can take. A batch can take it below zero.
+    permits: i64,
+    /// The entries sent to it and not acked yet.
+    pending: BTreeSet<u64>,
+    /// Whether it was told the topic ended.
+    ended: bool,
 }
 
 #[derive(Debug)]
@@ -95,6 +143,8 @@ struct Conn {
     producers: HashMap<u64, (String, u64)>,
     /// Producers the broker closed: their late sends are ignored, as the 5.0.1 broker's `recentlyClosedProducers`.
     closed_producers: std::collections::HashSet<u64>,
+    /// Consumers: consumer id to `(topic, segment, subscription)`.
+    consumers: HashMap<u64, (String, u64, String)>,
 }
 
 /// The simulated cluster. See the module documentation.
@@ -114,6 +164,11 @@ pub struct World {
     pub hold_sends: bool,
     /// Errors to answer the next sends with, one each, instead of storing them.
     pub fail_sends: VecDeque<ServerError>,
+    /// While set, subscribes wait unanswered until [`World::release_subscribes`], as while the broker creates the
+    /// consumer: closing the consumer meanwhile discards it, and its subscribe never gets an answer.
+    pub hold_subscribes: bool,
+    /// Errors to answer the next subscribes with, one each, instead of subscribing.
+    pub fail_subscribes: VecDeque<ServerError>,
     /// While set, scalable-topic lookups get no answer.
     pub silent_lookups: bool,
     /// Every command received, per connection.
@@ -122,6 +177,7 @@ pub struct World {
     conns: BTreeMap<ConnId, Conn>,
     held: Vec<(ConnId, BaseCommand)>,
     held_sends: Vec<(ConnId, Frame)>,
+    held_subscribes: Vec<(ConnId, BaseCommand)>,
     next_conn: ConnId,
     next_ledger: u64,
     next_name: u64,
@@ -144,12 +200,15 @@ impl Default for World {
             hold_receipts: false,
             hold_sends: false,
             fail_sends: VecDeque::new(),
+            hold_subscribes: false,
+            fail_subscribes: VecDeque::new(),
             silent_lookups: false,
             log: Vec::new(),
             topics: BTreeMap::new(),
             conns: BTreeMap::new(),
             held: Vec::new(),
             held_sends: Vec::new(),
+            held_subscribes: Vec::new(),
             next_conn: 0,
             next_ledger: 100,
             next_name: 0,
@@ -297,6 +356,33 @@ impl World {
         for (conn, producer_id, _) in producers {
             self.close_producer(conn, producer_id);
         }
+        // Consumers stay, to drain it.
+        self.dispatch(topic, segment);
+    }
+
+    /// Unloads a segment's topic, as a broker does before another broker takes it: its producers and consumers are
+    /// closed, with `CommandCloseProducer` and `CommandCloseConsumer`, and come back on their own.
+    pub fn unload(&mut self, topic: &str, segment: u64) {
+        let producers = {
+            let seg = self.topic_mut(topic).segments.get_mut(&segment).expect("no such segment");
+            seg.exclusive = false;
+            std::mem::take(&mut seg.producers)
+        };
+        for (conn, producer_id, _) in producers {
+            self.close_producer(conn, producer_id);
+        }
+        let consumers: Vec<(ConnId, u64)> = self
+            .conns
+            .iter()
+            .flat_map(|(conn, c)| c.consumers.iter().map(move |(id, place)| (*conn, *id, place)))
+            .filter(|(_, _, (t, s, _))| (t.as_str(), *s) == (topic, segment))
+            .map(|(conn, id, _)| (conn, id))
+            .collect();
+        for (conn, consumer_id) in consumers {
+            let place = self.conn(conn).consumers.remove(&consumer_id).unwrap();
+            self.remove_consumer(conn, consumer_id, &place);
+            self.push(conn, consumer_closed(consumer_id));
+        }
     }
 
     /// Processes the sends held while [`World::hold_sends`] was set, in order.
@@ -308,6 +394,38 @@ impl World {
             let command = BaseCommand::decode_from_slice(&frame.command).unwrap();
             self.send(conn, &command, &frame);
         }
+    }
+
+    /// Processes the subscribes held while [`World::hold_subscribes`] was set, in order.
+    pub fn release_subscribes(&mut self) {
+        // A connection that went took its subscribes with it.
+        let held: Vec<(ConnId, BaseCommand)> =
+            std::mem::take(&mut self.held_subscribes).into_iter().filter(|(conn, _)| self.is_open(*conn)).collect();
+        for (conn, command) in held {
+            self.subscribe(conn, &command);
+        }
+    }
+
+    /// Stores an entry in a segment as if another client produced it, a batch and/or compressed as `metadata`
+    /// says, and dispatches it. Returns its `(ledger id, entry id)`.
+    ///
+    /// The world doesn't decompress: a compressed entry's [`Stored::key`], [`Stored::value`] and [`Stored::single`]
+    /// stay empty. Consumers get `payload` as given.
+    pub fn publish_raw(&mut self, topic: &str, segment: u64, metadata: MessageMetadata, payload: Bytes) -> (u64, u64) {
+        assert!(!self.topic(topic).segments[&segment].terminated, "segment {segment} was terminated");
+        let at = self.store(topic, segment, metadata.sequence_id, metadata, payload);
+        self.dispatch(topic, segment);
+        at
+    }
+
+    /// The messages a subscription has not acked yet: a batch counts its indexes not acked.
+    pub fn backlog(&self, topic: &str, segment: u64, subscription: &str) -> usize {
+        self.topic(topic).segments[&segment].subscriptions[subscription].unacked.values().map(BTreeSet::len).sum()
+    }
+
+    /// The consumers a subscription has: none before it exists.
+    pub fn consumer_count(&self, topic: &str, segment: u64, subscription: &str) -> usize {
+        self.topic(topic).segments[&segment].subscriptions.get(subscription).map_or(0, |s| s.consumers.len())
     }
 
     /// What the topic's segments stored: in the order a reader that drains parents before children would see,
@@ -444,9 +562,17 @@ impl World {
         let Some(c) = self.conns.get_mut(&conn) else { return };
         c.open = false;
         let producers: Vec<(u64, (String, u64))> = c.producers.drain().collect();
+        let consumers: Vec<(u64, (String, u64, String))> = c.consumers.drain().collect();
         c.sessions.clear();
         for (producer_id, (topic, segment)) in producers {
             self.remove_producer(conn, producer_id, &topic, segment);
+        }
+        // All of them go before what they had pending goes to the consumers left.
+        for (consumer_id, place) in &consumers {
+            self.remove_consumer(conn, *consumer_id, place);
+        }
+        for (_, (topic, segment, _)) in consumers {
+            self.dispatch(&topic, segment);
         }
         for topic in self.topics.values_mut() {
             for segment in topic.segments.values_mut() {
@@ -501,6 +627,12 @@ impl World {
                 }
                 self.push(conn, reply::success(close.request_id));
             }
+            Type::SUBSCRIBE if self.hold_subscribes => self.held_subscribes.push((conn, command)),
+            Type::SUBSCRIBE => self.subscribe(conn, &command),
+            Type::FLOW => self.flow(conn, &command),
+            Type::ACK => self.ack(conn, &command),
+            Type::REDELIVER_UNACKNOWLEDGED_MESSAGES => self.redeliver(conn, &command),
+            Type::CLOSE_CONSUMER => self.close_consumer(conn, &command),
             _ => {}
         }
     }
@@ -664,21 +796,8 @@ impl World {
         let (ledger_id, entry_id) = if duplicate {
             (u64::MAX, u64::MAX) // -1, -1: how the broker acknowledges a duplicate
         } else {
-            let (key, value, single) = first_message(&metadata, &section.payload);
-            let entry_id = seg.entries.len() as u64;
-            seg.entries.push(Stored {
-                segment,
-                ledger_id: seg.ledger_id,
-                entry_id,
-                producer_name: name.clone(),
-                sequence_id: send.sequence_id,
-                key,
-                value,
-                metadata,
-                single,
-            });
             seg.last_sequence.insert(name, highest as i64);
-            (seg.ledger_id, entry_id)
+            self.store(&topic, segment, send.sequence_id, metadata, section.payload.clone())
         };
         let receipt = CommandSendReceipt {
             producer_id: send.producer_id,
@@ -694,6 +813,245 @@ impl World {
         } else {
             self.push(conn, receipt);
         }
+        // Once written, the entry goes to the subscriptions' consumers.
+        self.dispatch(&topic, segment);
+    }
+
+    /// Appends an entry to a segment, and to the backlog of each of its subscriptions.
+    fn store(
+        &mut self,
+        topic: &str,
+        segment: u64,
+        sequence_id: u64,
+        metadata: MessageMetadata,
+        payload: Bytes,
+    ) -> (u64, u64) {
+        let seg = self.topics.get_mut(topic).unwrap().segments.get_mut(&segment).unwrap();
+        // The world doesn't decompress: a compressed entry shows no first message.
+        let (key, value, single) = match metadata.compression() {
+            CompressionType::NONE => first_message(&metadata, &payload),
+            _ => (None, Bytes::new(), None),
+        };
+        let stored = Stored {
+            segment,
+            ledger_id: seg.ledger_id,
+            entry_id: seg.entries.len() as u64,
+            producer_name: metadata.producer_name.clone(),
+            sequence_id,
+            key,
+            value,
+            metadata,
+            single,
+            payload,
+        };
+        for sub in seg.subscriptions.values_mut() {
+            sub.unacked.insert(stored.entry_id, batch_indexes(&stored));
+        }
+        let at = (stored.ledger_id, stored.entry_id);
+        seg.entries.push(stored);
+        at
+    }
+
+    fn subscribe(&mut self, conn: ConnId, command: &BaseCommand) {
+        let subscribe = &command.subscribe;
+        let request_id = subscribe.request_id;
+        let found = self.find_segment(&subscribe.topic);
+        let refusal = match found {
+            None => Some(ServerError::TopicNotFound),
+            // Only Shared subscriptions are simulated for now.
+            Some(_) if subscribe.subType != SubType::Shared => Some(ServerError::NotAllowedError),
+            Some(_) => self.fail_subscribes.pop_front(),
+        };
+        if let Some(error) = refusal {
+            let error = reply::error(request_id, error, &format!("the broker refused the subscribe: {error:?}"));
+            self.push(conn, error);
+            return;
+        }
+        let (topic, segment) = found.expect("a segment, for a subscribe not refused");
+        // The broker would close the one there and answer `ServiceNotReady`: not simulated.
+        let id = subscribe.consumer_id;
+        assert!(!self.conns[&conn].consumers.contains_key(&id), "consumer {id} is on connection {conn} already");
+        let seg = self.topics.get_mut(&topic).unwrap().segments.get_mut(&segment).unwrap();
+        // Where a new subscription starts. One that exists stays where it is.
+        let start = match subscribe.initialPosition() {
+            InitialPosition::Latest => seg.entries.len(),
+            InitialPosition::Earliest => 0,
+        };
+        let entries = &seg.entries[start..];
+        let sub = seg.subscriptions.entry(subscribe.subscription.clone()).or_insert_with(|| Subscription {
+            unacked: entries.iter().map(|e| (e.entry_id, batch_indexes(e))).collect(),
+            ..Default::default()
+        });
+        sub.consumers.push(Consumer {
+            conn,
+            id,
+            priority: subscribe.priority_level.unwrap_or(0),
+            permits: 0,
+            pending: BTreeSet::new(),
+            ended: false,
+        });
+        let place = (topic.clone(), segment, subscribe.subscription.clone());
+        self.conn(conn).consumers.insert(id, place);
+        self.push(conn, reply::success(request_id));
+        // A consumer that joins a subscription at the end of a terminated segment learns it right away.
+        self.dispatch(&topic, segment);
+    }
+
+    fn flow(&mut self, conn: ConnId, command: &BaseCommand) {
+        let flow = &command.flow;
+        let Some((topic, segment, name)) = self.consumer(conn, flow.consumer_id) else { return };
+        let sub = self.subscription(&topic, segment, &name);
+        let at = sub.position(conn, flow.consumer_id);
+        sub.consumers[at].permits += i64::from(flow.messagePermits);
+        self.dispatch(&topic, segment);
+    }
+
+    fn ack(&mut self, conn: ConnId, command: &BaseCommand) {
+        let ack = &command.ack;
+        // A Shared subscription ignores cumulative acks, as the broker does.
+        let place = self.consumer(conn, ack.consumer_id).filter(|_| ack.ack_type == AckType::Individual);
+        let Some((topic, segment, name)) = place else { return };
+        let ledger = self.topic(&topic).segments[&segment].ledger_id;
+        let sub = self.subscription(&topic, segment, &name);
+        for id in ack.message_id.iter().filter(|id| id.ledgerId == ledger) {
+            // A corrupt entry is acked whole: the client drops all of it.
+            let ack_set = (ack.validation_error.is_none() && !id.ack_set.is_empty()).then_some(&id.ack_set[..]);
+            sub.ack(id.entryId, ack_set);
+        }
+        self.dispatch(&topic, segment);
+    }
+
+    fn redeliver(&mut self, conn: ConnId, command: &BaseCommand) {
+        let redeliver = &command.redeliverUnacknowledgedMessages;
+        let Some((topic, segment, name)) = self.consumer(conn, redeliver.consumer_id) else { return };
+        let ledger = self.topic(&topic).segments[&segment].ledger_id;
+        let sub = self.subscription(&topic, segment, &name);
+        let at = sub.position(conn, redeliver.consumer_id);
+        let pending = &mut sub.consumers[at].pending;
+        // No ids: everything pending on the consumer. Ids not pending on it are ignored, as the broker does.
+        let entries: Vec<u64> = if redeliver.message_ids.is_empty() {
+            std::mem::take(pending).into_iter().collect()
+        } else {
+            let ids = redeliver.message_ids.iter().filter(|id| id.ledgerId == ledger);
+            ids.map(|id| id.entryId).filter(|entry| pending.remove(entry)).collect()
+        };
+        // Asked for again: one redelivery more each.
+        for entry in &entries {
+            *sub.redeliveries.entry(*entry).or_default() += 1;
+        }
+        sub.redeliver.extend(entries);
+        self.dispatch(&topic, segment);
+    }
+
+    fn close_consumer(&mut self, conn: ConnId, command: &BaseCommand) {
+        let close = &command.close_consumer;
+        // Closing a consumer the broker is still creating discards it: its subscribe gets no answer.
+        self.held_subscribes.retain(|(c, held)| (*c, held.subscribe.consumer_id) != (conn, close.consumer_id));
+        // A consumer the broker doesn't know is closed already.
+        self.push(conn, reply::success(close.request_id));
+        let Some(place) = self.conn(conn).consumers.remove(&close.consumer_id) else { return };
+        self.remove_consumer(conn, close.consumer_id, &place);
+        self.dispatch(&place.0, place.1);
+    }
+
+    /// Takes a consumer off its subscription: the entries it had pending wait to go out again. As in the broker,
+    /// that is no redelivery to count, and the counts go once the last consumer goes.
+    fn remove_consumer(&mut self, conn: ConnId, id: u64, (topic, segment, name): &(String, u64, String)) {
+        let sub = self.subscription(topic, *segment, name);
+        let consumer = sub.consumers.remove(sub.position(conn, id));
+        sub.redeliver.extend(consumer.pending);
+        if sub.consumers.is_empty() {
+            sub.redeliveries.clear();
+        }
+    }
+
+    /// Where a consumer of the connection is: `(topic, segment, subscription)`.
+    fn consumer(&self, conn: ConnId, id: u64) -> Option<(String, u64, String)> {
+        self.conns[&conn].consumers.get(&id).cloned()
+    }
+
+    fn subscription(&mut self, topic: &str, segment: u64, name: &str) -> &mut Subscription {
+        let seg = self.topics.get_mut(topic).unwrap().segments.get_mut(&segment).unwrap();
+        seg.subscriptions.get_mut(name).expect("the subscription of a consumer")
+    }
+
+    /// Dispatches what each subscription of the segment has for its consumers. One that acked everything of a
+    /// terminated segment tells each of its consumers, once, that the topic ended.
+    fn dispatch(&mut self, topic: &str, segment: u64) {
+        let World { topics, conns, .. } = self;
+        let seg = topics.get_mut(topic).unwrap().segments.get_mut(&segment).unwrap();
+        for sub in seg.subscriptions.values_mut() {
+            while let Some((at, entry)) = sub.next_delivery() {
+                let stored = &seg.entries[entry as usize];
+                let message = sub.deliver(at, stored);
+                let out = &mut conns.get_mut(&sub.consumers[at].conn).expect("a consumer's connection").out;
+                encode_payload_command(&message, &stored.metadata, &stored.payload, out).unwrap();
+            }
+            let ended = seg.terminated && sub.unacked.is_empty();
+            for consumer in sub.consumers.iter_mut().filter(|c| ended && !c.ended) {
+                consumer.ended = true;
+                let out = &mut conns.get_mut(&consumer.conn).expect("a consumer's connection").out;
+                encode_command(&reached_end_of_topic(consumer.id), out).unwrap();
+            }
+        }
+    }
+}
+
+impl Subscription {
+    /// The next entry to dispatch and the consumer it goes to, by its position: the first entry to redeliver, else
+    /// the first one not read yet, to the next consumer with permits on the highest priority level, round robin.
+    fn next_delivery(&mut self) -> Option<(usize, u64)> {
+        let unread = self.unacked.range(self.read..).next().map(|(entry, _)| entry);
+        let entry = *self.redeliver.first().or(unread)?;
+        let count = self.consumers.len();
+        let ready = (0..count).map(|i| (self.next + i) % count).filter(|&i| self.consumers[i].permits > 0);
+        // The first of the lowest level, from where the round robin is.
+        let at = ready.min_by_key(|&i| self.consumers[i].priority)?;
+        self.next = at + 1;
+        Some((at, entry))
+    }
+
+    /// Gives an entry to the consumer at `at`, and returns the message that sends it. The entry stays pending on the
+    /// consumer until acked, and costs it the messages not acked in it: a consumer with any permit gets a whole
+    /// batch, as the broker's dispatcher gives each consumer it picks at least one entry.
+    fn deliver(&mut self, at: usize, stored: &Stored) -> BaseCommand {
+        let entry = stored.entry_id;
+        let unacked = &self.unacked[&entry];
+        let consumer = &mut self.consumers[at];
+        consumer.permits -= unacked.len() as i64;
+        consumer.pending.insert(entry);
+        self.redeliver.remove(&entry);
+        self.read = self.read.max(entry + 1);
+        // Only a batch with indexes acked says which ones are left.
+        let partial = unacked.len() < stored.metadata.num_messages_in_batch() as usize;
+        let message = CommandMessage {
+            consumer_id: consumer.id,
+            message_id: MessageIdData { ledgerId: stored.ledger_id, entryId: entry, ..Default::default() }.into(),
+            redelivery_count: self.redeliveries.get(&entry).copied(),
+            ack_set: if partial { bitset(unacked) } else { Vec::new() },
+            ..Default::default()
+        };
+        BaseCommand { r#type: Type::MESSAGE.into(), message: message.into(), ..Default::default() }
+    }
+
+    /// Acks the batch indexes whose bit `ack_set` clears, or the whole entry without one. An entry with every
+    /// index acked leaves the consumer it was pending on, and is never dispatched again.
+    fn ack(&mut self, entry: u64, ack_set: Option<&[i64]>) {
+        // One acked already stays acked, as the broker's cursor skips a deleted position.
+        let Some(unacked) = self.unacked.get_mut(&entry) else { return };
+        unacked.retain(|&index| ack_set.is_some_and(|words| is_set(words, index)));
+        if unacked.is_empty() {
+            self.unacked.remove(&entry);
+            self.redeliver.remove(&entry);
+            for consumer in &mut self.consumers {
+                consumer.pending.remove(&entry);
+            }
+        }
+    }
+
+    /// Where a consumer is in [`Subscription::consumers`].
+    fn position(&self, conn: ConnId, id: u64) -> usize {
+        self.consumers.iter().position(|c| (c.conn, c.id) == (conn, id)).expect("a consumer of the subscription")
     }
 }
 
@@ -710,6 +1068,7 @@ impl Segment {
             waiting: VecDeque::new(),
             topic_epoch: 0,
             last_sequence: HashMap::new(),
+            subscriptions: BTreeMap::new(),
         }
     }
 }
@@ -745,6 +1104,43 @@ fn close_producer(producer_id: u64) -> BaseCommand {
         close_producer: CommandCloseProducer { producer_id, ..Default::default() }.into(),
         ..Default::default()
     }
+}
+
+/// The broker closing a consumer.
+fn consumer_closed(consumer_id: u64) -> BaseCommand {
+    BaseCommand {
+        r#type: Type::CLOSE_CONSUMER.into(),
+        close_consumer: CommandCloseConsumer { consumer_id, ..Default::default() }.into(),
+        ..Default::default()
+    }
+}
+
+fn reached_end_of_topic(consumer_id: u64) -> BaseCommand {
+    BaseCommand {
+        r#type: Type::REACHED_END_OF_TOPIC.into(),
+        reachedEndOfTopic: CommandReachedEndOfTopic { consumer_id, ..Default::default() }.into(),
+        ..Default::default()
+    }
+}
+
+/// The batch indexes of an entry: one for an entry that isn't a batch.
+fn batch_indexes(stored: &Stored) -> BTreeSet<u32> {
+    (0..stored.metadata.num_messages_in_batch() as u32).collect()
+}
+
+/// Batch indexes as Java's `BitSet.toLongArray`, the layout of an `ack_set`: index i is bit i % 64 of word i / 64,
+/// up to the last word with a bit set.
+fn bitset(indexes: &BTreeSet<u32>) -> Vec<i64> {
+    let mut words = vec![0; indexes.last().map_or(0, |&last| last as usize / 64 + 1)];
+    for &index in indexes {
+        words[index as usize / 64] |= 1 << (index % 64);
+    }
+    words
+}
+
+/// Whether an `ack_set` has the bit of a batch index set. The words it leaves out are zeros.
+fn is_set(ack_set: &[i64], index: u32) -> bool {
+    ack_set.get(index as usize / 64).is_some_and(|&word| (word >> (index % 64)) & 1 == 1)
 }
 
 /// The key and payload of an entry's first message: a batch's first message, or the entry itself.

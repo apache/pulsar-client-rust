@@ -32,3 +32,6 @@ workspace = true
 apache-pulsar-protocol.workspace = true
 buffa.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+zstd = "0.14.4"

@@ -31,8 +31,21 @@ workspace = true
 buffa.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"], optional = true }
+lz4_flex = { version = "0.14.2", default-features = false, features = ["std", "safe-decode", "safe-encode"], optional = true }
+snap = { version = "1.1.2", optional = true }
 thiserror.workspace = true
+zstd = { version = "0.14.4", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The codecs that consumers decode, and later producers encode: each behind a feature, all on by default
+# (docs/3-protocol.md §6).
+[features]
+default = ["lz4", "zlib", "snappy", "zstd"]
+lz4 = ["dep:lz4_flex"]
+zlib = ["dep:flate2"]
+snappy = ["dep:snap"]
+zstd = ["dep:zstd"]

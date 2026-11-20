@@ -92,30 +92,45 @@ STICKY with `entryBucketDispatch` and the segment's boundary list in `hashRanges
 initial position, `read_compacted`, `replicate_subscription_state` and the schema.
 
 **Flow control.** The consumer grants the broker permits up to its receiver queue size (`CommandFlow`), and
-grants more as the application takes messages, once half the queue is free.
+grants more as the application takes messages, once half the queue is free. A message the consumer leaves out
+(acknowledged already in its batch, compacted out, or in an entry it can't read) counts as taken, since the broker
+counted it.
 
-**Receiving.** A `CommandMessage` is parsed into its metadata and payload, decompressed, and split into the
-messages of its batch (`SingleMessageMetadata`). Messages already acknowledged in a batch, per the
-`ack_set`, are skipped. Each message carries its segment id up to the scalable layer, which uses it to route
-acks.
+**Receiving.** A `CommandMessage` is checked, decompressed, and split into the messages of its batch
+(`SingleMessageMetadata`); as in Java, an entry is a batch when its metadata sets `num_messages_in_batch`. Messages
+already acknowledged in a batch, per the broker's `ack_set`, and messages compacted out are skipped. Each message
+carries its segment id up to the scalable layer, which uses it to route acks.
+
+- A corrupt entry (a bad checksum or metadata, a payload that doesn't decompress to its recorded size, a malformed
+  batch) is acknowledged with the reason, `validation_error`, so that the broker drops it, as Java does.
+- An encrypted entry, or a chunk of a larger message, is left unacknowledged for a consumer that can read it, until
+  encryption and chunking come ([Plan](../PLAN.md)). Java fails such an entry the same way by default.
 
 **Acknowledging.**
 
-- Individual and cumulative acks, with batch-index acks inside a batch.
+- Individual and cumulative acks, with batch-index acks inside a batch. An ack names the indexes acknowledged
+  since the last one, and the broker drops the entry once every index is acknowledged.
 - Acks are grouped by an ack group time (100 ms by default, as in Java) and sent as one `CommandAck` per
-  group. They are fire-and-forget: the scalable-topics API exposes no broker-confirmed acks, and the Java V5
-  `acknowledge` methods return `void`. So the engine never asks for ack receipts.
-- Negative acks collect for a redelivery delay, then go out as `CommandRedeliverUnacknowledgedMessages`.
-  The redelivery count comes back on the redelivered messages.
+  group, or at once when a group reaches 1000. They are fire-and-forget: the scalable-topics API exposes no
+  broker-confirmed acks, and the Java V5 `acknowledge` methods return `void`. So the engine never asks for ack
+  receipts.
+- Negative acks collect for a redelivery delay (60 s by default, as in Java), then go out as
+  `CommandRedeliverUnacknowledgedMessages`, a thousand entries at most per command. It names entries, so a negative
+  ack of one message of a batch brings the batch back, less the indexes acknowledged meanwhile, as in Java. The
+  redelivery count comes back on the redelivered messages.
 - Transactional acks are a later capability.
 
 **Draining.** For the Stream consumer's mode flips and segment releases (*key-shared* §4), the consumer can
 stop delivering new messages and report when every message it delivered has been acknowledged. It never
 acknowledges anything to get there.
 
+**The end of a segment.** The broker tells the consumers of a terminated segment once their subscription has
+acknowledged everything there (`CommandReachedEndOfTopic`). A consumer is then drained when it has nothing left to
+deliver and its acks are out. The Queue consumer lets the segment go then ([6](6-scalable-topics.md) §4).
+
 **Reconnecting.** Messages received but not yet delivered to the application are dropped, since the broker
-redelivers them. The consumer then resubscribes, and the broker resumes from the subscription's durable cursor.
-Readers work differently (§4).
+redelivers them. The consumer then resubscribes, with backoff, and the broker resumes from the subscription's
+durable cursor. The acks made meanwhile go out before the new permits, as in Java. Readers work differently (§4).
 
 ## 4. Reader
 

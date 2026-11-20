@@ -78,8 +78,13 @@ counterpart.
 - The Queue consumer: attach to every segment, keep that set in step with the layout, one receive queue, ack
   routing by segment ([6](docs/6-scalable-topics.md) §4).
 
-**Checks:** C8. Ported scenarios from `ScalableQueueConsumerReconcileTest`, `ScalableQueueConsumerReceiveLoopTest`
-and `V5MultiTopicQueueConsumerTest`. Java producer ⇄ Rust consumer.
+It lands in two pull requests: the segment consumer first, which M4 and M5 build on, then the Queue consumer.
+
+**Checks:** C8. Ported scenarios from `ScalableQueueConsumerReconcileTest`, `ScalableQueueConsumerReceiveLoopTest`,
+`V5QueueConsumerBasicTest`, `V5QueueConsumerMultiSegmentAckTest`, `V5SubscriptionInitialPositionTest` and
+`V5DAGFollowingTest`, and the Queue consumer cases of the split, merge and layout-watch tests. Java producer ⇄ Rust
+consumer, with each codec. `V5MultiTopicQueueConsumerTest` is the namespace consumer's, which comes after the first
+release.
 
 ## M4: Stream consumer
 

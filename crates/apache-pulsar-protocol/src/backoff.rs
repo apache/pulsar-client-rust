@@ -52,6 +52,23 @@ impl Backoff {
     }
 }
 
+/// A cheap source of the `random` that [`Backoff::next_delay`] takes: xorshift, uniform in `[0, 1)`.
+#[derive(Debug, Clone)]
+pub(crate) struct Jitter(u64);
+
+impl Jitter {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    pub(crate) fn next(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
