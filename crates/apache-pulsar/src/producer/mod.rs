@@ -74,7 +74,8 @@ pub struct ProducerBuilder<T, Api = ThreadSafe> {
     _api: PhantomData<Api>,
 }
 
-enum ApiClient {
+/// The client a builder creates its producer or consumer with.
+pub(crate) enum ApiClient {
     ThreadSafe(PulsarClient),
     Local(local::PulsarClient),
 }
@@ -242,7 +243,11 @@ async fn create_on(client: local::PulsarClient, topic: String, options: Producer
     let (created, is_created) = oneshot::channel();
     let last_sequence = Arc::new(AtomicI64::new(-1));
     let task = Task::new(machine, client.clone(), watch, receiver, last_sequence.clone(), created);
-    client.adopt(requests.clone(), task.run())?;
+    let closer = requests.clone();
+    let close = move || {
+        let _ = closer.unbounded_send(Request::Close { reply: None });
+    };
+    client.adopt(close, task.run())?;
     is_created.await.map_err(producer_closed)??;
     Ok(Link { requests, topic: resolved, last_sequence })
 }
@@ -450,7 +455,7 @@ impl<T: 'static, Api> MessageBuilder<'_, T, Api> {
 
 /// The canonical form of a topic name, as Java's `TopicName.get` gives it: a short name is a `persistent://` topic
 /// in `public/default`, or in the namespace given.
-fn normalize_topic(topic: Option<&str>) -> Result<String> {
+pub(crate) fn normalize_topic(topic: Option<&str>) -> Result<String> {
     let invalid = |message: String| Error::new(ErrorKind::InvalidConfiguration, message);
     let topic = topic.ok_or_else(|| invalid("a topic is required".into()))?;
     if let Some((domain, rest)) = topic.split_once("://") {

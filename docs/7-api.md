@@ -125,10 +125,14 @@ let position: Checkpoint = reader.checkpoint().await?;
 ```
 
 - **Receive:** `receive()`, `receive_timeout(d)` (returns `Ok(None)` when the time is up), and
-  `receive_batch(max, timeout)`. Each consumer also offers a `futures::Stream` view.
+  `receive_batch(max, timeout)`, which waits until it has `max` messages or the time is up, as Java's
+  `receiveMulti` does. Receives are answered in the order they are first polled, and one dropped before it
+  completes loses no message: the next receive gets it. Each consumer also offers a `futures::Stream` view, which
+  ends when the consumer closes.
 - **Acknowledge:** the future completes when the ack has been accepted by the consumer's ack tracker, not when
   the broker confirms it. Grouped acks go out on the ack group timer ([5](5-segment-engine.md) §3). A
-  failure can only be local: the consumer is closed, or the message id is not from this consumer.
+  failure can only be local: the consumer is closed. A Queue consumer ignores the id of a segment it no longer
+  has, drained or gone from the layout, as Java does: it can't tell it from an id of another consumer.
 
 ## 5. Messages
 

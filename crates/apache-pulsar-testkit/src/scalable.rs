@@ -21,7 +21,10 @@
 //! [`World`] is sans IO like the rest of the testkit: a test, or a socket server, feeds each connection's bytes to
 //! [`World::input`] and writes out what [`World::output`] returns. Admin operations ([`World::split`],
 //! [`World::merge`], [`World::terminate`]) behave like the 5.0.1 broker's: sealing a segment terminates its topic,
-//! which disconnects its producers with `CommandCloseProducer`, then the new layout goes to every watch.
+//! which disconnects its producers with `CommandCloseProducer`, then the new layout goes to every watch. The
+//! children of a split or a merge start without subscriptions, as the broker gives them only those registered on the
+//! scalable topic, which a consumer's subscribe doesn't register. The controller's garbage collection of a sealed segment is two steps, which a test takes in either
+//! order: [`World::prune`] drops it from the layout, [`World::delete_segment`] deletes its topic.
 //!
 //! A segment's subscriptions dispatch like the broker's Shared dispatcher: the entries to redeliver first, in
 //! position order, then the ones not read yet, each to the next consumer with permits on the highest priority
@@ -79,6 +82,10 @@ struct Segment {
     ledger_id: u64,
     entries: Vec<Stored>,
     terminated: bool,
+    /// Dropped from the layout by [`World::prune`].
+    pruned: bool,
+    /// Its topic was deleted by [`World::delete_segment`]: it can't be found any more.
+    deleted: bool,
     /// Subscriptions by name. They outlive their consumers.
     subscriptions: BTreeMap<String, Subscription>,
     /// Producers, in registration order: `(connection, producer id, name)`.
@@ -169,6 +176,11 @@ pub struct World {
     pub hold_subscribes: bool,
     /// Errors to answer the next subscribes with, one each, instead of subscribing.
     pub fail_subscribes: VecDeque<ServerError>,
+    /// Errors to answer the next subscribes to a topic with, one each, before [`World::fail_subscribes`].
+    pub fail_subscribes_to: HashMap<String, VecDeque<ServerError>>,
+    /// Topics whose subscribes wait unanswered until [`World::release_subscribes`], as [`World::hold_subscribes`]
+    /// makes every subscribe wait.
+    pub hold_subscribes_to: BTreeSet<String>,
     /// While set, scalable-topic lookups get no answer.
     pub silent_lookups: bool,
     /// Every command received, per connection.
@@ -202,6 +214,8 @@ impl Default for World {
             fail_sends: VecDeque::new(),
             hold_subscribes: false,
             fail_subscribes: VecDeque::new(),
+            fail_subscribes_to: HashMap::new(),
+            hold_subscribes_to: BTreeSet::new(),
             silent_lookups: false,
             log: Vec::new(),
             topics: BTreeMap::new(),
@@ -371,18 +385,42 @@ impl World {
         for (conn, producer_id, _) in producers {
             self.close_producer(conn, producer_id);
         }
-        let consumers: Vec<(ConnId, u64)> = self
-            .conns
-            .iter()
-            .flat_map(|(conn, c)| c.consumers.iter().map(move |(id, place)| (*conn, *id, place)))
-            .filter(|(_, _, (t, s, _))| (t.as_str(), *s) == (topic, segment))
-            .map(|(conn, id, _)| (conn, id))
-            .collect();
-        for (conn, consumer_id) in consumers {
+        for (conn, consumer_id) in self.consumers_on(topic, segment) {
             let place = self.conn(conn).consumers.remove(&consumer_id).unwrap();
             self.remove_consumer(conn, consumer_id, &place);
             self.push(conn, consumer_closed(consumer_id));
         }
+    }
+
+    /// Drops a sealed segment from the layout, in a new epoch, as the controller's garbage collection does once the
+    /// segment is past retention: its children no longer list it as a parent. Its topic stays until
+    /// [`World::delete_segment`].
+    pub fn prune(&mut self, topic: &str, segment: u64) {
+        let state = self.topic_mut(topic);
+        let seg = state.segments.get_mut(&segment).expect("no such segment");
+        assert_eq!(seg.info.state, SegmentState::SEALED, "segment {segment} is not sealed");
+        seg.pruned = true;
+        let (parents, children) = (seg.info.parent_ids.clone(), seg.info.child_ids.clone());
+        for id in children {
+            state.segments.get_mut(&id).unwrap().info.parent_ids.retain(|&p| p != segment);
+        }
+        for id in parents {
+            state.segments.get_mut(&id).unwrap().info.child_ids.retain(|&c| c != segment);
+        }
+        state.epoch += 1;
+        self.push_layout(topic);
+    }
+
+    /// Deletes a segment's topic, as the controller does once it pruned the segment: its consumers are closed with
+    /// `CommandCloseConsumer`, its subscriptions go, and a subscribe to it fails with `TopicNotFound`.
+    pub fn delete_segment(&mut self, topic: &str, segment: u64) {
+        for (conn, consumer_id) in self.consumers_on(topic, segment) {
+            self.conn(conn).consumers.remove(&consumer_id);
+            self.push(conn, consumer_closed(consumer_id));
+        }
+        let seg = self.topic_mut(topic).segments.get_mut(&segment).expect("no such segment");
+        seg.deleted = true;
+        seg.subscriptions.clear();
     }
 
     /// Processes the sends held while [`World::hold_sends`] was set, in order.
@@ -472,6 +510,16 @@ impl World {
         }
     }
 
+    /// The consumers on a segment: `(connection, consumer id)`.
+    fn consumers_on(&self, topic: &str, segment: u64) -> Vec<(ConnId, u64)> {
+        self.conns
+            .iter()
+            .flat_map(|(conn, c)| c.consumers.iter().map(move |(id, place)| (*conn, *id, place)))
+            .filter(|(_, _, (t, s, _))| (t.as_str(), *s) == (topic, segment))
+            .map(|(conn, id, _)| (conn, id))
+            .collect()
+    }
+
     fn topic(&self, topic: &str) -> &Topic {
         &self.topics[topic]
     }
@@ -553,7 +601,7 @@ impl World {
         let state = self.topic(topic);
         ScalableTopicDAG {
             epoch: state.epoch,
-            segments: state.segments.values().map(|s| s.info.clone()).collect(),
+            segments: state.segments.values().filter(|s| !s.pruned).map(|s| s.info.clone()).collect(),
             ..Default::default()
         }
     }
@@ -627,7 +675,9 @@ impl World {
                 }
                 self.push(conn, reply::success(close.request_id));
             }
-            Type::SUBSCRIBE if self.hold_subscribes => self.held_subscribes.push((conn, command)),
+            Type::SUBSCRIBE if self.hold_subscribes || self.hold_subscribes_to.contains(&command.subscribe.topic) => {
+                self.held_subscribes.push((conn, command));
+            }
             Type::SUBSCRIBE => self.subscribe(conn, &command),
             Type::FLOW => self.flow(conn, &command),
             Type::ACK => self.ack(conn, &command),
@@ -668,7 +718,7 @@ impl World {
 
     fn find_segment(&self, name: &str) -> Option<(String, u64)> {
         self.topics.iter().find_map(|(topic, state)| {
-            state.segments.values().find(|s| s.name == name).map(|s| (topic.clone(), s.info.segment_id))
+            state.segments.values().find(|s| s.name == name && !s.deleted).map(|s| (topic.clone(), s.info.segment_id))
         })
     }
 
@@ -860,7 +910,10 @@ impl World {
             None => Some(ServerError::TopicNotFound),
             // Only Shared subscriptions are simulated for now.
             Some(_) if subscribe.subType != SubType::Shared => Some(ServerError::NotAllowedError),
-            Some(_) => self.fail_subscribes.pop_front(),
+            Some(_) => match self.fail_subscribes_to.get_mut(&subscribe.topic).and_then(VecDeque::pop_front) {
+                Some(error) => Some(error),
+                None => self.fail_subscribes.pop_front(),
+            },
         };
         if let Some(error) = refusal {
             let error = reply::error(request_id, error, &format!("the broker refused the subscribe: {error:?}"));
@@ -1063,6 +1116,8 @@ impl Segment {
             ledger_id,
             entries: Vec::new(),
             terminated: false,
+            pruned: false,
+            deleted: false,
             producers: Vec::new(),
             exclusive: false,
             waiting: VecDeque::new(),

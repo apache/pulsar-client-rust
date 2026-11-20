@@ -102,7 +102,6 @@ impl<T> Schema<T> {
         (self.encode)(value)
     }
 
-    #[allow(dead_code)] // for the consumers, from milestone 3
     pub(crate) fn decode(&self, data: &[u8]) -> Result<T> {
         (self.decode)(data)
     }

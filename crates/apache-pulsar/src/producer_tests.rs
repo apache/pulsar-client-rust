@@ -46,18 +46,18 @@ use futures_util::stream::{FuturesOrdered, StreamExt};
 use crate::error::ErrorKind;
 use crate::{ProducerAccessMode, PulsarClient, Schema, local};
 
-const TOPIC: &str = "topic://acme/orders/events";
+pub(crate) const TOPIC: &str = "topic://acme/orders/events";
 
 /// The simulated world behind a loopback listener. Every connection can be pushed to at any time.
-struct WorldServer {
+pub(crate) struct WorldServer {
     address: HostPort,
-    world: Rc<RefCell<World>>,
+    pub(crate) world: Rc<RefCell<World>>,
     wakers: Rc<RefCell<HashMap<ConnId, Waker>>>,
     _task: JoinHandle<()>,
 }
 
 impl WorldServer {
-    async fn start(mut world: World) -> Self {
+    pub(crate) async fn start(mut world: World) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let address = HostPort { host: "127.0.0.1".into(), port };
@@ -77,12 +77,12 @@ impl WorldServer {
         Self { address, world, wakers, _task: task }
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("pulsar://{}", self.address)
     }
 
     /// Changes the world, and lets every connection send what it now has to.
-    fn with<R>(&self, change: impl FnOnce(&mut World) -> R) -> R {
+    pub(crate) fn with<R>(&self, change: impl FnOnce(&mut World) -> R) -> R {
         let result = change(&mut self.world.borrow_mut());
         for waker in self.wakers.borrow().values() {
             waker.wake_by_ref();
@@ -90,7 +90,7 @@ impl WorldServer {
         result
     }
 
-    fn received(&self, kind: Type) -> usize {
+    pub(crate) fn received(&self, kind: Type) -> usize {
         self.world.borrow().received(kind).len()
     }
 }
@@ -153,17 +153,17 @@ async fn serve(tcp: TcpStream, world: Rc<RefCell<World>>, wakers: Rc<RefCell<Has
     .await
 }
 
-fn world(segments: u32) -> World {
+pub(crate) fn world(segments: u32) -> World {
     let mut world = World::default();
     world.create_topic(TOPIC, segments);
     world
 }
 
-fn run<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn run<F: std::future::Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
-async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+pub(crate) async fn wait_until(what: &str, condition: impl Fn() -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !condition() {
         assert!(std::time::Instant::now() < deadline, "timed out waiting until {what}");
@@ -171,7 +171,7 @@ async fn wait_until(what: &str, condition: impl Fn() -> bool) {
     }
 }
 
-async fn local_client(server: &WorldServer) -> local::PulsarClient {
+pub(crate) async fn local_client(server: &WorldServer) -> local::PulsarClient {
     local::PulsarClient::builder()
         .service_url(server.url())
         .operation_timeout(Duration::from_secs(5))

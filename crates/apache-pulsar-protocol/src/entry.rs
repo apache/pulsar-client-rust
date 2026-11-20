@@ -230,12 +230,12 @@ fn decompress(codec: CompressionType, payload: Bytes, size: usize) -> Result<Byt
     decompressed.filter(|out| out.len() == size).map(Bytes::from).ok_or(DecodeError::Decompression)
 }
 
-/// ZLIB, as Java's `Deflater` writes it: with the zlib header.
+/// ZLIB, as Java's `Deflater` writes it: with the zlib header, and flushed but never finished, so without the final
+/// block and checksum. As Java's `Inflater` does, it reads the size recorded and no further.
 #[cfg(feature = "zlib")]
 fn inflate(payload: &[u8], size: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut out = Vec::with_capacity(size);
-    // One byte more than expected tells a longer stream from an exact one.
-    flate2::read::ZlibDecoder::new(payload).take(size as u64 + 1).read_to_end(&mut out).ok()?;
+    let mut out = vec![0; size];
+    flate2::read::ZlibDecoder::new(payload).read_exact(&mut out).ok()?;
     Some(out)
 }

@@ -19,8 +19,8 @@
 //!
 //! `cargo test` skips this target; run it with `cargo test -p apache-pulsar --test integration`. The broker and
 //! the proxy start before the first test, serve them all, and are removed when the run ends. On a failure, the
-//! last lines of their logs are printed. What the Rust producer stored is read back with the Java client, run in
-//! the broker container.
+//! last lines of their logs are printed. What the Rust producer stored is read back with the Java client, and what
+//! the Java client stored is read with the Rust consumer, both Java clients run in the broker container.
 
 mod env;
 
@@ -28,7 +28,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apache_pulsar::{ClientBuilder, ErrorKind, Local, ProducerAccessMode, Schema, TlsAuthentication, Token, local};
+use apache_pulsar::{
+    ClientBuilder, ErrorKind, Local, Message, ProducerAccessMode, Schema, SubscriptionInitialPosition,
+    TlsAuthentication, Token, local,
+};
 use apache_pulsar_protocol::hash::KeyHash;
 use env::Env;
 use futures_util::StreamExt;
@@ -48,6 +51,14 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("exclusive_producers_conflict_at_create", exclusive_producers_conflict_at_create),
     ("exclusive_with_fencing_fences_the_older_producer", exclusive_with_fencing_fences_the_older_producer),
     ("a_missing_topic_is_not_found_without_auto_creation", a_missing_topic_is_not_found_without_auto_creation),
+    ("a_queue_consumer_reads_and_acknowledges_every_segment", a_queue_consumer_reads_and_acknowledges_every_segment),
+    ("a_queue_consumer_reads_what_java_produced", a_queue_consumer_reads_what_java_produced),
+    ("a_queue_consumer_reads_compressed_java_batches", a_queue_consumer_reads_compressed_java_batches),
+    ("a_split_during_consumption_loses_no_message", a_split_during_consumption_loses_no_message),
+    ("a_latest_consumer_gets_what_the_children_stored_first", a_latest_consumer_gets_what_the_children_stored_first),
+    ("queue_consumers_share_a_subscription", queue_consumers_share_a_subscription),
+    ("a_negative_ack_brings_a_message_back", a_negative_ack_brings_a_message_back),
+    ("batch_index_acks_settle_whole_batches", batch_index_acks_settle_whole_batches),
 ];
 
 fn main() {
@@ -349,4 +360,287 @@ fn a_missing_topic_is_not_found_without_auto_creation(env: &Env) {
         assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
         client.close().await.unwrap();
     });
+}
+
+const SUB: &str = "workers";
+
+/// A Queue consumer of `topic` on the `workers` subscription, from where `position` says.
+async fn queue_consumer<T: 'static>(
+    client: &local::PulsarClient,
+    schema: Schema<T>,
+    topic: &str,
+    position: SubscriptionInitialPosition,
+) -> local::QueueConsumer<T> {
+    let builder = client.new_queue_consumer(schema).topic(topic).subscription_name(SUB);
+    builder.subscription_initial_position(position).subscribe().await.unwrap()
+}
+
+/// What `pulsar-admin` prints for `args`, as JSON: a topic's or a segment's stats.
+fn stats(env: &Env, args: &[&str]) -> serde_json::Value {
+    let output = env.admin(args);
+    serde_json::from_str(&output).unwrap_or_else(|error| panic!("{args:?} printed no JSON ({error}): {output}"))
+}
+
+/// Receives and acknowledges messages until there are `count`, or none comes for a while.
+async fn receive_all<T: 'static>(consumer: &local::QueueConsumer<T>, count: usize) -> Vec<Message<T>> {
+    let mut got = Vec::new();
+    while got.len() < count {
+        let Some(message) = consumer.receive_timeout(Duration::from_secs(30)).await.unwrap() else { break };
+        consumer.acknowledge(message.id()).await.unwrap();
+        got.push(message);
+    }
+    got
+}
+
+fn sorted_values(messages: &[Message<String>]) -> Vec<String> {
+    let mut values: Vec<String> = messages.iter().map(|m| m.value().unwrap()).collect();
+    values.sort();
+    values
+}
+
+/// Java's `V5QueueConsumerMultiSegmentAckTest`: a Queue consumer reads every segment, its acks reach each one, and a
+/// consumer subscribing again finds nothing left.
+fn a_queue_consumer_reads_and_acknowledges_every_segment(env: &Env) {
+    let name = unique("queue");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "4", &format!("public/default/{name}")]);
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let earliest = SubscriptionInitialPosition::Earliest;
+        let consumer = queue_consumer(&client, Schema::string(), &topic, earliest).await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut expected = Vec::new();
+        for i in 0..40 {
+            let value = format!("v-{i:02}");
+            producer.new_message().key(format!("k{i}")).value(value.clone()).send().await.unwrap();
+            expected.push(value);
+        }
+        let got = receive_all(&consumer, expected.len()).await;
+        assert_eq!(sorted_values(&got), expected);
+        let segments: std::collections::BTreeSet<String> =
+            got.iter().map(|m| m.id().to_string().split(':').next().unwrap().to_string()).collect();
+        assert_eq!(segments.len(), 4, "every segment delivered: {segments:?}");
+        assert!(got.iter().all(|m| m.topic() == topic));
+        // The acks go out with the close.
+        consumer.close().await.unwrap();
+        let again = queue_consumer(&client, Schema::string(), &topic, earliest).await;
+        assert!(again.receive_timeout(Duration::from_secs(1)).await.unwrap().is_none());
+        client.close().await.unwrap();
+    });
+}
+
+/// Java producer, Rust consumer: what the V5 CLI publishes to a scalable topic, keys and properties included.
+fn a_queue_consumer_reads_what_java_produced(env: &Env) {
+    let name = unique("java-to-rust");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "2", &format!("public/default/{name}")]);
+    let messages = ["-m", "alpha", "-m", "beta", "-m", "gamma"];
+    env.produce(&topic, &[&messages[..], &["-vs", "string", "-k", "user-1", "-p", "source=java"]].concat());
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let consumer = queue_consumer(&client, Schema::string(), &topic, SubscriptionInitialPosition::Earliest).await;
+        let got = receive_all(&consumer, 3).await;
+        assert_eq!(sorted_values(&got), ["alpha", "beta", "gamma"]);
+        for message in &got {
+            assert_eq!(message.key(), Some("user-1"));
+            assert_eq!(message.properties().collect::<Vec<_>>(), [("source", "java")]);
+            assert!(message.producer_name().is_some());
+        }
+        client.close().await.unwrap();
+    });
+}
+
+/// A Java producer's batches, compressed with each codec, read through the migration bridge: `pulsar-perf` writes a
+/// regular topic, which the Queue consumer reads as a layout of one legacy segment. `pulsar-perf` sends more than
+/// it is asked to, as it counts the sends completed: the broker's count of messages in is the reference.
+fn a_queue_consumer_reads_compressed_java_batches(env: &Env) {
+    for codec in ["NONE", "LZ4", "ZLIB", "ZSTD", "SNAPPY"] {
+        let topic = format!("persistent://public/default/{}", unique(&format!("codec-{}", codec.to_lowercase())));
+        env.perf_produce(&topic, codec, 100, 64);
+        let stored = stats(env, &["topics", "stats", &topic])["msgInCounter"].as_u64().unwrap() as usize;
+        assert!(stored >= 100, "{codec}: {stored} stored");
+        run(async {
+            let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+            let consumer =
+                queue_consumer(&client, Schema::bytes(), &topic, SubscriptionInitialPosition::Earliest).await;
+            let mut got = Vec::new();
+            while let Some(message) = consumer.receive_timeout(Duration::from_secs(2)).await.unwrap() {
+                consumer.acknowledge(message.id()).await.unwrap();
+                got.push(message);
+            }
+            let ids: std::collections::BTreeSet<String> = got.iter().map(|m| m.id().to_string()).collect();
+            assert_eq!((got.len(), ids.len()), (stored, stored), "{codec}");
+            assert!(got.iter().all(|m| m.size() == 64), "{codec}");
+            // `segment:ledger:entry:index`: messages after the first of a batch show it was one.
+            let batched = got.iter().filter(|m| !m.id().to_string().ends_with(":0")).count();
+            assert!(batched > 0, "{codec}: no batch of more than one message");
+            client.close().await.unwrap();
+        });
+    }
+}
+
+/// Java's `V5SegmentSplitTest`: a split while the producer sends and the consumer receives, and every message
+/// received once.
+fn a_split_during_consumption_loses_no_message(env: &Env) {
+    let name = unique("consume-split");
+    let topic = format!("topic://public/default/{name}");
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let consumer = queue_consumer(&client, Schema::string(), &topic, SubscriptionInitialPosition::Earliest).await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut expected = Vec::new();
+        let mut got = Vec::new();
+        for i in 0..60 {
+            if i == 30 {
+                env.admin(&["scalable-topics", "split-segment", "-s", "0", &format!("public/default/{name}")]);
+            }
+            let value = format!("v-{i:02}");
+            producer.new_message().key(format!("k{i}")).value(value.clone()).send().await.unwrap();
+            expected.push(value);
+            got.extend(receive_all(&consumer, 1).await);
+        }
+        got.extend(receive_all(&consumer, expected.len() - got.len()).await);
+        assert_eq!(sorted_values(&got), expected);
+        let segments: std::collections::BTreeSet<String> =
+            got.iter().map(|m| m.id().to_string().split(':').next().unwrap().to_string()).collect();
+        assert!(segments.len() > 1, "the split didn't happen while consuming: {segments:?}");
+        // The parent, drained, is let go while the layout still has it: its subscription keeps no consumer.
+        let parent = format!("segment://public/default/{name}/0000-ffff-0");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let subscription = stats(env, &["scalable-topics", "segment-stats", &parent])["subscriptions"][SUB].clone();
+            assert!(subscription.is_object(), "no subscription {SUB} on {parent}");
+            let consumers = subscription["consumers"].as_array().map_or(0, Vec::len);
+            if consumers == 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the drained parent keeps {consumers} consumer(s)");
+            compio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client.close().await.unwrap();
+    });
+}
+
+/// A Queue consumer at `Latest`, subscribed before a split, gets what a producer stored in the children before the
+/// consumer heard of the split. Its loop is held while the split and the sends happen, so the children get those
+/// messages before the consumer subscribes to them. Java subscribes to them at `Latest`, and loses them, unless the
+/// broker gave the children the subscription: whether it did is printed.
+fn a_latest_consumer_gets_what_the_children_stored_first(env: &Env) {
+    let name = unique("latest-split");
+    let topic = format!("topic://public/default/{name}");
+    let rt = compio::runtime::Runtime::new().unwrap();
+    let (client, consumer) = rt.block_on(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let consumer = queue_consumer(&client, Schema::string(), &topic, SubscriptionInitialPosition::Latest).await;
+        (client, consumer)
+    });
+    // The consumer's loop doesn't run until the next `block_on`.
+    env.admin(&["scalable-topics", "split-segment", "-s", "0", &format!("public/default/{name}")]);
+    let child = format!("segment://public/default/{name}/0000-7fff-1");
+    let carried = env.admin(&["scalable-topics", "segment-stats", &child]).contains(&format!("\"{SUB}\""));
+    eprintln!("the broker gave a split's children the Queue consumer's subscription: {carried}");
+    let sent: Vec<String> = (0..10).map(|i| format!("early-{i}")).collect();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            run(async {
+                let producer_client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+                let producer = producer_client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+                for (i, value) in sent.iter().enumerate() {
+                    producer.new_message().key(format!("k{i}")).value(value.clone()).send().await.unwrap();
+                }
+                producer_client.close().await.unwrap();
+            })
+        });
+    });
+    rt.block_on(async {
+        let got = receive_all(&consumer, sent.len()).await;
+        let mut expected = sent.clone();
+        expected.sort();
+        assert_eq!(sorted_values(&got), expected);
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `testQueueConsumersShareLoad`: consumers of one subscription share its messages, each delivered to one.
+fn queue_consumers_share_a_subscription(env: &Env) {
+    let name = unique("share");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "2", &format!("public/default/{name}")]);
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let earliest = SubscriptionInitialPosition::Earliest;
+        let a = queue_consumer(&client, Schema::string(), &topic, earliest).await;
+        let b = queue_consumer(&client, Schema::string(), &topic, earliest).await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let expected: Vec<String> = (0..100).map(|i| format!("v-{i:03}")).collect();
+        for (i, value) in expected.iter().enumerate() {
+            producer.new_message().key(format!("k{i}")).value(value.clone()).send().await.unwrap();
+        }
+        let (from_a, from_b) = futures_util::join!(receive_all(&a, 100), receive_all(&b, 100));
+        assert!(!from_a.is_empty() && !from_b.is_empty(), "a: {}, b: {}", from_a.len(), from_b.len());
+        let mut all = from_a;
+        all.extend(from_b);
+        assert_eq!(sorted_values(&all), expected);
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `testNegativeAckCausesRedelivery`.
+fn a_negative_ack_brings_a_message_back(env: &Env) {
+    let topic = format!("topic://public/default/{}", unique("nack"));
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let consumer = client
+            .new_queue_consumer(Schema::string())
+            .topic(&topic)
+            .subscription_name(SUB)
+            .negative_ack_redelivery_delay(Duration::from_millis(200))
+            .subscribe()
+            .await
+            .unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        producer.send("again".to_string()).await.unwrap();
+        let first = consumer.receive().await.unwrap();
+        assert_eq!(first.redelivery_count(), 0);
+        consumer.negative_acknowledge(first.id()).unwrap();
+        let again = consumer.receive_timeout(Duration::from_secs(30)).await.unwrap().expect("redelivered");
+        assert_eq!((again.id(), again.value().unwrap(), again.redelivery_count()), (first.id(), "again".into(), 1));
+        consumer.acknowledge(again.id()).await.unwrap();
+        client.close().await.unwrap();
+    });
+}
+
+/// Batch-index acks against the real broker. Each message of Java's batches is acknowledged on its own, without
+/// grouping, so that no ack names a whole entry: the broker settles each batch from its indexes. A consumer
+/// subscribing again then finds nothing left.
+fn batch_index_acks_settle_whole_batches(env: &Env) {
+    let topic = format!("persistent://public/default/{}", unique("index-acks"));
+    env.perf_produce(&topic, "NONE", 100, 16);
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let consumer = client
+            .new_queue_consumer(Schema::bytes())
+            .topic(&topic)
+            .subscription_name(SUB)
+            .subscription_initial_position(SubscriptionInitialPosition::Earliest)
+            .acknowledgment_group_time(Duration::ZERO)
+            .subscribe()
+            .await
+            .unwrap();
+        let (mut got, mut batched) = (0, 0);
+        while let Some(message) = consumer.receive_timeout(Duration::from_secs(2)).await.unwrap() {
+            consumer.acknowledge(message.id()).await.unwrap();
+            got += 1;
+            // `segment:ledger:entry:index`: messages after the first of a batch show it was one.
+            batched += usize::from(!message.id().to_string().ends_with(":0"));
+        }
+        assert!(got >= 100 && batched > 0, "{got} received, {batched} after the first of their batch");
+        consumer.close().await.unwrap();
+        let again = queue_consumer(&client, Schema::bytes(), &topic, SubscriptionInitialPosition::Earliest).await;
+        let left = again.receive_timeout(Duration::from_secs(2)).await.unwrap();
+        assert!(left.is_none(), "acknowledged, and delivered again: {left:?}");
+        client.close().await.unwrap();
+    });
+    let backlog = &stats(env, &["topics", "stats", &topic])["subscriptions"][SUB]["msgBacklog"];
+    assert_eq!(backlog.as_u64(), Some(0), "{backlog}");
 }

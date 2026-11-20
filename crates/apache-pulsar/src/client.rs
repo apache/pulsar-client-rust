@@ -32,6 +32,7 @@ use futures_util::future::LocalBoxFuture;
 use futures_util::stream::FuturesUnordered;
 
 use crate::config::{ClientBuilder, ClientConfig, ThreadSafe};
+use crate::consumer::QueueConsumerBuilder;
 use crate::error::{Error, ErrorKind, Result};
 use crate::local;
 use crate::memory::MemoryLimit;
@@ -115,6 +116,12 @@ impl PulsarClient {
     /// A producer, in the topic's layout, that publishes values with `schema`. See [`ProducerBuilder`].
     pub fn new_producer<T: 'static>(&self, schema: Schema<T>) -> ProducerBuilder<T> {
         ProducerBuilder::new(self.clone(), schema)
+    }
+
+    /// A Queue consumer, on every segment of the topic's layout, that reads values with `schema`. See
+    /// [`QueueConsumerBuilder`].
+    pub fn new_queue_consumer<T: 'static>(&self, schema: Schema<T>) -> QueueConsumerBuilder<T> {
+        QueueConsumerBuilder::new(self.clone(), schema)
     }
 
     /// The loop for a new producer or consumer: the least loaded, by count. The slot counts it there until dropped.
