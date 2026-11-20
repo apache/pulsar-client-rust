@@ -177,22 +177,52 @@ reference to its version. Serializing a message id writes its vector in full (Ja
 
 ### 6.1 Ungrouped
 
-- A layout watch, and one reader per segment, starting at the configured start position (*client-behavior*
-  §5, *wire-protocol* §6.3).
-- **Parents first:** a segment's reader starts only once every parent that is still in the layout has been
-  read to its end. The parents hold the older messages of the segment's keys, so this keeps per-key order
-  across a split or a merge. The spec doesn't state it; the Java client does it from the layout's lineage
+- A layout watch, and one reader per segment, active or sealed, in step with each new layout (*client-behavior*
+  §5, *wire-protocol* §6.3). A reader is a segment consumer ([5](5-segment-engine.md) §4) on an Exclusive
+  subscription that isn't durable, under a random `reader-…` name, as Java's v4 reader has. A segment that a layout
+  drops leaves the checkpoint, and its reader is closed.
+- **Where a reader starts.** Each subscribe names the reader's position: where it starts, then the last message
+  taken from it, so a reconnect resumes there. The broker sends the entry of that position again, and the reader
+  leaves out what it read, as Java's v4 consumer does: a message of a batch by its index, a message not in a batch
+  as its whole entry ([spec gap 25](../DESIGN.md#spec-gaps-to-raise-upstream)).
+- **Parents first:** a segment's messages are delivered only once every parent that is still in the layout has
+  been read to its end, or is gone. The parents hold the older messages of the segment's keys, so this keeps
+  per-key order across a split or a merge. Its reader subscribes at once and buffers meanwhile, as Java's does. The
+  spec doesn't state it; the Java client does it from the layout's lineage
   ([spec gap 7](../DESIGN.md#spec-gaps-to-raise-upstream)).
-- `checkpoint()` snapshots, for each segment, the position of the last message handed to the application, not
-  of anything prefetched. Being on one loop makes the snapshot atomic without locks (*client-behavior* §7).
+- **The end of a sealed segment.** Once a layout says a segment is sealed, the consumer asks for its last message
+  id (`CommandGetLastMessageId`), which no longer changes, since the controller terminates a segment before it
+  commits the layout that seals it. The segment is read to its end once its reader took that message. Then its
+  reader is closed, and its position stays in the checkpoint, so that a restore doesn't read it again. The broker
+  sends `CommandReachedEndOfTopic` to a reader only once the reader has acknowledged everything, and these readers
+  don't acknowledge: it comes only to a reader that starts at the end
+  ([spec gap 23](../DESIGN.md#spec-gaps-to-raise-upstream)). Java asks for the last message id too.
+- **`checkpoint()`** snapshots, for each segment, the position of the last message a receive returned, not of
+  anything prefetched. A receive dropped with messages gives them back, and the checkpoint goes back to before
+  them. Being on one loop makes the snapshot atomic without locks (*client-behavior* §7). Segments nothing was
+  received from are in it too, at their start: a restore would otherwise read them from their beginning.
 - **Restore:** each segment in the checkpoint resumes right after its saved position. Segments created after
-  the checkpoint start at their beginning, behind the parents-first rule. A segment whose backing topic has
-  since been deleted (retention) is skipped.
+  the checkpoint start at their beginning, behind the parents-first rule.
+- **A segment that is gone**, its topic deleted while the layout still has it (by the controller's garbage
+  collection, past retention), is skipped: its subscribe fails with `TopicNotFound`. It leaves the checkpoint and
+  holds no child back ([spec gap 26](../DESIGN.md#spec-gaps-to-raise-upstream)). The controller creates a split's
+  children before it commits their layout, so a segment that isn't found was deleted.
 - **`latest`:** a `latest` start becomes "the end of each segment in the first layout". Segments that appear
-  later are then read from their beginning, like the segments missing from a restored checkpoint.
+  later are then read from their beginning, like the segments missing from a restored checkpoint. Each of those
+  readers subscribes at the latest position without permits, asks for the segment's last message id, and reads
+  after it, leaving out what the broker sends from before it. A checkpoint taken before any message then names
+  that message, not a moving latest, and restores what the consumer read
+  ([spec gap 24](../DESIGN.md#spec-gaps-to-raise-upstream)). Java asks a separate reader before it attaches the
+  real one.
+- **Create** is all or nothing, as in Java: it completes once every reader is subscribed and knows where it
+  starts, and fails, closing them all, if one can't be. A reader that gives up later is attached again after a
+  backoff shared by all segments (100 ms doubling to 30 s), or at once when a new layout comes.
+- A reader on a legacy segment carries the V5-managed property, as the Queue consumer's do, so that a migration
+  doesn't count it as a v4 client. Java's readers don't.
 
 These rules follow the Java client (`ScalableCheckpointConsumer`, `CheckpointV5.latestOf`). Ported scenarios from
-`V5CheckpointConsumerLatestStartTest` and `V5CheckpointConsumerSkipDeletedSegmentTest` check them.
+`ScalableCheckpointConsumerTest`, `ScalableCheckpointConsumerReconcileTest` and the `V5CheckpointConsumer*Test`
+classes check them on the simulated cluster (`crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`).
 
 ### 6.2 Grouped
 
