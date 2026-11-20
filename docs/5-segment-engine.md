@@ -44,7 +44,8 @@ meanwhile.
 configured initial id, or, without one, after the broker's last id for the name. A message gets its id when it is
 first written, keeps it, with its bytes, when it is written again after a reconnect, and takes a new one when it
 is routed to another segment. An id set by the application is used as is and doesn't move the counter. The
-producer's last sequence id is the highest the brokers confirmed, over its segments' producers.
+producer's last sequence id is the highest the brokers confirmed, over its segments' producers
+([spec gap 14](../DESIGN.md#spec-gaps-to-raise-upstream)).
 
 **Sending.** Messages flow through:
 
@@ -55,9 +56,12 @@ producer's last sequence id is the highest the brokers confirmed, over its segme
 - The **pending queue** keeps sent, unacknowledged entries in send order. Receipts (`CommandSendReceipt`)
   complete them in order, matched against the head of the queue, as in Java: a receipt for an earlier sequence id
   is late and ignored, one for a later id means the two sides disagree, and the connection is closed so that the
-  producer registers again. After a reconnect the whole queue is resent, in order, before anything new.
+  producer registers again. After a reconnect the whole queue is resent, in order, before anything new. A
+  receipt at -1:-1, for a duplicate the broker discarded, completes its message with that position, as in Java
+  ([spec gap 17](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - The **send timeout** fails each message whose deadline passes, without invalidating the producer
-  (*client-api* §2). A message's clock starts once its segment's producer is registered.
+  (*client-api* §2). A message's clock starts once its segment's producer is registered, and starts again on
+  another segment, as in Java ([spec gap 15](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - A message larger than the broker's `max_message_size` fails alone.
 - **Batch format, always.** Every entry is a batch: `num_messages_in_batch` in the metadata, and a
   `SingleMessageMetadata` before each message. There is one encoding path, whatever the batch size.

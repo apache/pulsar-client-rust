@@ -23,7 +23,9 @@ A **layout watch** holds a topic's current `ScalableTopicDAG` and pushes changes
   only to find the controller, then close it, as Java does: their segments come from the assignment (§5).
 - **Opening:** connect as described in [4](4-connections.md) §3, check `supports_scalable_topics`, and send
   `CommandScalableTopicLookup`. If the first `CommandScalableTopicUpdate` carries an `error`, the create or
-  subscribe that opened the watch fails with the mapped category, `NotFound` included (*error-model* §2).
+  subscribe that opened the watch fails with the mapped category, `NotFound` included (*error-model* §2). An
+  error in a later update is logged and the session kept: a new one opens when the connection closes. Java
+  drops the session instead ([spec gap 16](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - **Updates:** a layout is applied only if its epoch is greater than the last applied (*client-behavior* §1,
   [spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)). Each applied layout reaches every user of the watch
   as a new immutable snapshot.
@@ -89,10 +91,12 @@ deterministically on the simulated broker and with a split during traffic on a r
 ### 3.4 Flush and close
 
 *Flush* waits for every message sent before the call, on every segment, and fails if one of them failed, as
-Java's does. *Close* fails the sends still waiting (parked, held, or not written yet) with `AlreadyClosed`,
-closes every per-segment producer, which waits for what the brokers already have, releases its layout watch, and
-can be called again safely (*client-api* §3.3). It follows Java: it does not flush, and a registration still
-waiting for exclusive access doesn't hold it up. An application that wants everything published flushes first.
+Java's does. On a closed producer it fails with `AlreadyClosed` (*client-api* §2), where Java's succeeds
+([J2](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). *Close* fails the sends still waiting
+(parked, held, or not written yet) with `AlreadyClosed`, closes every per-segment producer, which waits for what
+the brokers already have, releases its layout watch, and can be called again safely (*client-api* §3.3). It
+follows Java: it does not flush, and a registration still waiting for exclusive access doesn't hold it up. An
+application that wants everything published flushes first.
 
 ## 4. Queue consumer
 
@@ -102,14 +106,15 @@ waiting for exclusive access doesn't hold it up. An application that wants every
   subscribed at the earliest position: it is the child of a split or a merge, created after the subscription,
   and the broker creates the children with the subscriptions registered on the scalable topic, which a Queue
   consumer's subscribe doesn't register. Java subscribes it at the initial position, so a consumer at `Latest`
-  (the default) loses what a producer stored in the children before the consumer heard of the layout. A consumer
-  created on a layout that is already stale can likewise see a few messages from before it subscribed.
+  (the default) loses what a producer stored in the children before the consumer heard of the layout
+  ([spec gap 20](../DESIGN.md#spec-gaps-to-raise-upstream)). A consumer created on a layout that is already stale
+  can likewise see a few messages from before it subscribed.
 
   This narrows the hole without closing it. Until the consumer subscribes to a child, no subscription holds the
   child's ledgers, so a ledger rolled over and trimmed meanwhile is lost, though a rollover takes at least 10 minutes
   by default. And a subscription with no consumer running during the split is created on the children at the
   initial position when one comes back. Only the broker can close it, by giving the children their parents'
-  subscriptions when it creates them.
+  subscriptions when it creates them ([J14](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)).
 - **Subscribe is all or nothing**, as in Java: it completes once every segment is subscribed, those of layouts
   that come meanwhile included, and fails, closing every segment's consumer, if one can't be.
 - **Retries.** A segment whose consumer gives up, because a subscribe failed for good, is subscribed again after
@@ -125,8 +130,14 @@ waiting for exclusive access doesn't hold it up. An application that wants every
   the end of the topic (`CommandReachedEndOfTopic`, which Java sees as `TopicTerminatedException`), and every
   message this consumer received from the segment has been acknowledged. Requiring the acks as well keeps a late
   ack or negative ack from being lost after the close. Java means to close at the end of the topic, but that code
-  never runs, so its segment consumers stay subscribed until the segment leaves the layout. A segment that leaves
-  the layout before it is drained is detached anyway.
+  never runs, so its segment consumers stay subscribed until the segment leaves the layout
+  ([spec gap 19](../DESIGN.md#spec-gaps-to-raise-upstream)). A segment that leaves the layout before it is
+  drained is detached anyway.
+- **Garbage collection.** The controller doesn't know a Queue consumer's subscription: nothing registers it on
+  the scalable topic. Once a sealed segment is past retention, the controller checks only the registered
+  subscriptions' backlog before it deletes the segment, so it can delete messages a Queue subscription hasn't
+  acknowledged. Only the broker can fix this, by checking every subscription on the segment
+  ([spec gap 21](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - Dead-letter (later): [5](5-segment-engine.md) §5.
 
 ## 5. Stream consumer
