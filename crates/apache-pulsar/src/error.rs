@@ -43,6 +43,8 @@ pub enum ErrorKind {
     NotConnected,
     ProducerQueueFull,
     MemoryBufferFull,
+    /// A message larger than the broker accepts. It fails alone: the producer stays usable.
+    MessageTooLarge,
     TransactionConflict,
     Crypto,
     InvalidConfiguration,
