@@ -49,6 +49,7 @@ documents in `spec/scalable-topics/` of `apache/pulsar`. The design cites the sp
 | Crate split and which crates carry semver guarantees | Proposed | [2](docs/2-architecture.md) |
 | Producer batching: the batch format for every entry from the start, one message per batch first, then multi-message batches with entry-bucketing | Decided | [5](docs/5-segment-engine.md), [Plan](PLAN.md) |
 | Brokers before 5.0: not supported, with no classic fallback | Decided | [1](docs/1-scope.md) |
+| Codecs: `lz4_flex`, `flate2` on `miniz_oxide`, `snap`, and `zstd` on the C `libzstd`, each behind a feature, all on by default | Decided | [3](docs/3-protocol.md) |
 
 ## Spec gaps to raise upstream
 

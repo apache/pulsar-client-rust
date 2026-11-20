@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use buffa::Message;
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::backoff::Backoff;
+use crate::backoff::{Backoff, Jitter};
 use crate::hash::KeyHash;
 use crate::layout::{Layout, LayoutError};
 use crate::message_id::{EntryId, MessageId};
@@ -121,7 +121,7 @@ pub enum SendError {
     Unavailable(String),
 }
 
-/// Why registering a segment's producer failed, as the driver saw it.
+/// Why registering a segment's producer or consumer failed, as the driver saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterError {
     /// The broker refused it.
@@ -258,7 +258,7 @@ pub struct Producer {
     next_send: SendId,
     next_generation: u64,
     round_robin: u64,
-    random: u64,
+    jitter: Jitter,
     /// How many times a send was parked or held, for tests and metrics.
     waited: u64,
 }
@@ -280,7 +280,7 @@ impl Producer {
             next_send: 0,
             next_generation: 0,
             round_robin: 0,
-            random: now.elapsed().as_nanos() as u64 | 1,
+            jitter: Jitter::new(now.elapsed().as_nanos() as u64),
             waited: 0,
         };
         if producer.exclusive() {
@@ -775,10 +775,7 @@ impl Producer {
     }
 
     fn retry_later(&mut self, id: u64, now: Instant) {
-        self.random ^= self.random << 13;
-        self.random ^= self.random >> 7;
-        self.random ^= self.random << 17;
-        let jitter = (self.random >> 11) as f64 / (1u64 << 53) as f64;
+        let jitter = self.jitter.next();
         let s = self.segments.get_mut(&id).unwrap();
         let delay = s.backoff.next_delay(jitter);
         s.link = Link::Idle { retry_at: Some(now + delay) };
@@ -1054,7 +1051,8 @@ impl Segment {
     }
 }
 
-fn retriable(error: ServerError) -> bool {
+/// Whether a broker's refusal to register a producer or consumer is worth retrying.
+pub(crate) fn retriable(error: ServerError) -> bool {
     matches!(
         error,
         ServerError::ServiceNotReady

@@ -22,7 +22,9 @@
 
 pub mod backoff;
 pub mod connection;
+pub mod consumer;
 pub mod defaults;
+pub mod entry;
 pub mod frame;
 pub mod hash;
 pub mod layout;

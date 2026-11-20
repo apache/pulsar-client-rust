@@ -105,8 +105,9 @@ waiting for exclusive access doesn't hold it up. An application that wants every
   per-segment consumer as soon as the segment is drained for this consumer. That means the broker has signaled
   the end of the topic (`CommandReachedEndOfTopic`, which Java sees as `TopicTerminatedException`), and every
   message this consumer received from the segment has been acknowledged. Requiring the acks as well keeps a late
-  ack or negative ack from being lost after the close. Java closes as soon as it sees the end of the topic. A
-  segment that leaves the layout before it is drained is detached anyway.
+  ack or negative ack from being lost after the close. Java means to close at the end of the topic, but that code
+  never runs, so its segment consumers stay subscribed until the segment leaves the layout. A segment that leaves
+  the layout before it is drained is detached anyway.
 - Dead-letter (later): [5](5-segment-engine.md) §5.
 
 ## 5. Stream consumer

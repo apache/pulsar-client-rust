@@ -134,13 +134,11 @@ connection to frame.
 | Snappy | `snap` | Pure Rust. |
 | ZSTD | `zstd` | Binds the C `libzstd`. There is no mature pure-Rust encoder; `ruzstd` only decodes well. |
 
-Each codec sits behind a feature, all on by default.
+Each codec sits behind a feature, all on by default. ZSTD binds the C `libzstd`, so building needs a C compiler.
 
 ## 7. Open questions
 
 1. **Small messages pinning big buffers.** Should payloads below some size be copied out, so that one retained
    message doesn't keep a whole read buffer alive?
-2. **ZSTD:** is the C dependency acceptable by default, given that it matters for cross-compiling and for future
-   bindings?
-3. **`CommandTopicMigrated`** (protocol v20), the redirect a blue-green migration sends: handle it in the first
+2. **`CommandTopicMigrated`** (protocol v20), the redirect a blue-green migration sends: handle it in the first
    connection milestone, or later?
