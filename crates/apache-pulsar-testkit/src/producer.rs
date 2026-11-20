@@ -352,7 +352,7 @@ impl Harness {
     }
 }
 
-fn decode(bytes: &[u8]) -> Vec<BaseCommand> {
+pub(crate) fn decode(bytes: &[u8]) -> Vec<BaseCommand> {
     let decoder = FrameDecoder::default();
     let mut buf = BytesMut::from(bytes);
     let mut out = Vec::new();
@@ -362,7 +362,7 @@ fn decode(bytes: &[u8]) -> Vec<BaseCommand> {
     out
 }
 
-fn empty_layout() -> Layout {
+pub(crate) fn empty_layout() -> Layout {
     let dag = apache_pulsar_protocol::proto::ScalableTopicDAG::default();
     Layout::from_dag(&dag, "topic://harness/placeholder/x").unwrap()
 }

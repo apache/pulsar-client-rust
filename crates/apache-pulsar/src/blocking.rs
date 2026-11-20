@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The blocking API: the thread-safe client and producers, for code without an async runtime (docs/7-api.md §1).
+//! The blocking API: the thread-safe client, producers and consumers, for code without an async runtime
+//! (docs/7-api.md §1).
 //!
 //! Each call blocks the calling thread until its operation completes. Don't call them from inside an event loop
 //! or an async task: block on the thread-safe API's futures there instead.
@@ -25,6 +26,7 @@ use std::time::{Duration, SystemTime};
 use futures_executor::block_on;
 
 use crate::config::{Blocking, ClientBuilder};
+use crate::consumer::Message;
 use crate::error::Result;
 use crate::message_id::MessageId;
 use crate::schema::Schema;
@@ -45,7 +47,12 @@ impl PulsarClient {
         crate::ProducerBuilder::new_blocking(self.inner.clone(), schema)
     }
 
-    /// Closes the client, its producers first. Can be called again.
+    /// A Queue consumer that reads values with `schema`. See [`crate::QueueConsumerBuilder`].
+    pub fn new_queue_consumer<T: 'static>(&self, schema: Schema<T>) -> crate::QueueConsumerBuilder<T, Blocking> {
+        crate::QueueConsumerBuilder::new_blocking(self.inner.clone(), schema)
+    }
+
+    /// Closes the client, its producers and consumers first. Can be called again.
     pub fn close(&self) -> Result<()> {
         block_on(self.inner.close())
     }
@@ -167,5 +174,68 @@ impl<T: 'static> MessageBuilder<'_, T> {
     /// Sends the message, and returns its id once it is stored.
     pub fn send(self) -> Result<MessageId> {
         block_on(self.inner.send())
+    }
+}
+
+/// A blocking Queue consumer. `Send + Sync`, and cheap to clone. See [`crate::QueueConsumer`].
+pub struct QueueConsumer<T> {
+    inner: crate::QueueConsumer<T>,
+}
+
+impl<T> Clone for QueueConsumer<T> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
+impl<T> std::fmt::Debug for QueueConsumer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<T: 'static> QueueConsumer<T> {
+    pub(crate) fn new(inner: crate::QueueConsumer<T>) -> Self {
+        Self { inner }
+    }
+
+    pub fn topic(&self) -> &str {
+        self.inner.topic()
+    }
+
+    pub fn subscription(&self) -> &str {
+        self.inner.subscription()
+    }
+
+    pub fn consumer_name(&self) -> Option<&str> {
+        self.inner.consumer_name()
+    }
+
+    /// Blocks until the next message.
+    pub fn receive(&self) -> Result<Message<T>> {
+        block_on(self.inner.receive())
+    }
+
+    /// Blocks until the next message, for up to `timeout`.
+    pub fn receive_timeout(&self, timeout: Duration) -> Result<Option<Message<T>>> {
+        block_on(self.inner.receive_timeout(timeout))
+    }
+
+    /// Blocks until there are `max` messages, or `timeout` passes. See [`crate::QueueConsumer::receive_batch`].
+    pub fn receive_batch(&self, max: usize, timeout: Duration) -> Result<Vec<Message<T>>> {
+        block_on(self.inner.receive_batch(max, timeout))
+    }
+
+    pub fn acknowledge(&self, id: &MessageId) -> Result<()> {
+        block_on(self.inner.acknowledge(id))
+    }
+
+    pub fn negative_acknowledge(&self, id: &MessageId) -> Result<()> {
+        self.inner.negative_acknowledge(id)
+    }
+
+    /// See [`crate::QueueConsumer::close`].
+    pub fn close(&self) -> Result<()> {
+        block_on(self.inner.close())
     }
 }

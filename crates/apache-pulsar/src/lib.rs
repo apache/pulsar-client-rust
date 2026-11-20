@@ -17,15 +17,16 @@
 
 //! Apache Pulsar client for scalable topics.
 //!
-//! Status: milestone 2. Producers publish to scalable topics, and to regular topics through the migration bridge,
-//! in the thread-safe ([`PulsarClient`]), [`local`] and [`blocking`] APIs; consumers come next. See `DESIGN.md`
-//! and `PLAN.md` in the repository.
+//! Status: milestone 3. Producers publish to scalable topics, and to regular topics through the migration bridge,
+//! and Queue consumers read them, in the thread-safe ([`PulsarClient`]), [`local`] and [`blocking`] APIs; the Stream
+//! and Checkpoint consumers come next. See `DESIGN.md` and `PLAN.md` in the repository.
 
 pub mod auth;
 pub mod blocking;
 mod client;
 mod config;
 mod conn;
+mod consumer;
 mod error;
 pub mod local;
 mod memory;
@@ -39,11 +40,14 @@ mod watch;
 pub use auth::{Authentication, TlsAuthentication, Token};
 pub use client::PulsarClient;
 pub use config::{Blocking, ClientBuilder, Local, ThreadSafe};
+pub use consumer::{Message, QueueConsumer, QueueConsumerBuilder, SubscriptionInitialPosition};
 pub use error::{Error, ErrorKind, Result};
 pub use message_id::MessageId;
 pub use producer::{MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder};
 pub use schema::Schema;
 
+#[cfg(test)]
+mod consumer_tests;
 #[cfg(test)]
 mod producer_tests;
 #[cfg(test)]

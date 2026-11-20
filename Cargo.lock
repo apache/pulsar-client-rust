@@ -99,6 +99,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls-native-certs",
+ "serde_json",
  "testcontainers",
  "thiserror",
  "tracing",

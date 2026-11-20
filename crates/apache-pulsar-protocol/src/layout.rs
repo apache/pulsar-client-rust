@@ -133,6 +133,11 @@ impl Layout {
         self.segments.get(&id)
     }
 
+    /// Every segment, active and sealed, by id.
+    pub fn segments(&self) -> impl Iterator<Item = &Segment> {
+        self.segments.values()
+    }
+
     /// The active segments, by hash-range start.
     pub fn active(&self) -> impl Iterator<Item = &Segment> {
         self.active.iter().map(|id| &self.segments[id])

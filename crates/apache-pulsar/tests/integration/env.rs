@@ -137,6 +137,28 @@ impl Env {
         output.lines().filter_map(Consumed::parse).collect()
     }
 
+    /// Publishes with the Java client in the broker container, as the admin: `pulsar-client produce`, whose V5
+    /// client serves a `topic://` topic.
+    pub fn produce(&self, topic: &str, args: &[&str]) {
+        let mut command = vec!["bin/pulsar-client", "--url", "pulsar://localhost:6650"];
+        command.extend(TOKEN_AUTH);
+        command.push("produce");
+        command.extend(args);
+        command.push(topic);
+        self.exec(&command);
+    }
+
+    /// Publishes `count` messages of `size` bytes to a regular topic with `pulsar-perf`, the Java v4 client, in
+    /// batches compressed with `compression`, as the admin.
+    pub fn perf_produce(&self, topic: &str, compression: &str, count: usize, size: usize) {
+        let (count, size) = (count.to_string(), size.to_string());
+        let mut command = vec!["bin/pulsar-perf", "produce", "-u", "pulsar://localhost:6650"];
+        command.extend(TOKEN_AUTH);
+        // Half a second of messages per batch window.
+        command.extend(["-z", compression, "-m", &count, "-s", &size, "-r", "200", "-b", "500", topic]);
+        self.exec(&command);
+    }
+
     fn exec(&self, command: &[&str]) -> String {
         let exec = ExecCommand::new(command.iter().copied()).with_cmd_ready_condition(CmdWaitFor::exit());
         let mut result = self.broker.exec(exec).unwrap_or_else(|e| panic!("{command:?}: {e}"));

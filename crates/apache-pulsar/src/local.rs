@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use compio::runtime::JoinHandle;
-use futures_channel::mpsc;
 
 use apache_pulsar_protocol::backoff::Backoff;
 use apache_pulsar_protocol::lookup::{BrokerAddress, Lookup, LookupStep};
@@ -37,7 +36,6 @@ use crate::conn::ConnHandle;
 use crate::error::{Error, ErrorKind, Result};
 use crate::memory::MemoryLimit;
 use crate::pool::Pool;
-use crate::producer::Request;
 use crate::schema::Schema;
 use crate::watch::Watches;
 
@@ -47,6 +45,13 @@ pub type Producer<T> = crate::Producer<T, Local>;
 pub type ProducerBuilder<T> = crate::ProducerBuilder<T, Local>;
 /// A message being built: [`Producer::new_message`].
 pub type MessageBuilder<'a, T> = crate::MessageBuilder<'a, T, Local>;
+/// A Queue consumer on this loop. See [`crate::QueueConsumer`].
+pub type QueueConsumer<T> = crate::QueueConsumer<T, Local>;
+/// Builds a Queue consumer on this loop: [`PulsarClient::new_queue_consumer`].
+pub type QueueConsumerBuilder<T> = crate::QueueConsumerBuilder<T, Local>;
+
+/// Asks a producer's or consumer's task to close.
+type Close = Box<dyn Fn()>;
 
 /// The client of one event loop. Cheap to clone; clones are the same client.
 #[derive(Clone)]
@@ -57,8 +62,8 @@ pub struct PulsarClient {
 struct Inner {
     pool: Pool,
     watches: Watches,
-    /// The producers' tasks, with the way to ask each to close.
-    tasks: RefCell<Vec<(mpsc::UnboundedSender<Request>, JoinHandle<()>)>>,
+    /// The producers' and consumers' tasks, with the way to ask each to close.
+    tasks: RefCell<Vec<(Close, JoinHandle<()>)>>,
     closed: Cell<bool>,
     /// The next service URL host to try first.
     next_host: Cell<usize>,
@@ -93,15 +98,21 @@ impl PulsarClient {
         crate::ProducerBuilder::new_local(self.clone(), schema)
     }
 
-    /// Closes the producers, then every connection. Later operations fail with [`ErrorKind::AlreadyClosed`]. Can
+    /// A Queue consumer, on every segment of the topic's layout, that reads values with `schema`, on this loop. See
+    /// [`QueueConsumerBuilder`](crate::QueueConsumerBuilder).
+    pub fn new_queue_consumer<T: 'static>(&self, schema: Schema<T>) -> QueueConsumerBuilder<T> {
+        crate::QueueConsumerBuilder::new_local(self.clone(), schema)
+    }
+
+    /// Closes the producers and consumers, then every connection. Later operations fail with [`ErrorKind::AlreadyClosed`]. Can
     /// be called again.
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.replace(true) {
             return Ok(());
         }
         let tasks = std::mem::take(&mut *self.inner.tasks.borrow_mut());
-        for (requests, _) in &tasks {
-            let _ = requests.unbounded_send(Request::Close { reply: None });
+        for (close, _) in &tasks {
+            close();
         }
         for (_, task) in tasks {
             let _ = task.await;
@@ -110,16 +121,13 @@ impl PulsarClient {
         Ok(())
     }
 
-    /// Runs a producer's task on this loop, owned by the client, which closes it on close.
-    pub(crate) fn adopt(
-        &self,
-        requests: mpsc::UnboundedSender<Request>,
-        task: impl Future<Output = ()> + 'static,
-    ) -> Result<()> {
+    /// Runs a producer's or consumer's task on this loop, owned by the client, which calls `close` to close it on
+    /// close.
+    pub(crate) fn adopt(&self, close: impl Fn() + 'static, task: impl Future<Output = ()> + 'static) -> Result<()> {
         self.check_open()?;
         let mut tasks = self.inner.tasks.borrow_mut();
         tasks.retain(|(_, task)| !task.is_finished());
-        tasks.push((requests, compio::runtime::spawn(task)));
+        tasks.push((Box::new(close), compio::runtime::spawn(task)));
         Ok(())
     }
 

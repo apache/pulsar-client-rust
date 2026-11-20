@@ -81,6 +81,7 @@ pub fn decode_all(bytes: &[u8]) -> Vec<BaseCommand> {
 /// Builders for the commands a broker sends.
 pub mod consumer;
 pub mod producer;
+pub mod queue;
 pub mod scalable;
 
 pub mod reply {

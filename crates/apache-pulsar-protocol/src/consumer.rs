@@ -385,6 +385,13 @@ impl SegmentConsumer {
         self.end_of_topic && self.incoming.is_empty() && self.acks.is_empty() && self.batch_acks.is_empty()
     }
 
+    /// Whether the consumer is closed and nothing of it is left on a connection: no subscribe or close in flight.
+    /// [`Action::Closed`] can come before that: a consumer closed while subscribing still closes the subscription
+    /// once the subscribe completes.
+    pub fn is_finished(&self) -> bool {
+        self.link == Link::Closed
+    }
+
     /// Closes the consumer: its acks go out first. The messages not taken yet, and the negative acks still
     /// waiting, are dropped: the broker delivers those messages again. Can be called again.
     pub fn close(&mut self) {

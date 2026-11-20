@@ -98,9 +98,28 @@ waiting for exclusive access doesn't hold it up. An application that wants every
 
 - Subscribes Shared to **every** active and sealed segment in the layout, and keeps that set in step with
   each new layout: it attaches new segments and detaches the ones that leave (*client-behavior* §5).
-- All per-segment consumers feed one receive queue on the loop. Segments with messages ready take turns, so
-  a busy segment can't starve the others.
-- An ack or negative ack goes to the per-segment consumer named by the segment id in the message id.
+- **The initial position** applies to the segments of the first layout. A segment a later layout adds is
+  subscribed at the earliest position: it is the child of a split or a merge, created after the subscription,
+  and the broker creates the children with the subscriptions registered on the scalable topic, which a Queue
+  consumer's subscribe doesn't register. Java subscribes it at the initial position, so a consumer at `Latest`
+  (the default) loses what a producer stored in the children before the consumer heard of the layout. A consumer
+  created on a layout that is already stale can likewise see a few messages from before it subscribed.
+
+  This narrows the hole without closing it. Until the consumer subscribes to a child, no subscription holds the
+  child's ledgers, so a ledger rolled over and trimmed meanwhile is lost, though a rollover takes at least 10 minutes
+  by default. And a subscription with no consumer running during the split is created on the children at the
+  initial position when one comes back. Only the broker can close it, by giving the children their parents'
+  subscriptions when it creates them.
+- **Subscribe is all or nothing**, as in Java: it completes once every segment is subscribed, those of layouts
+  that come meanwhile included, and fails, closing every segment's consumer, if one can't be.
+- **Retries.** A segment whose consumer gives up, because a subscribe failed for good, is subscribed again after
+  a backoff shared by all segments (100 ms doubling to 30 s, reset once every segment is subscribed), or at once
+  when a new layout comes, as Java's reconcile does.
+- Receives take messages from the per-segment consumers, which buffer up to the receiver queue size each, as
+  Java's do. Segments with messages ready take turns, so a busy segment can't starve the others. A message is
+  taken only for a receive, so the broker's permits follow what the application takes.
+- An ack or negative ack goes to the per-segment consumer named by the segment id in the message id. One for a
+  segment the consumer no longer has does nothing, as in Java.
 - **Detach once drained.** The consumer doesn't wait for a sealed segment to leave the layout. It closes its
   per-segment consumer as soon as the segment is drained for this consumer. That means the broker has signaled
   the end of the topic (`CommandReachedEndOfTopic`, which Java sees as `TopicTerminatedException`), and every

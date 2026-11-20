@@ -148,9 +148,13 @@ fn every_codec_decompresses() {
     let raw = batch(&[(Default::default(), "one"), (Default::default(), "two")]);
     let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     zlib.write_all(&raw).unwrap();
+    // Java's `CompressionCodecZLib` flushes the stream and never finishes it: no final block, no checksum.
+    zlib.flush().unwrap();
+    let unfinished = zlib.get_ref().clone();
     let codecs = [
         (CompressionType::LZ4, lz4_flex::block::compress(&raw)),
         (CompressionType::ZLIB, zlib.finish().unwrap()),
+        (CompressionType::ZLIB, unfinished),
         (CompressionType::ZSTD, zstd::bulk::compress(&raw, 3).unwrap()),
         (CompressionType::SNAPPY, snap::raw::Encoder::new().compress_vec(&raw).unwrap()),
     ];

@@ -31,6 +31,7 @@ pub mod layout;
 pub mod lookup;
 pub mod message_id;
 pub mod producer;
+pub mod queue_consumer;
 
 /// Generated from the vendored `PulsarApi.proto` by `cargo run -p xtask -- codegen`.
 ///
