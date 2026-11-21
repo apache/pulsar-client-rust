@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A simulated cluster for scalable topics: topics and their layouts, segments, and the producers, Shared
-//! subscriptions and readers on them, over any number of connections.
+//! A simulated cluster for scalable topics: topics and their layouts, segments, and the producers, subscriptions and
+//! readers on them, over any number of connections.
 //!
 //! [`World`] is sans IO like the rest of the testkit: a test, or a socket server, feeds each connection's bytes to
 //! [`World::input`] and writes out what [`World::output`] returns. Admin operations ([`World::split`],
@@ -26,10 +26,10 @@
 //! scalable topic, which a consumer's subscribe doesn't register. The controller's garbage collection of a sealed segment is two steps, which a test takes in either
 //! order: [`World::prune`] drops it from the layout, [`World::delete_segment`] deletes its topic.
 //!
-//! A segment's subscriptions dispatch like the broker's Shared dispatcher: the entries to redeliver first, in
+//! A segment's Shared subscriptions dispatch like the broker's Shared dispatcher: the entries to redeliver first, in
 //! position order, then the ones not read yet, each to the next consumer with permits on the highest priority
-//! level, round robin. They outlive their consumers, take acks per message, batch indexes included, and tell their
-//! consumers when they acked everything of a terminated segment, with `CommandReachedEndOfTopic`.
+//! level, round robin. Subscriptions outlive their consumers, take acks per message, batch indexes included, and tell
+//! their consumers when they acked everything of a terminated segment, with `CommandReachedEndOfTopic`.
 //!
 //! A reader's subscription isn't durable: it starts where the broker places such a cursor (the start id's entry,
 //! which goes out again), goes with its consumer, and is told the segment ended only if it starts at the end, since
@@ -38,6 +38,10 @@
 //! Unlike the broker, the world hands a consumer one entry a turn, where the broker hands it up to
 //! `dispatcherMaxRoundRobinBatchSize`; and tells a consumer the topic ended once, where the broker tells it again on
 //! later acks and reads.
+//!
+//! Exclusive subscriptions and `Key_Shared` ones by entry bucket, and rewinds, are in the `subscriptions` module.
+
+mod subscriptions;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -105,7 +109,7 @@ struct Segment {
     last_sequence: HashMap<String, i64>,
 }
 
-/// A Shared subscription on a segment, or a reader's.
+/// A subscription on a segment, or a reader's.
 #[derive(Debug, Default)]
 struct Subscription {
     /// A reader's subscription: not durable, it goes with its consumer.
@@ -123,12 +127,15 @@ struct Subscription {
     consumers: Vec<Consumer>,
     /// Where the round robin looks for the next consumer first.
     next: usize,
+    /// Its type, which the first of its consumers sets.
+    kind: subscriptions::Kind,
 }
 
 #[derive(Debug)]
 struct Consumer {
     conn: ConnId,
     id: u64,
+    name: String,
     /// The lowest level is served first.
     priority: i32,
     /// The messages it can take. A batch can take it below zero.
@@ -979,15 +986,14 @@ impl World {
         let found = self.find_segment(&subscribe.topic);
         // A subscription that isn't durable is a reader's.
         let reader = subscribe.durable == Some(false);
-        let refusal = match found {
+        let refusal = match &found {
             None => Some(ServerError::TopicNotFound),
-            // Only Shared subscriptions, and readers, are simulated for now.
-            Some(_) if subscribe.subType != SubType::Shared && !reader => Some(ServerError::NotAllowedError),
-            Some(_) => match self.fail_subscribes_to.get_mut(&subscribe.topic).and_then(VecDeque::pop_front) {
-                Some(error) => Some(error),
-                None => self.fail_subscribes.pop_front(),
-            },
-        };
+            Some((topic, segment)) => self.refusal(topic, *segment, subscribe),
+        }
+        .or_else(|| match self.fail_subscribes_to.get_mut(&subscribe.topic).and_then(VecDeque::pop_front) {
+            Some(error) => Some(error),
+            None => self.fail_subscribes.pop_front(),
+        });
         if let Some(error) = refusal {
             let error = reply::error(request_id, error, &format!("the broker refused the subscribe: {error:?}"));
             self.push(conn, error);
@@ -1017,9 +1023,11 @@ impl World {
             unacked: entries.iter().map(|e| (e.entry_id, batch_indexes(e))).collect(),
             ..Default::default()
         });
+        sub.join(subscribe);
         sub.consumers.push(Consumer {
             conn,
             id,
+            name: subscribe.consumer_name.clone().unwrap_or_default(),
             priority: subscribe.priority_level.unwrap_or(0),
             permits: 0,
             pending: BTreeSet::new(),
@@ -1043,9 +1051,10 @@ impl World {
 
     fn ack(&mut self, conn: ConnId, command: &BaseCommand) {
         let ack = &command.ack;
-        // A Shared subscription ignores cumulative acks, as the broker does.
-        let place = self.consumer(conn, ack.consumer_id).filter(|_| ack.ack_type == AckType::Individual);
-        let Some((topic, segment, name)) = place else { return };
+        if ack.ack_type == AckType::Cumulative {
+            return self.ack_cumulative(conn, ack);
+        }
+        let Some((topic, segment, name)) = self.consumer(conn, ack.consumer_id) else { return };
         let ledger = self.topic(&topic).segments[&segment].ledger_id;
         let sub = self.subscription(&topic, segment, &name);
         for id in ack.message_id.iter().filter(|id| id.ledgerId == ledger) {
@@ -1121,7 +1130,7 @@ impl World {
         let World { topics, conns, .. } = self;
         let seg = topics.get_mut(topic).unwrap().segments.get_mut(&segment).unwrap();
         for sub in seg.subscriptions.values_mut() {
-            while let Some((at, entry)) = sub.next_delivery() {
+            while let Some((at, entry)) = sub.next(&seg.entries) {
                 let stored = &seg.entries[entry as usize];
                 let message = sub.deliver(at, stored);
                 let out = &mut conns.get_mut(&sub.consumers[at].conn).expect("a consumer's connection").out;

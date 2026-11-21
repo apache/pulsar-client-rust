@@ -96,6 +96,10 @@ release.
 **Checks:** C7. Ported scenarios from `ScalableStreamConsumerReconcileTest`, `V5StreamConsumerAckWatermarkTest`
 and `V5StreamConsumerDagReplayTest`, plus more consumers than segments, so that segments are shared.
 
+It lands in three pull requests: the segment consumer's cumulative acks, `Key_Shared` attach and draining, with the
+simulated broker's Exclusive and `Key_Shared` subscriptions; then the assignment session, the Stream consumer and the
+simulated controller; then the driver and the API.
+
 ## M5: Checkpoint consumer
 
 - Readers on every segment, parents first, checkpoint capture and restore, the grouped mode

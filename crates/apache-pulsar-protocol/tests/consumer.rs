@@ -25,11 +25,11 @@ use apache_pulsar_protocol::frame::PayloadSection;
 use apache_pulsar_protocol::message_id::EntryId;
 use apache_pulsar_protocol::producer::RegisterError;
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::command_ack::ValidationError;
+use apache_pulsar_protocol::proto::command_ack::{AckType, ValidationError};
 use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
 use apache_pulsar_protocol::proto::{
-    BaseCommand, CommandMessage, EncryptionKeys, KeyValue, MessageIdData, MessageMetadata, ServerError,
-    SingleMessageMetadata,
+    BaseCommand, CommandMessage, EncryptionKeys, IntRange, KeySharedMode, KeyValue, MessageIdData, MessageMetadata,
+    ServerError, SingleMessageMetadata,
 };
 use buffa::{EnumValue, Message};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -501,6 +501,217 @@ fn news_from_another_subscription_is_ignored() {
     t.actions();
     t.deliver(2, single(0));
     assert_eq!(t.consumer.available(), 0);
+}
+
+/// Each cumulative ack's `(entry, ack_set)`.
+fn cumulative_acks(actions: &[Action]) -> Vec<(u64, Vec<i64>)> {
+    commands(actions)
+        .iter()
+        .filter(|c| c.r#type == EnumValue::Known(Type::ACK) && c.ack.ack_type == AckType::Cumulative)
+        .map(|c| {
+            assert_eq!(c.ack.message_id.len(), 1, "a cumulative ack names one position");
+            (c.ack.message_id[0].entryId, c.ack.message_id[0].ack_set.clone())
+        })
+        .collect()
+}
+
+fn exclusive() -> ConsumerOptions {
+    ConsumerOptions { sub_type: SubType::Exclusive, ..options() }
+}
+
+fn key_shared() -> ConsumerOptions {
+    let range = |start, end| IntRange { start, end, ..Default::default() };
+    ConsumerOptions {
+        sub_type: SubType::Key_Shared,
+        bucket_ranges: vec![range(0, 0x7fff), range(0x8000, 0xffff)],
+        ..options()
+    }
+}
+
+#[test]
+fn a_key_shared_consumer_declares_the_segments_buckets() {
+    let command = Test::new(key_shared()).consumer.subscribe_command(7);
+    let meta = command.subscribe.keySharedMeta.as_option().expect("Key_Shared metadata");
+    assert_eq!(command.subscribe.subType, SubType::Key_Shared);
+    assert_eq!((meta.keySharedMode, meta.entryBucketDispatch), (KeySharedMode::STICKY, Some(true)));
+    let ranges: Vec<(i32, i32)> = meta.hashRanges.iter().map(|r| (r.start, r.end)).collect();
+    assert_eq!(ranges, [(0, 0x7fff), (0x8000, 0xffff)]);
+    // The other types declare none.
+    let command = Test::new(exclusive()).consumer.subscribe_command(7);
+    assert_eq!((command.subscribe.subType, command.subscribe.keySharedMeta.is_set()), (SubType::Exclusive, false));
+}
+
+#[test]
+fn cumulative_acks_go_out_once_a_group() {
+    let mut t = Test::subscribed(exclusive());
+    t.consumer.acknowledge_cumulative(&id(1, -1, 0), t.now);
+    t.consumer.acknowledge_cumulative(&id(3, -1, 0), t.now);
+    // At or before one waiting: nothing new.
+    t.consumer.acknowledge_cumulative(&id(2, -1, 0), t.now);
+    assert!(t.actions().is_empty());
+    t.advance(Duration::from_millis(100));
+    assert_eq!(cumulative_acks(&t.actions()), [(3, vec![])]);
+    // Nor at or before one out already.
+    t.consumer.acknowledge_cumulative(&id(3, -1, 0), t.now);
+    t.advance(Duration::from_millis(100));
+    assert!(t.actions().is_empty());
+    // Without grouping, each goes out at once.
+    let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..exclusive() });
+    t.consumer.acknowledge_cumulative(&id(4, -1, 0), t.now);
+    assert_eq!(cumulative_acks(&t.actions()), [(4, vec![])]);
+}
+
+/// The broker may deliver again what an ack covered before a new registration, and may never have had the ack: the
+/// application's ack of the same position goes out again.
+#[test]
+fn a_new_registration_takes_the_same_cumulative_ack_again() {
+    let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..exclusive() });
+    t.consumer.acknowledge_cumulative(&id(5, -1, 0), t.now);
+    assert_eq!(cumulative_acks(&t.actions()), [(5, vec![])]);
+    t.consumer.on_disconnected(1, t.now);
+    t.advance(Duration::from_millis(200));
+    assert_eq!(t.actions(), [Action::Connect { generation: 2 }]);
+    t.consumer.on_subscribed(2, 8);
+    t.actions();
+    t.consumer.acknowledge_cumulative(&id(5, -1, 0), t.now);
+    assert_eq!(cumulative_acks(&t.actions()), [(5, vec![])]);
+}
+
+#[test]
+fn a_cumulative_ack_made_while_subscribing_goes_first() {
+    let mut t = Test::new(exclusive());
+    t.actions();
+    t.consumer.acknowledge_cumulative(&id(2, -1, 0), t.now);
+    t.advance(Duration::from_millis(100));
+    assert!(t.actions().is_empty());
+    t.consumer.on_subscribed(1, 7);
+    let actions = t.actions();
+    assert_eq!(cumulative_acks(&actions), [(2, vec![])]);
+    assert_eq!(flows(&actions), [4]);
+}
+
+#[test]
+fn a_cumulative_ack_inside_a_batch_leaves_the_later_indexes() {
+    let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..exclusive() });
+    t.consumer.acknowledge_cumulative(&id(6, 1, 4), t.now);
+    assert_eq!(cumulative_acks(&t.actions()), [(6, vec![0b1100])]);
+    // The last index covers the whole entry.
+    t.consumer.acknowledge_cumulative(&id(6, 3, 4), t.now);
+    assert_eq!(cumulative_acks(&t.actions()), [(6, vec![])]);
+}
+
+/// A Key_Shared subscription forbids cumulative acks: the messages given up to the position go out one by one.
+#[test]
+fn a_key_shared_consumer_acknowledges_each_message_given() {
+    let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..key_shared() });
+    t.deliver(1, single(0));
+    t.deliver(1, batch(1, 2, Vec::new()));
+    t.deliver(1, single(2));
+    t.take(4);
+    t.actions();
+    t.consumer.acknowledge_cumulative(&id(1, 0, 2), t.now);
+    let actions = t.actions();
+    assert!(cumulative_acks(&actions).is_empty());
+    assert_eq!(acks(&actions), [(vec![(10, 0, vec![]), (10, 1, vec![0b10])], None)]);
+    // Only what wasn't acknowledged yet.
+    t.consumer.acknowledge_cumulative(&id(1, 1, 2), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 1, vec![0b01])], None)]);
+    t.consumer.acknowledge_cumulative(&id(2, -1, 0), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 2, vec![])], None)]);
+    // Nothing given, nothing to acknowledge.
+    t.consumer.acknowledge_cumulative(&id(9, -1, 0), t.now);
+    assert!(t.actions().is_empty());
+}
+
+/// A redelivery, such as the messages of a member that crashed, can come after messages further on in the segment. A
+/// cumulative ack covers the messages given up to the one at its position, in the order given: not by position.
+#[test]
+fn a_key_shared_consumer_acknowledges_in_the_order_given() {
+    let given = || {
+        let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..key_shared() });
+        for entry in [1, 2, 0] {
+            t.deliver(1, single(entry));
+        }
+        t.take(3);
+        t.actions();
+        t
+    };
+    // Up to 0, the last given: the messages given before it too, though further on in the segment.
+    let mut t = given();
+    t.consumer.acknowledge_cumulative(&id(0, -1, 0), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 0, vec![]), (10, 1, vec![]), (10, 2, vec![])], None)]);
+    assert!(t.consumer.is_settled());
+    // Up to 2: not 0, given after it.
+    let mut t = given();
+    t.consumer.acknowledge_cumulative(&id(2, -1, 0), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 1, vec![]), (10, 2, vec![])], None)]);
+    // One acknowledged on its own leaves the order.
+    t.consumer.acknowledge(&id(0, -1, 0), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 0, vec![])], None)]);
+    assert!(t.consumer.is_settled());
+    t.consumer.acknowledge_cumulative(&id(0, -1, 0), t.now);
+    assert!(t.actions().is_empty());
+}
+
+/// After a new registration the broker delivers again, in the segment's order, what wasn't acknowledged. A message
+/// given again keeps the place it was first given at: a cumulative ack covers no message first given after the one at
+/// its position.
+#[test]
+fn a_key_shared_message_given_again_keeps_its_place() {
+    let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..key_shared() });
+    t.deliver(1, single(1));
+    t.deliver(1, single(0));
+    t.take(2);
+    t.consumer.on_disconnected(1, t.now);
+    t.advance(Duration::from_millis(200));
+    t.consumer.on_subscribed(2, 7);
+    t.deliver(2, single(0));
+    t.deliver(2, single(1));
+    t.take(2);
+    t.actions();
+    t.consumer.acknowledge_cumulative(&id(1, -1, 0), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 1, vec![])], None)]);
+    t.consumer.acknowledge_cumulative(&id(0, -1, 0), t.now);
+    assert_eq!(acks(&t.actions()), [(vec![(10, 0, vec![])], None)]);
+    assert!(t.consumer.is_settled());
+}
+
+#[test]
+fn a_paused_consumer_settles_once_what_it_gave_is_acknowledged() {
+    // Exclusive: the last message given, against the highest cumulative ack.
+    let mut t = Test::subscribed(exclusive());
+    assert!(t.consumer.is_settled(), "nothing given");
+    t.deliver(1, single(0));
+    t.deliver(1, single(1));
+    t.deliver(1, single(2));
+    t.take(2);
+    t.consumer.pause();
+    assert_eq!((t.consumer.available(), t.consumer.next_message().is_none()), (0, true));
+    assert!(!t.consumer.is_settled());
+    t.consumer.acknowledge_cumulative(&id(0, -1, 0), t.now);
+    assert!(!t.consumer.is_settled());
+    t.consumer.acknowledge_cumulative(&id(1, -1, 0), t.now);
+    assert!(t.consumer.is_settled(), "the message still in was never given");
+    // Key_Shared: every message given.
+    let mut t = Test::subscribed(key_shared());
+    t.deliver(1, single(0));
+    t.deliver(1, single(1));
+    t.take(2);
+    t.consumer.pause();
+    t.consumer.acknowledge_cumulative(&id(0, -1, 0), t.now);
+    assert!(!t.consumer.is_settled());
+    t.consumer.acknowledge_cumulative(&id(1, -1, 0), t.now);
+    assert!(t.consumer.is_settled());
+}
+
+#[test]
+fn a_cumulative_ack_still_to_go_out_keeps_a_segment_from_draining() {
+    let mut t = Test::subscribed(exclusive());
+    t.consumer.on_reached_end_of_topic(1);
+    t.consumer.acknowledge_cumulative(&id(0, -1, 0), t.now);
+    assert!(!t.consumer.is_drained());
+    t.advance(Duration::from_millis(100));
+    assert!(t.consumer.is_drained());
 }
 
 /// A reader's subscription isn't durable and starts after its position. The broker sends the start's entry again:

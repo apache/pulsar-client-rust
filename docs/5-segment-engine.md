@@ -118,6 +118,13 @@ carries its segment id up to the scalable layer, which uses it to route acks.
   group, or at once when a group reaches 1000. They are fire-and-forget: the scalable-topics API exposes no
   broker-confirmed acks, and the Java V5 `acknowledge` methods return `void`. So the engine never asks for ack
   receipts.
+- A cumulative ack, for the Stream consumer ([6](6-scalable-topics.md) §5.2), goes out once per group: the highest
+  position acknowledged, inside a batch with the later indexes left in its ack set, as Java writes it. One at or
+  before an ack that went out already on the registration adds nothing; a new registration forgets them, since the
+  broker may deliver again what they covered and may never have had them. A `Key_Shared` subscription forbids
+  cumulative acks: there the consumer acknowledges one by one each message it gave the application up to the one at
+  the position, in the order it gave them, since a redelivery can come after messages further on in the segment
+  ([spec gap 27](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - Negative acks collect for a redelivery delay (60 s by default, as in Java), then go out as
   `CommandRedeliverUnacknowledgedMessages`, a thousand entries at most per command. It names entries, so a negative
   ack of one message of a batch brings the batch back, less the indexes acknowledged meanwhile, as in Java. The
@@ -125,7 +132,8 @@ carries its segment id up to the scalable layer, which uses it to route acks.
 - Transactional acks are a later capability.
 
 **Draining.** For the Stream consumer's mode flips and segment releases (*key-shared* §4), the consumer can
-stop delivering new messages and report when every message it delivered has been acknowledged. It never
+stop delivering new messages and report when every message it delivered has been acknowledged: each one on a
+`Key_Shared` subscription, and on an Exclusive one the last one given, against the highest cumulative ack. It never
 acknowledges anything to get there.
 
 **The end of a segment.** The broker tells the consumers of a terminated segment once their subscription has

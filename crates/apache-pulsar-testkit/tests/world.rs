@@ -18,13 +18,14 @@
 //! The simulated cluster's own behavior, on raw frames: what the tests of the producer and the consumer rely on.
 
 use apache_pulsar_protocol::frame::{FrameDecoder, encode_command, encode_payload_command};
+use apache_pulsar_protocol::hash::KeyHash;
 use apache_pulsar_protocol::proto::base_command::Type;
 use apache_pulsar_protocol::proto::command_ack::{AckType, ValidationError};
 use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
 use apache_pulsar_protocol::proto::{
     BaseCommand, CommandAck, CommandCloseConsumer, CommandConnect, CommandFlow, CommandPing, CommandProducer,
     CommandRedeliverUnacknowledgedMessages, CommandSend, CommandSubscribe, CommandUnsubscribe, CompressionType,
-    MessageIdData, MessageMetadata, ServerError, SingleMessageMetadata,
+    IntRange, KeySharedMeta, KeySharedMode, MessageIdData, MessageMetadata, ServerError, SingleMessageMetadata,
 };
 use apache_pulsar_testkit::decode_all;
 use apache_pulsar_testkit::scalable::World;
@@ -492,8 +493,8 @@ fn the_end_of_topic_comes_once_everything_is_acked() {
     assert_eq!(types(&decode_all(&world.output(conn))), [Type::REACHED_END_OF_TOPIC]);
 }
 
-/// Subscribes fail on an unknown segment, for a type other than Shared, or as told, and wait for their answer while
-/// held. Commands for a consumer the broker doesn't have are ignored, and closing one succeeds.
+/// Subscribes fail on an unknown segment, for a type the world doesn't simulate, or as told, and wait for their answer
+/// while held. Commands for a consumer the broker doesn't have are ignored, and closing one succeeds.
 #[test]
 fn subscribes_fail_or_wait_as_told() {
     let mut world = World::default();
@@ -502,8 +503,8 @@ fn subscribes_fail_or_wait_as_told() {
     let conn = connected(&mut world);
     let unknown = CommandSubscribe { topic: "segment://acme/orders/events/0000-ffff-9".into(), ..shared(SUB, 1) };
     assert_eq!(subscribe(&mut world, conn, unknown)[0].error.error, ServerError::TopicNotFound);
-    let exclusive = CommandSubscribe { subType: SubType::Exclusive, ..shared(SUB, 1) };
-    assert_eq!(subscribe(&mut world, conn, exclusive)[0].error.error, ServerError::NotAllowedError);
+    let failover = CommandSubscribe { subType: SubType::Failover, ..shared(SUB, 1) };
+    assert_eq!(subscribe(&mut world, conn, failover)[0].error.error, ServerError::NotAllowedError);
     world.fail_subscribes.push_back(ServerError::ServiceNotReady);
     let refused = subscribe(&mut world, conn, shared(SUB, 1));
     assert_eq!((refused[0].error.request_id, refused[0].error.error), (101, ServerError::ServiceNotReady));
@@ -588,4 +589,162 @@ fn a_producers_entries_reach_the_consumers() {
     assert_eq!(types(&decode_all(&world.output(conn))), [Type::SEND_RECEIPT, Type::MESSAGE]);
     let stored = &world.stored_in(TOPIC, 0)[0];
     assert_eq!((&stored.value[..], &stored.payload), (&b"hello"[..], &payload));
+}
+
+fn exclusive(consumer_id: u64) -> CommandSubscribe {
+    CommandSubscribe { subType: SubType::Exclusive, ..shared(SUB, consumer_id) }
+}
+
+/// A Key_Shared subscription by entry bucket, named `name`, declaring `ranges`.
+fn by_bucket(name: &str, consumer_id: u64, ranges: &[(i32, i32)]) -> CommandSubscribe {
+    let ranges = ranges.iter().map(|&(start, end)| IntRange { start, end, ..Default::default() }).collect();
+    let meta = KeySharedMeta {
+        keySharedMode: KeySharedMode::STICKY,
+        hashRanges: ranges,
+        entryBucketDispatch: Some(true),
+        ..Default::default()
+    };
+    CommandSubscribe {
+        subType: SubType::Key_Shared,
+        consumer_name: Some(name.into()),
+        keySharedMeta: meta.into(),
+        ..shared(SUB, consumer_id)
+    }
+}
+
+const FOUR: [(i32, i32); 4] = [(0, 0x3fff), (0x4000, 0x7fff), (0x8000, 0xbfff), (0xc000, 0xffff)];
+
+/// Stores a one-message entry in [`SEGMENT`] stamped with `hash`, or with `key` and no stamp.
+fn publish_stamped(world: &mut World, hash: Option<u32>, key: Option<&str>) -> u64 {
+    let metadata = MessageMetadata {
+        producer_name: "other".into(),
+        entry_hash_min: hash,
+        entry_hash_max: hash,
+        partition_key: key.map(str::to_string),
+        ..Default::default()
+    };
+    world.publish_raw(TOPIC, 0, metadata, Bytes::from_static(b"v")).1
+}
+
+#[test]
+fn an_exclusive_subscription_has_one_consumer_and_takes_cumulative_acks() {
+    let mut world = World::default();
+    world.create_topic(TOPIC, 1);
+    let conn = connected(&mut world);
+    assert_eq!(types(&subscribe(&mut world, conn, exclusive(1))), [Type::SUCCESS]);
+    assert_eq!(subscribe(&mut world, conn, exclusive(2))[0].error.error, ServerError::ConsumerBusy);
+    assert_eq!(subscribe(&mut world, conn, shared(SUB, 3))[0].error.error, ServerError::ConsumerBusy);
+    flow(&mut world, conn, 1, 10);
+    publish(&mut world, &["a"]);
+    publish(&mut world, &["b"]);
+    publish(&mut world, &["c", "d", "e"]);
+    assert_eq!(delivered(&mut world, conn), [(1, 0, 0), (1, 1, 0), (1, 2, 0)]);
+    let cumulative = |entry: MessageIdData| CommandAck { ack_type: AckType::Cumulative, ..acks(1, vec![entry]) };
+    ack(&mut world, conn, cumulative(id(1)));
+    assert_eq!(world.backlog(TOPIC, 0, SUB), 3);
+    // Inside a batch: the indexes the ack set keeps stay.
+    ack(&mut world, conn, cumulative(indexes(2, &[0b110])));
+    assert_eq!(world.backlog(TOPIC, 0, SUB), 2);
+    // Another ledger's position, or another consumer's ack, does nothing.
+    ack(&mut world, conn, cumulative(MessageIdData { ledgerId: 7, ..id(2) }));
+    ack(&mut world, conn, CommandAck { consumer_id: 9, ..cumulative(id(2)) });
+    assert_eq!(world.backlog(TOPIC, 0, SUB), 2);
+    ack(&mut world, conn, cumulative(id(2)));
+    assert_eq!(world.backlog(TOPIC, 0, SUB), 0);
+    // Once its consumer is gone, the subscription takes another type.
+    assert_eq!(types(&close(&mut world, conn, 1)), [Type::SUCCESS]);
+    assert_eq!(types(&subscribe(&mut world, conn, shared(SUB, 4))), [Type::SUCCESS]);
+}
+
+#[test]
+fn a_key_shared_subscription_takes_consumers_declaring_the_same_buckets() {
+    let mut world = World::default();
+    world.create_topic(TOPIC, 1);
+    let conn = connected(&mut world);
+    let refused = |world: &mut World, command| subscribe(world, conn, command)[0].error.error;
+    // By key, or with ranges that don't tile the ring.
+    let by_key = CommandSubscribe { keySharedMeta: KeySharedMeta::default().into(), ..by_bucket("a", 1, &FOUR) };
+    assert_eq!(refused(&mut world, by_key), ServerError::NotAllowedError);
+    assert_eq!(
+        refused(&mut world, by_bucket("a", 1, &[(0, 0x7fff), (0x8001, 0xffff)])),
+        ServerError::ConsumerAssignError
+    );
+    assert_eq!(refused(&mut world, by_bucket("a", 1, &[(0, 0x7fff)])), ServerError::ConsumerAssignError);
+    assert_eq!(types(&subscribe(&mut world, conn, by_bucket("a", 1, &FOUR))), [Type::SUCCESS]);
+    // Others must declare the same buckets, and be Key_Shared.
+    assert_eq!(refused(&mut world, by_bucket("b", 2, &[(0, 0xffff)])), ServerError::ConsumerAssignError);
+    assert_eq!(refused(&mut world, exclusive(2)), ServerError::ConsumerBusy);
+    assert_eq!(types(&subscribe(&mut world, conn, by_bucket("b", 2, &FOUR))), [Type::SUCCESS]);
+}
+
+/// The buckets go to the consumers by name: with two of four buckets each, `a` owns 0 and 1, `b` 2 and 3. An entry
+/// goes by its stamp, else its key's bucket hash, else to bucket 0.
+#[test]
+fn a_key_shared_subscription_dispatches_by_bucket() {
+    let mut world = World::default();
+    world.create_topic(TOPIC, 1);
+    let conn = connected(&mut world);
+    subscribe(&mut world, conn, by_bucket("b", 1, &FOUR));
+    subscribe(&mut world, conn, by_bucket("a", 2, &FOUR));
+    flow(&mut world, conn, 1, 10);
+    flow(&mut world, conn, 2, 10);
+    publish_stamped(&mut world, Some(0x0001), None);
+    publish_stamped(&mut world, Some(0xc000), None);
+    publish_stamped(&mut world, None, None);
+    let key = (0..).map(|i| format!("k{i}")).find(|k| KeyHash::of(k.as_bytes()).bucket_hash() >= 0x8000).unwrap();
+    publish_stamped(&mut world, None, Some(&key));
+    assert_eq!(delivered(&mut world, conn), [(2, 0, 0), (1, 1, 0), (2, 2, 0), (1, 3, 0)]);
+}
+
+/// When consumers join, the buckets that move wait until the consumers that had them acknowledge what they hold of
+/// them, and the entries after a held one in its bucket wait with it. A bucket with no consumer, or whose owner has no
+/// permits, waits too; the other buckets flow.
+#[test]
+fn a_bucket_that_moves_waits_for_its_entries_in_flight() {
+    let mut world = World::default();
+    world.create_topic(TOPIC, 1);
+    let conn = connected(&mut world);
+    subscribe(&mut world, conn, by_bucket("a", 1, &FOUR));
+    close(&mut world, conn, 1);
+    // No consumer: the entry waits.
+    publish_stamped(&mut world, Some(0x4000), None);
+    subscribe(&mut world, conn, by_bucket("a", 2, &FOUR));
+    flow(&mut world, conn, 2, 10);
+    assert_eq!(delivered(&mut world, conn), [(2, 0, 0)]);
+    // With three consumers, `a` keeps bucket 0, `b` takes 1, and `c` 2 and 3. Bucket 1 is in flight on `a`.
+    subscribe(&mut world, conn, by_bucket("b", 3, &FOUR));
+    subscribe(&mut world, conn, by_bucket("c", 4, &FOUR));
+    flow(&mut world, conn, 3, 10);
+    publish_stamped(&mut world, Some(0x4001), None);
+    publish_stamped(&mut world, Some(0x8000), None);
+    publish_stamped(&mut world, Some(0x4002), None);
+    // `c` has no permits yet: bucket 2 waits; bucket 1 waits for `a`'s ack.
+    assert!(delivered(&mut world, conn).is_empty());
+    ack(&mut world, conn, acks(2, vec![id(0)]));
+    assert_eq!(delivered(&mut world, conn), [(3, 1, 0), (3, 3, 0)]);
+    flow(&mut world, conn, 4, 10);
+    assert_eq!(delivered(&mut world, conn), [(4, 2, 0)]);
+}
+
+/// A rewind closes the subscription's consumers and makes everything unacknowledged again; the segment's other
+/// subscriptions keep theirs.
+#[test]
+fn a_rewind_delivers_everything_again() {
+    let mut world = World::default();
+    world.create_topic(TOPIC, 1);
+    let conn = connected(&mut world);
+    subscribe(&mut world, conn, exclusive(1));
+    subscribe(&mut world, conn, shared("other", 2));
+    flow(&mut world, conn, 1, 10);
+    publish(&mut world, &["a"]);
+    publish(&mut world, &["b"]);
+    assert_eq!(delivered(&mut world, conn), [(1, 0, 0), (1, 1, 0)]);
+    ack(&mut world, conn, CommandAck { ack_type: AckType::Cumulative, ..acks(1, vec![id(1)]) });
+    world.rewind(TOPIC, 0, SUB);
+    let closed = decode_all(&world.output(conn));
+    assert_eq!((types(&closed), closed[0].close_consumer.consumer_id), (vec![Type::CLOSE_CONSUMER], 1));
+    assert_eq!((world.backlog(TOPIC, 0, SUB), world.consumer_count(TOPIC, 0, "other")), (2, 1));
+    subscribe(&mut world, conn, exclusive(3));
+    flow(&mut world, conn, 3, 10);
+    assert_eq!(delivered(&mut world, conn), [(3, 0, 0), (3, 1, 0)]);
 }

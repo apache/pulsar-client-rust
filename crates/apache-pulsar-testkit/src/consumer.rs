@@ -94,6 +94,11 @@ impl ConsumerHarness {
         self.pump();
     }
 
+    pub fn ack_cumulative(&mut self, id: &MessageId) {
+        self.consumer.acknowledge_cumulative(&id.entry, self.clock.now());
+        self.pump();
+    }
+
     pub fn nack(&mut self, id: &MessageId) {
         self.consumer.negative_acknowledge(&id.entry, self.clock.now());
         self.pump();
