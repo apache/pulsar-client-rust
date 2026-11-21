@@ -139,6 +139,16 @@ segment only, as Java's do.
 **Checks:** ported scenarios from `V5ProducerCompressionTest`. Key affinity holds with batched producers and shared
 segments. A performance baseline is recorded.
 
+It lands in three pull requests: batching, then compression, then the benchmarks.
+
+Ported so far: batching, with Java V5's `BatchingPolicy` and its defaults, and `EntryBucketBatchContainer`'s rules,
+on the simulated cluster (`crates/apache-pulsar-testkit/tests/producer_batching.rs`): the three triggers, one bucket
+per entry and its stamp, entries in sequence order, the messages that go alone, and open batches on a flush, a close,
+a reconnect, a split and a timeout. Key affinity holds on the simulated cluster and against a 5.0.1 broker: two
+Stream members sharing a one-segment topic by bucket each get whole keys, in order, from entries of several messages.
+Java's `V5EntryBucketDispatchTest` sends one message at a time, so its entries hold one; these pipeline the sends. A
+Java consumer reads Rust's batches, and with deduplication on, a 5.0.1 broker takes the entries of every bucket.
+
 ## M7: Conformance and a first release
 
 - The rest of the schemas, generic records included (C11, [7](docs/7-api.md) §8).

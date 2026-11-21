@@ -25,7 +25,7 @@ use apache_pulsar_protocol::hash::KeyHash;
 use apache_pulsar_protocol::layout::{Layout, LayoutError};
 use apache_pulsar_protocol::message_id::{EntryId, MessageId};
 use apache_pulsar_protocol::producer::{
-    Action, OutgoingMessage, Producer, ProducerOptions, RegisterError, SendError, SendId,
+    Action, Batching, OutgoingMessage, Producer, ProducerOptions, RegisterError, SendError, SendId,
 };
 use apache_pulsar_protocol::proto::{
     CommandProducerSuccess, CommandSendError, CommandSendReceipt, MessageIdData, ProducerAccessMode, ScalableTopicDAG,
@@ -59,6 +59,7 @@ fn options(mode: ProducerAccessMode) -> ProducerOptions {
         properties: Vec::new(),
         schema: None,
         operation_timeout: Duration::from_secs(30),
+        batching: None,
     }
 }
 
@@ -312,6 +313,79 @@ fn a_layout_drops_a_ready_segment_once_its_producer_is_closed() {
     let done = Test::done(&t.actions());
     assert_eq!(done[0].0, send);
     assert_eq!(done[0].1.as_ref().unwrap().segment_id, 1);
+}
+
+/// A layout that drops a ready segment parks what its open batches hold at once, since it was never written, and
+/// its entries with the close's answer. All of them go to the successor, in call order.
+#[test]
+fn a_layout_drops_a_ready_segment_with_open_batches() {
+    let batching = Batching { max_messages: 2, max_bytes: 0, max_delay: Duration::from_millis(10) };
+    let options = ProducerOptions { batching: Some(batching), ..options(ProducerAccessMode::Shared) };
+    let now = Instant::now();
+    let mut t = Test { producer: Producer::new(options, one_segment(), now), now };
+    let sends = [t.send(keyless()), t.send(keyless())];
+    let generation = Test::connects(&t.actions())[0].1;
+    t.register(0, generation, 7);
+    assert_eq!(Test::sent(&t.actions()), [(0, 1)]);
+    let open = t.send(keyless());
+    t.producer.on_layout(layout(2, &[(0, 0, 0xffff, false), (1, 0, 0xffff, true)]), t.now);
+    assert_eq!(t.actions(), [Action::CloseProducer { segment: 0, generation }]);
+    assert_eq!(t.producer.sends_parked_or_held(), 1);
+    // The close's answer: the entry wasn't stored.
+    t.producer.on_disconnected(0, generation, t.now);
+    assert_eq!(t.producer.sends_parked_or_held(), 3);
+    let actions = t.actions();
+    let [(1, next)] = Test::connects(&actions)[..] else { panic!("{actions:?}") };
+    t.register(1, next, 8);
+    assert_eq!(Test::sent(&t.actions()), [(1, 1)]);
+    t.receipt(1, next, 1, Some(3));
+    t.advance(Duration::from_millis(10));
+    let mut actions = t.actions();
+    assert_eq!(Test::sent(&actions), [(1, 2)]);
+    t.receipt(1, next, 2, Some(4));
+    actions.extend(t.actions());
+    let done: Vec<(SendId, i64)> =
+        Test::done(&actions).into_iter().map(|(send, result)| (send, result.unwrap().segment_id)).collect();
+    assert_eq!(done, [(sends[0], 1), (sends[1], 1), (open, 1)]);
+}
+
+/// A flush covers the messages still waiting for their segment's registration: they go out together once it is
+/// registered, without waiting out the delay.
+#[test]
+fn a_flush_covers_messages_waiting_for_a_registration() {
+    let batching = Batching { max_messages: 0, max_bytes: 0, max_delay: Duration::from_secs(60) };
+    let options = ProducerOptions { batching: Some(batching), ..options(ProducerAccessMode::Shared) };
+    let mut t = Test { producer: Producer::new(options, one_segment(), Instant::now()), now: Instant::now() };
+    t.send(keyless());
+    t.send(keyless());
+    t.producer.flush();
+    let generation = Test::connects(&t.actions())[0].1;
+    let later = t.send(keyless());
+    t.register(0, generation, 7);
+    // The flushed two and the later one, which joined before the batches closed, in one entry.
+    assert_eq!(Test::sent(&t.actions()), [(0, 2)]);
+    t.receipt(0, generation, 2, Some(3));
+    let done = Test::done(&t.actions());
+    assert_eq!(done.len(), 3);
+    assert_eq!(done[2].0, later);
+}
+
+/// A message routed to a segment while its producer reconnects waits there with its clock running, and times out
+/// before it gets into a batch.
+#[test]
+fn a_message_waiting_for_a_reconnect_times_out() {
+    let options =
+        ProducerOptions { send_timeout: Some(Duration::from_millis(100)), ..options(ProducerAccessMode::Shared) };
+    let mut t = Test { producer: Producer::new(options, one_segment(), Instant::now()), now: Instant::now() };
+    t.send(keyless());
+    let generation = Test::connects(&t.actions())[0].1;
+    t.register(0, generation, 7);
+    t.receipt(0, generation, 0, Some(1));
+    t.producer.on_disconnected(0, generation, t.now);
+    t.actions();
+    let late = t.send(keyless());
+    t.advance(Duration::from_millis(100));
+    assert_eq!(Test::done(&t.actions()), [(late, Err(SendError::Timeout))]);
 }
 
 #[test]
