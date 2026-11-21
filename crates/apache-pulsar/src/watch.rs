@@ -20,8 +20,9 @@
 //! One watch per topic per loop, shared by the producers and consumers of the topic on the loop, and closed with
 //! the last of them. It finds a broker with a standard lookup on the topic name, as the Java client does, and
 //! opens a `CommandScalableTopicLookup` session there. A layout is applied only if its epoch is greater than the
-//! last applied (*client-behavior* §1). After a connection loss the watch reopens its session with backoff, and
-//! keeps the last layout meanwhile.
+//! last applied (*client-behavior* §1), or if it is a migrated topic's first layout, which has the epoch of the
+//! synthetic layout it replaces (spec gap 29). After a connection loss the watch reopens its session with backoff,
+//! and keeps the last layout meanwhile.
 //!
 //! A failure before the first layout fails whoever opened the watch, as the Java client's `DagWatchClient` does:
 //! the caller of `create()` sees it, rather than a retry it can't observe.
@@ -288,7 +289,7 @@ fn apply(watch: &Shared, topic: &str, frame: &Frame) -> Result<()> {
     let resolved = update.resolved_topic_name.or(state.layout.as_ref().map(|l| l.topic())).unwrap_or(topic);
     let layout = Layout::from_dag(&dag, resolved).map_err(malformed)?;
     if let Some(current) = &state.layout
-        && layout.epoch() <= current.epoch()
+        && !layout.supersedes(current)
     {
         tracing::debug!(%topic, epoch = layout.epoch(), current = current.epoch(), "stale layout ignored");
         return Ok(());
@@ -315,13 +316,13 @@ mod tests {
 
     use super::*;
 
-    /// A layout with a segment off the hash ring is refused, and changes nothing.
-    #[test]
-    fn a_malformed_layout_is_refused() {
-        let watch = Shared { topic: "topic://t/n/x".into(), state: RefCell::default(), task: Cell::new(None) };
-        let off_ring = SegmentInfoProto { hash_end: 0x1_0000, state: SegmentState::ACTIVE, ..Default::default() };
-        let dag = ScalableTopicDAG { epoch: 1, segments: vec![off_ring], ..Default::default() };
-        let update = CommandScalableTopicUpdate { dag: dag.into(), ..Default::default() };
+    /// A `CommandScalableTopicUpdate` with `dag`, for `topic://t/n/x`.
+    fn update(dag: ScalableTopicDAG) -> Frame {
+        let update = CommandScalableTopicUpdate {
+            dag: dag.into(),
+            resolved_topic_name: Some("topic://t/n/x".into()),
+            ..Default::default()
+        };
         let command = BaseCommand {
             r#type: Type::SCALABLE_TOPIC_UPDATE.into(),
             scalableTopicUpdate: update.into(),
@@ -329,10 +330,45 @@ mod tests {
         };
         let mut bytes = bytes::BytesMut::new();
         encode_command(&command, &mut bytes).unwrap();
-        let frame = FrameDecoder::default().decode(&mut bytes).unwrap().unwrap();
-        let error = apply(&watch, &watch.topic, &frame).unwrap_err();
+        FrameDecoder::default().decode(&mut bytes).unwrap().unwrap()
+    }
+
+    /// A layout with a segment off the hash ring is refused, and changes nothing.
+    #[test]
+    fn a_malformed_layout_is_refused() {
+        let watch = Shared { topic: "topic://t/n/x".into(), state: RefCell::default(), task: Cell::new(None) };
+        let off_ring = SegmentInfoProto { hash_end: 0x1_0000, state: SegmentState::ACTIVE, ..Default::default() };
+        let dag = ScalableTopicDAG { epoch: 1, segments: vec![off_ring], ..Default::default() };
+        let error = apply(&watch, &watch.topic, &update(dag)).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("outside the 16-bit ring"), "{error}");
         assert!(watch.state.borrow().layout.is_none());
+    }
+
+    /// A migrated topic's first layout replaces its synthetic one, though the 5.0.1 broker gives both epoch 0, and the
+    /// synthetic one, sent again, doesn't replace it back.
+    #[test]
+    fn a_migration_replaces_the_synthetic_layout() {
+        let watch = Shared { topic: "persistent://t/n/x".into(), state: RefCell::default(), task: Cell::new(None) };
+        let legacy = |state| SegmentInfoProto {
+            legacy_topic_name: Some("persistent://t/n/x".into()),
+            hash_end: 0xffff,
+            state,
+            ..Default::default()
+        };
+        let child = SegmentInfoProto {
+            segment_id: 1,
+            hash_end: 0xffff,
+            state: SegmentState::ACTIVE,
+            parent_ids: vec![0],
+            ..Default::default()
+        };
+        let synthetic = ScalableTopicDAG { segments: vec![legacy(SegmentState::ACTIVE)], ..Default::default() };
+        let migrated = ScalableTopicDAG { segments: vec![legacy(SegmentState::SEALED), child], ..Default::default() };
+        for (dag, active) in [(synthetic.clone(), 0), (migrated, 1), (synthetic, 1)] {
+            apply(&watch, &watch.topic, &update(dag)).unwrap();
+            let layout = watch.state.borrow().layout.clone().unwrap();
+            assert_eq!(layout.active().map(|s| s.id).collect::<Vec<_>>(), [active]);
+        }
     }
 }
