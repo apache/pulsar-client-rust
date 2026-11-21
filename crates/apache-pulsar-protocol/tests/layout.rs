@@ -78,6 +78,30 @@ fn legacy_layout_routes_like_v4_partitions() {
     }
 }
 
+/// A layout replaces one of a lower epoch. At the same epoch, only a migrated topic's first layout replaces the
+/// synthetic one, as the 5.0.1 broker gives both epoch 0.
+#[test]
+fn a_greater_epoch_or_a_migration_supersedes() {
+    let at = |epoch: u64, segments: Vec<SegmentInfoProto>| {
+        let dag = ScalableTopicDAG { epoch, segments, ..Default::default() };
+        Layout::from_dag(&dag, "topic://acme/orders/events").unwrap()
+    };
+    let legacy = |id: u64, active: bool| SegmentInfoProto {
+        legacy_topic_name: Some(format!("persistent://acme/orders/events-partition-{id}")),
+        ..info(id, 0, 0xffff, active)
+    };
+    let child =
+        |id: u64, start: u32, end: u32| SegmentInfoProto { parent_ids: vec![0, 1], ..info(id, start, end, true) };
+    let synthetic = at(0, vec![legacy(0, true), legacy(1, true)]);
+    let migrated = at(0, vec![legacy(0, false), legacy(1, false), child(2, 0, 0x7fff), child(3, 0x8000, 0xffff)]);
+    assert!(migrated.supersedes(&synthetic));
+    assert!(!synthetic.supersedes(&synthetic) && !migrated.supersedes(&migrated));
+    assert!(!synthetic.supersedes(&migrated), "a synthetic layout never replaces a real one");
+    let first = at(0, vec![info(0, 0, 0xffff, true)]);
+    let split = at(1, vec![info(0, 0, 0xffff, false), info(1, 0, 0x7fff, true), info(2, 0x8000, 0xffff, true)]);
+    assert!(split.supersedes(&first) && !first.supersedes(&split) && !first.supersedes(&first));
+}
+
 #[test]
 fn errors() {
     let gap = layout(vec![info(1, 0, 0x7fff, true)]);

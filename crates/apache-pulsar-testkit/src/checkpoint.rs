@@ -98,7 +98,8 @@ impl CheckpointHarness {
         let command = decode(&harness.world.output(conn)).pop().expect("no answer to the scalable lookup");
         let update = &command.scalableTopicUpdate;
         assert!(update.error.is_none(), "lookup failed: {:?} {:?}", update.error, update.message);
-        let layout = Layout::from_dag(&update.dag, &harness.topic).unwrap();
+        let layout =
+            Layout::from_dag(&update.dag, update.resolved_topic_name.as_deref().unwrap_or(&harness.topic)).unwrap();
         harness.consumer = CheckpointConsumer::new(options, start, Rc::new(layout), harness.clock.now());
         harness.pump();
         harness
@@ -179,7 +180,9 @@ impl CheckpointHarness {
                 for command in self.wire.answer(&mut self.consumer, &output, now) {
                     let update = &command.scalableTopicUpdate;
                     assert_eq!((update.session_id, update.error), (self.session_id, None), "{command:?}");
-                    let layout = Layout::from_dag(&update.dag, &self.topic).unwrap();
+                    let layout =
+                        Layout::from_dag(&update.dag, update.resolved_topic_name.as_deref().unwrap_or(&self.topic))
+                            .unwrap();
                     self.consumer.on_layout(Rc::new(layout), now);
                 }
             }

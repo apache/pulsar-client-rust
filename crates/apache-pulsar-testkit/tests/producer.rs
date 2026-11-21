@@ -18,8 +18,9 @@
 //! The scalable producer's state machine against the simulated world, deterministically.
 //!
 //! Ported scenarios from the Java client's `ScalableTopicProducerOrderingTest`, `V5ProducerSegmentGoneTest`,
-//! `V5ProducerAccessModeTest`, `V5ProducerLayoutChangeOrderingTest` and `V5ScalableTopicAutoCreateTest`, plus the
-//! segment producer's own behavior: encoding, sequence ids, receipts, reconnects and the send timeout.
+//! `V5ProducerAccessModeTest`, `V5ProducerLayoutChangeOrderingTest`, `V5ScalableTopicAutoCreateTest` and
+//! `V5MigrationEndToEndTest`, plus the segment producer's own behavior: encoding, sequence ids, receipts, reconnects
+//! and the send timeout.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -32,6 +33,7 @@ use apache_pulsar_testkit::producer::{Harness, options};
 use apache_pulsar_testkit::scalable::World;
 
 const TOPIC: &str = "topic://acme/orders/events";
+const LEGACY: &str = "persistent://acme/orders/legacy";
 
 fn world(segments: u32) -> World {
     let mut world = World::default();
@@ -48,10 +50,17 @@ fn key_in(start: u16, end: u16, nth: usize) -> String {
         .unwrap()
 }
 
-/// The values stored per key, in the order a reader would see them.
-fn by_key(harness: &Harness) -> BTreeMap<String, Vec<String>> {
+/// A regular topic of two partitions.
+fn legacy_world() -> World {
+    let mut world = World::default();
+    world.create_legacy_topic(LEGACY, 2);
+    world
+}
+
+/// The values `topic` stored per key, in the order a reader would see them.
+fn by_key(harness: &Harness, topic: &str) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for stored in harness.world.stored(TOPIC) {
+    for stored in harness.world.stored(topic) {
         let value = String::from_utf8(stored.value.to_vec()).unwrap();
         out.entry(stored.key.unwrap_or_default()).or_default().push(value);
     }
@@ -184,28 +193,37 @@ fn only_the_keys_of_a_retiring_segment_are_held() {
 /// call order.
 #[test]
 fn per_key_order_holds_across_a_split_with_traffic() {
-    per_key_order(1, |h| {
+    per_key_order(world(1), TOPIC, |h| {
         h.world.split(TOPIC, 0);
     });
 }
 
 #[test]
 fn per_key_order_holds_across_a_merge_with_traffic() {
-    per_key_order(2, |h| {
+    per_key_order(world(2), TOPIC, |h| {
         h.world.merge(TOPIC, 0, 1);
     });
 }
 
 #[test]
 fn per_key_order_holds_across_consecutive_splits() {
-    per_key_order(1, |h| {
+    per_key_order(world(1), TOPIC, |h| {
         let (low, _) = h.world.split(TOPIC, 0);
         h.world.split(TOPIC, low);
     });
 }
 
-fn per_key_order(segments: u32, change: impl FnOnce(&mut Harness)) {
-    let mut h = Harness::new(world(segments), TOPIC, options());
+/// Java's `V5MigrationEndToEndTest`: a producer on a regular topic follows the topic's migration, though the 5.0.1
+/// broker gives the migrated layout the synthetic one's epoch, 0 (spec gap 29).
+#[test]
+fn per_key_order_holds_across_a_migration_with_traffic() {
+    per_key_order(legacy_world(), LEGACY, |h| {
+        h.world.migrate(LEGACY);
+    });
+}
+
+fn per_key_order(world: World, topic: &str, change: impl FnOnce(&mut Harness)) {
+    let mut h = Harness::new(world, topic, options());
     let keys: Vec<String> = (0..40).map(|i| format!("k{i}")).collect();
     let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut send = |h: &mut Harness, round: usize| {
@@ -236,7 +254,7 @@ fn per_key_order(segments: u32, change: impl FnOnce(&mut Harness)) {
     }
     h.run_until(Duration::from_secs(10), |h| h.producer.outstanding() == 0);
     assert!(h.done.values().all(Result::is_ok), "a send failed");
-    assert_eq!(by_key(&h), sent);
+    assert_eq!(by_key(&h, topic), sent);
     // Without this the test could pass without the layout change touching any send.
     assert!(h.producer.sends_parked_or_held() > 0, "no send waited for the layout change");
 }
@@ -461,6 +479,27 @@ fn a_legacy_topic_routes_like_v4_partitions() {
     let registration = &h.world.received(Type::PRODUCER)[0].producer;
     assert!(registration.topic.starts_with("persistent://acme/orders/legacy-partition-"));
     assert!(registration.metadata.iter().any(|kv| kv.key == "__pulsar.v5.managed" && kv.value == "true"));
+}
+
+/// A topic migrated while the producer's connection is down: the session the watch opens again gets the migrated
+/// layout, at the synthetic layout's epoch, and the producer sends to the new segments, managed ones without the
+/// V5-managed marker.
+#[test]
+fn a_migration_made_while_disconnected_is_followed() {
+    let mut h = Harness::new(legacy_world(), LEGACY, options());
+    let before = h.send(Some("k"), "before");
+    for conn in h.world.open_connections() {
+        h.world.kill(conn);
+    }
+    let managed = h.world.migrate(LEGACY);
+    h.pump();
+    let after = h.send(Some("k"), "after");
+    h.run_until(Duration::from_secs(5), |h| h.result(after).is_some());
+    assert!(h.segment_of(before) < 2);
+    assert!(managed.contains(&h.segment_of(after)), "sent to {}", h.segment_of(after));
+    let registration = &h.world.received(Type::PRODUCER).last().unwrap().producer;
+    assert!(registration.topic.starts_with("segment://acme/orders/legacy/"), "{}", registration.topic);
+    assert!(registration.metadata.is_empty());
 }
 
 // --- Send errors ---
