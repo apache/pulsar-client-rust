@@ -22,8 +22,8 @@
 //! [`World::input`] and writes out what [`World::output`] returns. Admin operations ([`World::split`],
 //! [`World::merge`], [`World::terminate`]) behave like the 5.0.1 broker's: sealing a segment terminates its topic,
 //! which disconnects its producers with `CommandCloseProducer`, then the new layout goes to every watch. The
-//! children of a split or a merge start without subscriptions, as the broker gives them only those registered on the
-//! scalable topic, which a consumer's subscribe doesn't register. The controller's garbage collection of a sealed segment is two steps, which a test takes in either
+//! children of a split or a merge start with only the subscriptions registered on the scalable topic, which a Queue
+//! consumer's subscribe doesn't register, and a Stream or Checkpoint consumer's registration does. The controller's garbage collection of a sealed segment is two steps, which a test takes in either
 //! order: [`World::prune`] drops it from the layout, [`World::delete_segment`] deletes its topic.
 //!
 //! A segment's Shared subscriptions dispatch like the broker's Shared dispatcher: the entries to redeliver first, in
@@ -35,8 +35,10 @@
 //! `dispatcherMaxRoundRobinBatchSize`; and tells a consumer the topic ended once, where the broker tells it again on
 //! later acks and reads.
 //!
-//! Exclusive subscriptions and `Key_Shared` ones by entry bucket, and rewinds, are in the `subscriptions` module.
+//! Exclusive subscriptions and `Key_Shared` ones by entry bucket, and rewinds, are in the `subscriptions` module; the
+//! controller, which registers Stream and Checkpoint consumers and assigns them segments, in [`controller`].
 
+pub mod controller;
 mod subscriptions;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -192,6 +194,8 @@ pub struct World {
     pub silent_lookups: bool,
     /// Every command received, per connection.
     pub log: Vec<(ConnId, BaseCommand)>,
+    /// The topics' controllers.
+    pub controller: controller::Controller,
     topics: BTreeMap<String, Topic>,
     conns: BTreeMap<ConnId, Conn>,
     held: Vec<(ConnId, BaseCommand)>,
@@ -233,6 +237,7 @@ impl Default for World {
             next_conn: 0,
             next_ledger: 100,
             next_name: 0,
+            controller: controller::Controller::default(),
         }
     }
 }
@@ -584,6 +589,7 @@ impl World {
             info.sealed_at_epoch = Some(epoch);
             info.child_ids = ids.clone();
         }
+        self.provision(topic, &ids);
         self.push_layout(topic);
         ids
     }
@@ -593,6 +599,7 @@ impl World {
         for (conn, session_id) in self.watchers(topic) {
             self.push(conn, layout_update(session_id, topic, dag.clone()));
         }
+        self.rebalance(topic);
     }
 
     /// The sessions watching `topic`, on the open connections.
@@ -609,6 +616,7 @@ impl World {
         ScalableTopicDAG {
             epoch: state.epoch,
             segments: state.segments.values().filter(|s| !s.pruned).map(|s| s.info.clone()).collect(),
+            controller_broker_url: self.controller.url.clone(),
             ..Default::default()
         }
     }
@@ -619,6 +627,7 @@ impl World {
         let producers: Vec<(u64, (String, u64))> = c.producers.drain().collect();
         let consumers: Vec<(u64, (String, u64, String))> = c.consumers.drain().collect();
         c.sessions.clear();
+        self.members_disconnected(conn);
         for (producer_id, (topic, segment)) in producers {
             self.remove_producer(conn, producer_id, &topic, segment);
         }
@@ -686,6 +695,8 @@ impl World {
                 self.held_subscribes.push((conn, command));
             }
             Type::SUBSCRIBE => self.subscribe(conn, &command),
+            Type::SCALABLE_TOPIC_SUBSCRIBE => self.register(conn, &command),
+            Type::SCALABLE_TOPIC_UNSUBSCRIBE => self.unregister(conn, &command),
             Type::FLOW => self.flow(conn, &command),
             Type::ACK => self.ack(conn, &command),
             Type::REDELIVER_UNACKNOWLEDGED_MESSAGES => self.redeliver(conn, &command),
@@ -1056,6 +1067,7 @@ impl World {
                 encode_command(&reached_end_of_topic(consumer.id), out).unwrap();
             }
         }
+        self.check_drains(topic);
     }
 }
 

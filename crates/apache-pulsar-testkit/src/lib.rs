@@ -83,6 +83,7 @@ pub mod consumer;
 pub mod producer;
 pub mod queue;
 pub mod scalable;
+pub mod stream;
 
 pub mod reply {
     use super::*;

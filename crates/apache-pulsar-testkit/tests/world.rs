@@ -24,8 +24,9 @@ use apache_pulsar_protocol::proto::command_ack::{AckType, ValidationError};
 use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
 use apache_pulsar_protocol::proto::{
     BaseCommand, CommandAck, CommandCloseConsumer, CommandConnect, CommandFlow, CommandPing, CommandProducer,
-    CommandRedeliverUnacknowledgedMessages, CommandSend, CommandSubscribe, CommandUnsubscribe, CompressionType,
-    IntRange, KeySharedMeta, KeySharedMode, MessageIdData, MessageMetadata, ServerError, SingleMessageMetadata,
+    CommandRedeliverUnacknowledgedMessages, CommandScalableTopicSubscribe, CommandScalableTopicUnsubscribe,
+    CommandSend, CommandSubscribe, CommandUnsubscribe, CompressionType, IntRange, KeySharedMeta, KeySharedMode,
+    MessageIdData, MessageMetadata, ScalableConsumerType, ServerError, SingleMessageMetadata,
 };
 use apache_pulsar_testkit::decode_all;
 use apache_pulsar_testkit::scalable::World;
@@ -747,4 +748,69 @@ fn a_rewind_delivers_everything_again() {
     subscribe(&mut world, conn, exclusive(3));
     flow(&mut world, conn, 3, 10);
     assert_eq!(delivered(&mut world, conn), [(3, 0, 0), (3, 1, 0)]);
+}
+
+/// Registers a member named `name` in a group of [`SUB`] on `topic`, and returns what the broker sent since.
+fn join_group(
+    world: &mut World,
+    conn: usize,
+    topic: &str,
+    name: &str,
+    consumer_id: u64,
+    kind: ScalableConsumerType,
+) -> Vec<BaseCommand> {
+    let subscribe = CommandScalableTopicSubscribe {
+        request_id: 300 + consumer_id,
+        topic: topic.into(),
+        subscription: SUB.into(),
+        consumer_name: name.into(),
+        consumer_id,
+        consumer_type: kind,
+        ..Default::default()
+    };
+    let command = BaseCommand {
+        r#type: Type::SCALABLE_TOPIC_SUBSCRIBE.into(),
+        scalableTopicSubscribe: subscribe.into(),
+        ..Default::default()
+    };
+    write(world, conn, &command);
+    decode_all(&world.output(conn))
+}
+
+/// The controller refuses a registration on a topic that doesn't exist, and takes an unsubscribe of a member it
+/// doesn't have as done.
+#[test]
+fn the_controller_refuses_an_unknown_topic_and_ignores_an_unknown_member() {
+    let mut world = World::default();
+    let conn = connected(&mut world);
+    let answer = join_group(&mut world, conn, TOPIC, "a", 1, ScalableConsumerType::STREAM);
+    let response = &answer[0].scalableTopicSubscribeResponse;
+    assert_eq!((response.request_id, response.error), (301, Some(ServerError::TopicNotFound)));
+    let unsubscribe = CommandScalableTopicUnsubscribe { request_id: 9, consumer_id: 1, ..Default::default() };
+    let command = BaseCommand {
+        r#type: Type::SCALABLE_TOPIC_UNSUBSCRIBE.into(),
+        scalableTopicUnsubscribe: unsubscribe.into(),
+        ..Default::default()
+    };
+    write(&mut world, conn, &command);
+    let answer = decode_all(&world.output(conn));
+    assert_eq!((types(&answer), answer[0].success.request_id), (vec![Type::SUCCESS], 9));
+}
+
+/// A Checkpoint group never shares a segment, and reads a split's children without waiting for the parent.
+#[test]
+fn a_checkpoint_group_neither_shares_nor_waits_for_parents() {
+    let mut world = World::default();
+    world.create_topic(TOPIC, 1);
+    world.set_buckets(TOPIC, 0, 4);
+    let conn = connected(&mut world);
+    join_group(&mut world, conn, TOPIC, "a", 1, ScalableConsumerType::CHECKPOINT);
+    join_group(&mut world, conn, TOPIC, "b", 2, ScalableConsumerType::CHECKPOINT);
+    assert_eq!((world.assigned(TOPIC, SUB, "a"), world.assigned(TOPIC, SUB, "b")), (vec![(0, false)], vec![]));
+    publish(&mut world, &["a"]);
+    let (low, high) = world.split(TOPIC, 0);
+    let mut segments: Vec<u64> =
+        ["a", "b"].iter().flat_map(|name| world.assigned(TOPIC, SUB, name)).map(|(s, _)| s).collect();
+    segments.sort();
+    assert_eq!(segments, [0, low, high]);
 }
