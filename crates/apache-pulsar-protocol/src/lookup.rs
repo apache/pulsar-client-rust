@@ -129,9 +129,19 @@ impl BrokerAddress {
         Self { logical: host.clone(), physical: host }
     }
 
+    /// Any broker behind the proxy at `proxy`: the proxy picks one.
+    pub fn behind(proxy: HostPort) -> Self {
+        Self { logical: HostPort { host: String::new(), port: 0 }, physical: proxy }
+    }
+
     /// Whether the connection goes through a proxy.
     pub fn through_proxy(&self) -> bool {
         self.logical != self.physical
+    }
+
+    /// What `CommandConnect.proxy_to_broker_url` asks the proxy for: the logical broker, or, empty, any broker.
+    pub fn proxy_target(&self) -> String {
+        if self.logical.host.is_empty() { String::new() } else { self.logical.to_string() }
     }
 }
 

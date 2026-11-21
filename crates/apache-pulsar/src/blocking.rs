@@ -53,6 +53,11 @@ impl PulsarClient {
         crate::QueueConsumerBuilder::new_blocking(self.inner.clone(), schema)
     }
 
+    /// A Stream consumer that reads values with `schema`. See [`crate::StreamConsumerBuilder`].
+    pub fn new_stream_consumer<T: 'static>(&self, schema: Schema<T>) -> crate::StreamConsumerBuilder<T, Blocking> {
+        crate::StreamConsumerBuilder::new_blocking(self.inner.clone(), schema)
+    }
+
     /// A Checkpoint consumer that reads values with `schema`. See [`crate::CheckpointConsumerBuilder`].
     pub fn new_checkpoint_consumer<T: 'static>(
         &self,
@@ -244,6 +249,66 @@ impl<T: 'static> QueueConsumer<T> {
     }
 
     /// See [`crate::QueueConsumer::close`].
+    pub fn close(&self) -> Result<()> {
+        block_on(self.inner.close())
+    }
+}
+
+/// A blocking Stream consumer. `Send + Sync`, and cheap to clone. See [`crate::StreamConsumer`].
+pub struct StreamConsumer<T> {
+    inner: crate::StreamConsumer<T>,
+}
+
+impl<T> Clone for StreamConsumer<T> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
+impl<T> std::fmt::Debug for StreamConsumer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<T: 'static> StreamConsumer<T> {
+    pub(crate) fn new(inner: crate::StreamConsumer<T>) -> Self {
+        Self { inner }
+    }
+
+    pub fn topic(&self) -> &str {
+        self.inner.topic()
+    }
+
+    pub fn subscription(&self) -> &str {
+        self.inner.subscription()
+    }
+
+    pub fn consumer_name(&self) -> &str {
+        self.inner.consumer_name()
+    }
+
+    /// Blocks until the next message.
+    pub fn receive(&self) -> Result<Message<T>> {
+        block_on(self.inner.receive())
+    }
+
+    /// Blocks until the next message, for up to `timeout`.
+    pub fn receive_timeout(&self, timeout: Duration) -> Result<Option<Message<T>>> {
+        block_on(self.inner.receive_timeout(timeout))
+    }
+
+    /// Blocks until there are `max` messages, or `timeout` passes. See [`crate::StreamConsumer::receive_batch`].
+    pub fn receive_batch(&self, max: usize, timeout: Duration) -> Result<Vec<Message<T>>> {
+        block_on(self.inner.receive_batch(max, timeout))
+    }
+
+    /// See [`crate::StreamConsumer::acknowledge_cumulative`].
+    pub fn acknowledge_cumulative(&self, id: &MessageId) -> Result<()> {
+        block_on(self.inner.acknowledge_cumulative(id))
+    }
+
+    /// See [`crate::StreamConsumer::close`].
     pub fn close(&self) -> Result<()> {
         block_on(self.inner.close())
     }

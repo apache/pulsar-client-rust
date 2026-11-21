@@ -18,9 +18,12 @@
 //! Consumers (docs/7-api.md §4) and the messages they receive (§5).
 
 mod checkpoint;
+mod stream;
+mod stream_task;
 mod task;
 
 pub use checkpoint::{CheckpointConsumer, CheckpointConsumerBuilder};
+pub use stream::{StreamConsumer, StreamConsumerBuilder};
 pub(crate) use task::Request;
 
 use std::marker::PhantomData;

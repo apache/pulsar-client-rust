@@ -59,6 +59,20 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("queue_consumers_share_a_subscription", queue_consumers_share_a_subscription),
     ("a_negative_ack_brings_a_message_back", a_negative_ack_brings_a_message_back),
     ("batch_index_acks_settle_whole_batches", batch_index_acks_settle_whole_batches),
+    (
+        "a_stream_consumer_reads_in_order_and_acknowledges_cumulatively",
+        a_stream_consumer_reads_in_order_and_acknowledges_cumulatively,
+    ),
+    (
+        "a_stream_consumer_reads_sealed_backlog_first_in_key_order",
+        a_stream_consumer_reads_sealed_backlog_first_in_key_order,
+    ),
+    ("stream_consumers_share_a_segment_by_bucket", stream_consumers_share_a_segment_by_bucket),
+    ("a_rewound_stream_subscription_takes_the_same_ack_again", a_rewound_stream_subscription_takes_the_same_ack_again),
+    (
+        "a_closed_stream_consumer_hands_its_segments_over_at_once",
+        a_closed_stream_consumer_hands_its_segments_over_at_once,
+    ),
     ("a_checkpoint_consumer_resumes_across_a_split", a_checkpoint_consumer_resumes_across_a_split),
     ("a_latest_checkpoint_consumer_reads_a_later_split", a_latest_checkpoint_consumer_reads_a_later_split),
     ("a_checkpoint_consumer_skips_a_deleted_segment", a_checkpoint_consumer_skips_a_deleted_segment),
@@ -650,6 +664,214 @@ fn batch_index_acks_settle_whole_batches(env: &Env) {
     });
     let backlog = &stats(env, &["topics", "stats", &topic])["subscriptions"][SUB]["msgBacklog"];
     assert_eq!(backlog.as_u64(), Some(0), "{backlog}");
+}
+
+/// A Stream consumer of `topic` on the `workers` subscription, from its start, named `name`. Through the proxy: on this
+/// broker, with an internal and an external listener, the layout names the controller by its internal address,
+/// which the host can't reach, and a client connected on the external listener has no other.
+async fn stream_consumer(client: &local::PulsarClient, topic: &str, name: &str) -> local::StreamConsumer<String> {
+    client
+        .new_stream_consumer(Schema::string())
+        .topic(topic)
+        .subscription_name(SUB)
+        .consumer_name(name)
+        .subscription_initial_position(SubscriptionInitialPosition::Earliest)
+        .acknowledgment_group_time(Duration::ZERO)
+        .subscribe()
+        .await
+        .unwrap()
+}
+
+fn proxy_client(env: &Env) -> ClientBuilder<Local> {
+    token_client(env::PROXY_URL, Some(env.token.clone()))
+}
+
+/// Receives until there are `count`, or none comes for a while, acknowledging each cumulatively.
+async fn stream_all(consumer: &local::StreamConsumer<String>, count: usize) -> Vec<Message<String>> {
+    let mut got = Vec::new();
+    while got.len() < count {
+        let Some(message) = consumer.receive_timeout(Duration::from_secs(30)).await.unwrap() else { break };
+        consumer.acknowledge_cumulative(message.id()).await.unwrap();
+        got.push(message);
+    }
+    got
+}
+
+/// The subscription's backlog over the topic's segments.
+fn stream_backlog(env: &Env, name: &str) -> u64 {
+    let stats = stats(env, &["scalable-topics", "stats", &format!("public/default/{name}")]);
+    stats["subscriptions"][SUB]["msgBacklog"].as_u64().unwrap_or(0)
+}
+
+/// Java's `V5StreamConsumerBasicTest`: a Stream consumer reads a segment in order, and a cumulative ack of the last
+/// message leaves nothing to deliver again. What a Java producer published reads the same.
+fn a_stream_consumer_reads_in_order_and_acknowledges_cumulatively(env: &Env) {
+    let name = unique("stream");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &format!("public/default/{name}")]);
+    env.produce(&topic, &["-m", "java-0", "-m", "java-1", "-vs", "string", "-k", "user-1"]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let consumer = stream_consumer(&client, &topic, "solo").await;
+        assert_eq!((consumer.topic(), consumer.consumer_name()), (topic.as_str(), "solo"));
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut expected = vec!["java-0".to_string(), "java-1".to_string()];
+        for i in 0..50 {
+            let value = format!("m-{i:02}");
+            producer.new_message().key(format!("k{}", i % 7)).value(value.clone()).send().await.unwrap();
+            expected.push(value);
+        }
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            got.push(consumer.receive_timeout(Duration::from_secs(30)).await.unwrap().expect("a message"));
+        }
+        assert_eq!(got.iter().map(|m| m.value().unwrap()).collect::<Vec<_>>(), expected);
+        assert_eq!(got[0].key(), Some("user-1"));
+        consumer.acknowledge_cumulative(got.last().unwrap().id()).await.unwrap();
+        assert!(consumer.receive_timeout(Duration::from_millis(500)).await.unwrap().is_none());
+        consumer.close().await.unwrap();
+        client.close().await.unwrap();
+    });
+    assert_eq!(stream_backlog(env, &name), 0);
+}
+
+/// Java's `V5StreamConsumerDagReplayTest` and `V5StreamConsumerOrderingTest`: a subscription created after two
+/// generations of splits reads the sealed segments first, and each key's messages arrive in the order they were sent.
+fn a_stream_consumer_reads_sealed_backlog_first_in_key_order(env: &Env) {
+    let name = unique("stream-dag");
+    let topic = format!("topic://public/default/{name}");
+    let admin_topic = format!("public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &admin_topic]);
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        for generation in 0..3 {
+            if generation == 1 {
+                env.admin(&["scalable-topics", "split-segment", "-s", "0", &admin_topic]);
+            }
+            if generation == 2 {
+                env.admin(&["scalable-topics", "split-segment", "-s", "1", &admin_topic]);
+            }
+            for i in 0..10 {
+                for k in 0..8 {
+                    let (key, value) = (format!("key-{k}"), format!("key-{k}-gen{generation}-{i}"));
+                    producer.new_message().key(&key).value(value.clone()).send().await.unwrap();
+                    sent.entry(key).or_default().push(value);
+                }
+            }
+        }
+        let consumer = stream_consumer(&client, &topic, "replay").await;
+        let total = sent.values().map(Vec::len).sum();
+        let got = stream_all(&consumer, total).await;
+        let mut received: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for message in &got {
+            received.entry(message.key().unwrap().to_string()).or_default().push(message.value().unwrap());
+        }
+        assert_eq!(received, sent);
+        client.close().await.unwrap();
+    });
+}
+
+/// More consumers than segments: the controller shares the segment by entry bucket. Each key goes to one consumer,
+/// in order, and each acknowledges its own messages.
+fn stream_consumers_share_a_segment_by_bucket(env: &Env) {
+    let name = unique("stream-share");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &format!("public/default/{name}")]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let alice = stream_consumer(&client, &topic, "alice").await;
+        let bob = stream_consumer(&client, &topic, "bob").await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        for i in 0..64 {
+            producer.new_message().key(format!("k{}", i % 16)).value(format!("v-{i:02}")).send().await.unwrap();
+        }
+        let (from_alice, from_bob) = futures_util::join!(stream_all(&alice, 64), stream_all(&bob, 64));
+        assert!(!from_alice.is_empty() && !from_bob.is_empty(), "alice {}, bob {}", from_alice.len(), from_bob.len());
+        assert_eq!(from_alice.len() + from_bob.len(), 64);
+        let keys = |messages: &[Message<String>]| -> BTreeMap<String, Vec<String>> {
+            let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for m in messages {
+                keys.entry(m.key().unwrap().to_string()).or_default().push(m.value().unwrap());
+            }
+            keys
+        };
+        let (keys_alice, keys_bob) = (keys(&from_alice), keys(&from_bob));
+        assert!(keys_alice.keys().all(|key| !keys_bob.contains_key(key)), "a key goes to one consumer");
+        for values in keys_alice.values().chain(keys_bob.values()) {
+            let mut sorted = values.clone();
+            sorted.sort();
+            assert_eq!(values, &sorted, "in order");
+        }
+        client.close().await.unwrap();
+    });
+    assert_eq!(stream_backlog(env, &name), 0);
+}
+
+/// Java's `V5StreamConsumerAckWatermarkTest`: after the subscription is rewound and everything comes again, the
+/// application's ack of a position it acknowledged before goes out again.
+fn a_rewound_stream_subscription_takes_the_same_ack_again(env: &Env) {
+    let name = unique("stream-rewind");
+    let topic = format!("topic://public/default/{name}");
+    let admin_topic = format!("public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &admin_topic]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let consumer = stream_consumer(&client, &topic, "solo").await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        for i in 0..10 {
+            producer.new_message().key("k").value(format!("v-{i}")).send().await.unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 10 {
+            got.push(consumer.receive_timeout(Duration::from_secs(30)).await.unwrap().expect("a message"));
+        }
+        let last = got.last().unwrap().id().clone();
+        consumer.acknowledge_cumulative(&last).await.unwrap();
+        wait_for(|| stream_backlog(env, &name) == 0, "the ack is in").await;
+        env.admin(&["scalable-topics", "seek", "-s", SUB, "-t", "1h", &admin_topic]);
+        wait_for(|| stream_backlog(env, &name) == 10, "the subscription is rewound").await;
+        let mut again = Vec::new();
+        while again.len() < 10 {
+            again.push(consumer.receive_timeout(Duration::from_secs(30)).await.unwrap().expect("a message again"));
+        }
+        consumer.acknowledge_cumulative(&last).await.unwrap();
+        wait_for(|| stream_backlog(env, &name) == 0, "the same ack goes out again").await;
+        client.close().await.unwrap();
+    });
+}
+
+/// A consumer that closes leaves the controller's group at once: the other consumer takes its segment without
+/// waiting for the grace period.
+fn a_closed_stream_consumer_hands_its_segments_over_at_once(env: &Env) {
+    let name = unique("stream-leave");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "2", &format!("public/default/{name}")]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let alice = stream_consumer(&client, &topic, "alice").await;
+        let bob = stream_consumer(&client, &topic, "bob").await;
+        alice.close().await.unwrap();
+        let started = std::time::Instant::now();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        for i in 0..20 {
+            producer.new_message().key(format!("k{i}")).value(format!("v-{i:02}")).send().await.unwrap();
+        }
+        let got = stream_all(&bob, 20).await;
+        assert_eq!(got.len(), 20, "bob reads both segments");
+        assert!(started.elapsed() < Duration::from_secs(30), "well within the 60 s grace period");
+        client.close().await.unwrap();
+    });
+}
+
+/// Polls `condition` for up to 30 seconds.
+async fn wait_for(condition: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        compio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Publishes `count` messages `<prefix>-<i>`, with keys `k0`..`k4` in turn, and records them per key.

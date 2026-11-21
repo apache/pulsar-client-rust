@@ -44,8 +44,8 @@ pub use checkpoint::Checkpoint;
 pub use client::PulsarClient;
 pub use config::{Blocking, ClientBuilder, Local, ThreadSafe};
 pub use consumer::{
-    CheckpointConsumer, CheckpointConsumerBuilder, Message, QueueConsumer, QueueConsumerBuilder,
-    SubscriptionInitialPosition,
+    CheckpointConsumer, CheckpointConsumerBuilder, Message, QueueConsumer, QueueConsumerBuilder, StreamConsumer,
+    StreamConsumerBuilder, SubscriptionInitialPosition,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use message_id::MessageId;
@@ -58,5 +58,7 @@ mod checkpoint_tests;
 mod consumer_tests;
 #[cfg(test)]
 mod producer_tests;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod tests;

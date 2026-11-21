@@ -32,7 +32,7 @@ use futures_util::future::LocalBoxFuture;
 use futures_util::stream::FuturesUnordered;
 
 use crate::config::{ClientBuilder, ClientConfig, ThreadSafe};
-use crate::consumer::{CheckpointConsumerBuilder, QueueConsumerBuilder};
+use crate::consumer::{CheckpointConsumerBuilder, QueueConsumerBuilder, StreamConsumerBuilder};
 use crate::error::{Error, ErrorKind, Result};
 use crate::local;
 use crate::memory::MemoryLimit;
@@ -122,6 +122,12 @@ impl PulsarClient {
     /// [`QueueConsumerBuilder`].
     pub fn new_queue_consumer<T: 'static>(&self, schema: Schema<T>) -> QueueConsumerBuilder<T> {
         QueueConsumerBuilder::new(self.clone(), schema)
+    }
+
+    /// A Stream consumer, on the segments the topic's controller assigns it, that reads values with `schema`. See
+    /// [`StreamConsumerBuilder`].
+    pub fn new_stream_consumer<T: 'static>(&self, schema: Schema<T>) -> StreamConsumerBuilder<T> {
+        StreamConsumerBuilder::new(self.clone(), schema)
     }
 
     /// A Checkpoint consumer, with a reader on every segment of the topic's layout, that reads values with `schema`.

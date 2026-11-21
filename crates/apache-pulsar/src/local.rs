@@ -29,7 +29,7 @@ use std::time::Instant;
 use compio::runtime::JoinHandle;
 
 use apache_pulsar_protocol::backoff::Backoff;
-use apache_pulsar_protocol::lookup::{BrokerAddress, Lookup, LookupStep};
+use apache_pulsar_protocol::lookup::{BrokerAddress, Lookup, LookupStep, ServiceUrl};
 
 use crate::config::{ClientBuilder, Local};
 use crate::conn::ConnHandle;
@@ -49,6 +49,10 @@ pub type MessageBuilder<'a, T> = crate::MessageBuilder<'a, T, Local>;
 pub type QueueConsumer<T> = crate::QueueConsumer<T, Local>;
 /// Builds a Queue consumer on this loop: [`PulsarClient::new_queue_consumer`].
 pub type QueueConsumerBuilder<T> = crate::QueueConsumerBuilder<T, Local>;
+/// A Stream consumer on this loop. See [`crate::StreamConsumer`].
+pub type StreamConsumer<T> = crate::StreamConsumer<T, Local>;
+/// Builds a Stream consumer on this loop: [`PulsarClient::new_stream_consumer`].
+pub type StreamConsumerBuilder<T> = crate::StreamConsumerBuilder<T, Local>;
 /// A Checkpoint consumer on this loop. See [`crate::CheckpointConsumer`].
 pub type CheckpointConsumer<T> = crate::CheckpointConsumer<T, Local>;
 /// Builds a Checkpoint consumer on this loop: [`PulsarClient::new_checkpoint_consumer`].
@@ -106,6 +110,12 @@ impl PulsarClient {
     /// [`QueueConsumerBuilder`](crate::QueueConsumerBuilder).
     pub fn new_queue_consumer<T: 'static>(&self, schema: Schema<T>) -> QueueConsumerBuilder<T> {
         crate::QueueConsumerBuilder::new_local(self.clone(), schema)
+    }
+
+    /// A Stream consumer, on the segments the topic's controller assigns it, that reads values with `schema`, on this
+    /// loop. See [`StreamConsumerBuilder`](crate::StreamConsumerBuilder).
+    pub fn new_stream_consumer<T: 'static>(&self, schema: Schema<T>) -> StreamConsumerBuilder<T> {
+        crate::StreamConsumerBuilder::new_local(self.clone(), schema)
     }
 
     /// A Checkpoint consumer, with a reader on every segment of the topic's layout, that reads values with `schema`,
@@ -201,6 +211,11 @@ impl PulsarClient {
 
     pub(crate) fn operation_timeout(&self) -> std::time::Duration {
         self.inner.pool.config().operation_timeout
+    }
+
+    /// The service URL the client was built with.
+    pub(crate) fn service(&self) -> &ServiceUrl {
+        &self.inner.pool.config().service
     }
 
     /// A ready connection to `address`, from the pool.

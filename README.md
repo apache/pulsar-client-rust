@@ -23,12 +23,14 @@ A Rust client for [Apache Pulsar](https://pulsar.apache.org) scalable topics, bu
 [Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) on the
 [compio](https://github.com/compio-rs/compio) runtime.
 
-**Status:** milestones 3 and 5, ungrouped. Producers publish to scalable topics, keeping per-key order across segment
-splits and merges, and to regular `persistent://` topics through the migration bridge. Queue consumers read every
-segment of a topic, following its splits and merges, and acknowledge each message. Checkpoint consumers read every
-segment, parents before their children, and resume from checkpoints the application keeps, in the Java client's
-bytes. All work in the thread-safe, local and blocking APIs, with token and mTLS authentication, directly or through
-a proxy. The Stream consumer and the grouped Checkpoint consumer come next. The design is in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
+**Status:** milestones 4 and 5, but for the grouped Checkpoint consumer. Producers publish to scalable topics, keeping
+per-key order across segment splits and merges, and to regular `persistent://` topics through the migration bridge.
+Queue consumers read every segment of a topic, following its splits and merges, and acknowledge each message. Stream
+consumers read the segments the topic's controller assigns them, each key in order, share segments by entry bucket
+when they outnumber them, and acknowledge cumulatively. Checkpoint consumers read every segment, parents before their
+children, and resume from checkpoints the application keeps, in the Java client's bytes. All work in the thread-safe,
+local and blocking APIs, with token and mTLS authentication, directly or through a proxy. The grouped Checkpoint
+consumer comes next. The design is in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
 
 ```rust
 let client = PulsarClient::builder().service_url("pulsar://localhost:6650").build().await?;
@@ -49,7 +51,7 @@ client.close().await?;
 
 | Path | What it is |
 |---|---|
-| `crates/apache-pulsar` | The client: producers, Queue and Checkpoint consumers, layout watches, connections, the pool, lookup, authentication, TLS, the memory limit, and the thread-safe, local and blocking APIs. |
+| `crates/apache-pulsar` | The client: producers, Queue, Stream and Checkpoint consumers, layout watches, connections, the pool, lookup, authentication, TLS, the memory limit, and the thread-safe, local and blocking APIs. |
 | `crates/apache-pulsar-protocol` | The sans-IO protocol core: generated protobuf code, framing, the connection, producer and consumer state machines, entry decoding, layouts and routing, message ids. Internal; not a stable API. |
 | `crates/apache-pulsar-testkit` | The simulated broker and cluster, and the deterministic tests of the protocol state machines. Not published. |
 | `checks/` | Milestone 0 checks: compio behavior, and the handshake against a real broker. |
