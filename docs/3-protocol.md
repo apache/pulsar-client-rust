@@ -130,7 +130,7 @@ connection to frame.
 | Codec | Crate | Notes |
 |---|---|---|
 | LZ4 | `lz4_flex` | Pure Rust. |
-| ZLIB | `flate2` with `miniz_oxide` | Pure Rust. Java flushes its stream and never finishes it, so it has no final block or checksum: decode the recorded size and no further, as Java's `Inflater` does. |
+| ZLIB | `flate2` with `miniz_oxide` | Pure Rust. Java flushes its stream and never finishes it, so it has no final block or checksum: decode the recorded size and no further, as Java's `Inflater` does ([spec gap 22](../DESIGN.md#spec-gaps-to-raise-upstream)). |
 | Snappy | `snap` | Pure Rust. |
 | ZSTD | `zstd` | Binds the C `libzstd`. There is no mature pure-Rust encoder; `ruzstd` only decodes well. |
 

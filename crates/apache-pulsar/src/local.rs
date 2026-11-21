@@ -49,6 +49,10 @@ pub type MessageBuilder<'a, T> = crate::MessageBuilder<'a, T, Local>;
 pub type QueueConsumer<T> = crate::QueueConsumer<T, Local>;
 /// Builds a Queue consumer on this loop: [`PulsarClient::new_queue_consumer`].
 pub type QueueConsumerBuilder<T> = crate::QueueConsumerBuilder<T, Local>;
+/// A Checkpoint consumer on this loop. See [`crate::CheckpointConsumer`].
+pub type CheckpointConsumer<T> = crate::CheckpointConsumer<T, Local>;
+/// Builds a Checkpoint consumer on this loop: [`PulsarClient::new_checkpoint_consumer`].
+pub type CheckpointConsumerBuilder<T> = crate::CheckpointConsumerBuilder<T, Local>;
 
 /// Asks a producer's or consumer's task to close.
 type Close = Box<dyn Fn()>;
@@ -102,6 +106,12 @@ impl PulsarClient {
     /// [`QueueConsumerBuilder`](crate::QueueConsumerBuilder).
     pub fn new_queue_consumer<T: 'static>(&self, schema: Schema<T>) -> QueueConsumerBuilder<T> {
         crate::QueueConsumerBuilder::new_local(self.clone(), schema)
+    }
+
+    /// A Checkpoint consumer, with a reader on every segment of the topic's layout, that reads values with `schema`,
+    /// on this loop. See [`CheckpointConsumerBuilder`](crate::CheckpointConsumerBuilder).
+    pub fn new_checkpoint_consumer<T: 'static>(&self, schema: Schema<T>) -> CheckpointConsumerBuilder<T> {
+        crate::CheckpointConsumerBuilder::new_local(self.clone(), schema)
     }
 
     /// Closes the producers and consumers, then every connection. Later operations fail with [`ErrorKind::AlreadyClosed`]. Can

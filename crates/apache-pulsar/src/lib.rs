@@ -17,12 +17,14 @@
 
 //! Apache Pulsar client for scalable topics.
 //!
-//! Status: milestone 3. Producers publish to scalable topics, and to regular topics through the migration bridge,
-//! and Queue consumers read them, in the thread-safe ([`PulsarClient`]), [`local`] and [`blocking`] APIs; the Stream
-//! and Checkpoint consumers come next. See `DESIGN.md` and `PLAN.md` in the repository.
+//! Status: milestones 3 and 5, ungrouped. Producers publish to scalable topics, and to regular topics through the
+//! migration bridge; Queue consumers read them, and Checkpoint consumers read them from a [`Checkpoint`] the
+//! application keeps; in the thread-safe ([`PulsarClient`]), [`local`] and [`blocking`] APIs. The Stream consumer,
+//! and the grouped Checkpoint consumer, come next. See `DESIGN.md` and `PLAN.md` in the repository.
 
 pub mod auth;
 pub mod blocking;
+mod checkpoint;
 mod client;
 mod config;
 mod conn;
@@ -38,14 +40,20 @@ mod schema;
 mod watch;
 
 pub use auth::{Authentication, TlsAuthentication, Token};
+pub use checkpoint::Checkpoint;
 pub use client::PulsarClient;
 pub use config::{Blocking, ClientBuilder, Local, ThreadSafe};
-pub use consumer::{Message, QueueConsumer, QueueConsumerBuilder, SubscriptionInitialPosition};
+pub use consumer::{
+    CheckpointConsumer, CheckpointConsumerBuilder, Message, QueueConsumer, QueueConsumerBuilder,
+    SubscriptionInitialPosition,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use message_id::MessageId;
 pub use producer::{MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder};
 pub use schema::Schema;
 
+#[cfg(test)]
+mod checkpoint_tests;
 #[cfg(test)]
 mod consumer_tests;
 #[cfg(test)]
