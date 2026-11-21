@@ -24,6 +24,7 @@ pub mod assignment;
 pub mod backoff;
 pub mod checkpoint;
 pub mod checkpoint_consumer;
+pub mod compression;
 pub mod connection;
 pub mod consumer;
 pub mod defaults;

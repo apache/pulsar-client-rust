@@ -28,8 +28,8 @@ use apache_pulsar_protocol::producer::{
     Action, Batching, OutgoingMessage, Producer, ProducerOptions, RegisterError, SendError, SendId,
 };
 use apache_pulsar_protocol::proto::{
-    CommandProducerSuccess, CommandSendError, CommandSendReceipt, MessageIdData, ProducerAccessMode, ScalableTopicDAG,
-    SegmentInfoProto, SegmentState, ServerError,
+    CommandProducerSuccess, CommandSendError, CommandSendReceipt, CompressionType, MessageIdData, ProducerAccessMode,
+    ScalableTopicDAG, SegmentInfoProto, SegmentState, ServerError,
 };
 use bytes::Bytes;
 
@@ -60,6 +60,7 @@ fn options(mode: ProducerAccessMode) -> ProducerOptions {
         schema: None,
         operation_timeout: Duration::from_secs(30),
         batching: None,
+        compression: CompressionType::NONE,
     }
 }
 

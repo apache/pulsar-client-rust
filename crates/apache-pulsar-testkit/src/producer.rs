@@ -30,7 +30,7 @@ use apache_pulsar_protocol::producer::{
 };
 use apache_pulsar_protocol::proto::base_command::Type;
 use apache_pulsar_protocol::proto::{
-    BaseCommand, CommandCloseProducer, CommandConnect, CommandScalableTopicLookup, ProducerAccessMode,
+    BaseCommand, CommandCloseProducer, CommandConnect, CommandScalableTopicLookup, CompressionType, ProducerAccessMode,
 };
 use buffa::{EnumValue, Message};
 use bytes::BytesMut;
@@ -66,8 +66,8 @@ pub struct Harness {
     pub registrations: BTreeMap<u64, usize>,
 }
 
-/// Options for a test producer: shared, named `p`, no send timeout, and each message in an entry of its own, so
-/// that a send goes out without the clock moving.
+/// Options for a test producer: shared, named `p`, no send timeout, no compression, and each message in an entry of
+/// its own, so that a send goes out without the clock moving.
 pub fn options() -> ProducerOptions {
     ProducerOptions {
         name: Some("p".into()),
@@ -78,6 +78,7 @@ pub fn options() -> ProducerOptions {
         schema: None,
         operation_timeout: Duration::from_secs(30),
         batching: None,
+        compression: CompressionType::NONE,
     }
 }
 
