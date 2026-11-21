@@ -32,6 +32,7 @@ use std::sync::Arc;
 use buffa::Message;
 use bytes::{Buf, Bytes};
 
+use crate::compression;
 use crate::frame::PayloadSection;
 use crate::message_id::{EntryId, MessageId};
 use crate::proto::command_ack::ValidationError;
@@ -156,7 +157,7 @@ pub fn decode(segment_id: i64, message: &CommandMessage, section: &PayloadSectio
         return Err(DecodeError::Chunked);
     }
     let size = metadata.uncompressed_size.unwrap_or_default() as usize;
-    let payload = decompress(metadata.compression(), section.payload.clone(), size)?;
+    let payload = compression::decompress(metadata.compression(), section.payload.clone(), size)?;
     let id = &message.message_id;
     let message_id = |batch_index, batch_size| {
         let entry = EntryId {
@@ -211,37 +212,4 @@ impl Batch {
         }
         Ok(self.0.split_to(n))
     }
-}
-
-/// The payload as the producer had it, `size` bytes long.
-#[cfg_attr(
-    not(any(feature = "lz4", feature = "zlib", feature = "zstd", feature = "snappy")),
-    allow(unreachable_code, unused_variables)
-)]
-fn decompress(codec: CompressionType, payload: Bytes, size: usize) -> Result<Bytes, DecodeError> {
-    let decompressed: Option<Vec<u8>> = match codec {
-        CompressionType::NONE => return Ok(payload),
-        #[cfg(feature = "lz4")]
-        CompressionType::LZ4 => lz4_flex::block::decompress(&payload, size).ok(),
-        #[cfg(feature = "zlib")]
-        CompressionType::ZLIB => inflate(&payload, size),
-        #[cfg(feature = "zstd")]
-        CompressionType::ZSTD => zstd::bulk::decompress(&payload, size).ok(),
-        #[cfg(feature = "snappy")]
-        CompressionType::SNAPPY => snap::raw::Decoder::new().decompress_vec(&payload).ok(),
-        #[cfg(not(all(feature = "lz4", feature = "zlib", feature = "zstd", feature = "snappy")))]
-        codec => return Err(DecodeError::Codec(codec)),
-    };
-    // Each codec checks its own stream, but not that it holds what the producer recorded.
-    decompressed.filter(|out| out.len() == size).map(Bytes::from).ok_or(DecodeError::Decompression)
-}
-
-/// ZLIB, as Java's `Deflater` writes it: with the zlib header, and flushed but never finished, so without the final
-/// block and checksum. As Java's `Inflater` does, it reads the size recorded and no further.
-#[cfg(feature = "zlib")]
-fn inflate(payload: &[u8], size: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut out = vec![0; size];
-    flate2::read::ZlibDecoder::new(payload).read_exact(&mut out).ok()?;
-    Some(out)
 }

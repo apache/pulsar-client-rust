@@ -149,6 +149,11 @@ Stream members sharing a one-segment topic by bucket each get whole keys, in ord
 Java's `V5EntryBucketDispatchTest` sends one message at a time, so its entries hold one; these pipeline the sends. A
 Java consumer reads Rust's batches, and with deduplication on, a 5.0.1 broker takes the entries of every bucket.
 
+Compression, with Java V5's `CompressionPolicy`: the scenarios of `V5ProducerCompressionTest` (a payload with each
+codec, none, and no policy set) on the simulated cluster (`producer_compression.rs`) and against a 5.0.1 broker, a
+batch compressed whole, and the broker's limit on the compressed entry. A Java consumer reads Rust's batches compressed
+with each codec, the ZLIB ones finished streams.
+
 ## M7: Conformance and a first release
 
 - The rest of the schemas, generic records included (C11, [7](docs/7-api.md) §8).
