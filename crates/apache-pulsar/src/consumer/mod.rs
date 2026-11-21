@@ -34,7 +34,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use apache_pulsar_protocol::consumer::ConsumerOptions;
 use apache_pulsar_protocol::entry::ReceivedMessage;
 use apache_pulsar_protocol::layout::Layout;
-use apache_pulsar_protocol::proto;
 use apache_pulsar_protocol::proto::command_subscribe::InitialPosition;
 use apache_pulsar_protocol::queue_consumer::QueueConsumer as QueueMachine;
 use futures_channel::{mpsc, oneshot};
@@ -191,7 +190,7 @@ impl<T: 'static, Api> QueueConsumerBuilder<T, Api> {
 /// The topic and the segment consumers' options, once checked. Not generic: one copy serves every schema and client.
 fn consumer_options(
     settings: &Settings,
-    schema: Option<&SchemaInfo>,
+    schema: &SchemaInfo,
     operation_timeout: Duration,
 ) -> Result<(String, ConsumerOptions)> {
     let topic = normalize_topic(settings.topic.as_deref())?;
@@ -216,21 +215,11 @@ fn consumer_options(
         priority_level: settings.priority_level,
         subscription_properties: settings.subscription_properties.clone(),
         properties: settings.properties.clone(),
-        schema: proto_schema(schema),
+        schema: schema.to_proto(),
         operation_timeout,
         ..ConsumerOptions::default()
     };
     Ok((topic, options))
-}
-
-/// The schema a consumer declares on subscribing; `None` for raw bytes.
-fn proto_schema(schema: Option<&SchemaInfo>) -> Option<proto::Schema> {
-    schema.map(|info| proto::Schema {
-        name: info.name.clone(),
-        schema_data: info.data.clone(),
-        r#type: info.kind,
-        ..Default::default()
-    })
 }
 
 fn invalid(message: &str) -> Error {

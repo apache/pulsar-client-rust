@@ -23,6 +23,7 @@
 //! the Java client stored is read with the Rust consumer, both Java clients run in the broker container.
 
 mod env;
+mod schemas;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -93,6 +94,7 @@ fn main() {
     let env = (!args.list).then(|| Arc::new(Env::start()));
     let trials = TESTS
         .iter()
+        .chain(schemas::TESTS)
         .map(|&(name, test)| {
             let env = env.clone();
             Trial::test(name, move || {

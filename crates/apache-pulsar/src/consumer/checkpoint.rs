@@ -31,7 +31,7 @@ use futures_util::Stream;
 
 use super::stream::random_name;
 use super::task::Machine;
-use super::{Link, Message, Request, consumer_closed, invalid, proto_schema};
+use super::{Link, Message, Request, consumer_closed, invalid};
 use crate::checkpoint::Checkpoint;
 use crate::client::{LoopSlot, PulsarClient};
 use crate::config::{Blocking, Local, ThreadSafe};
@@ -136,14 +136,14 @@ impl<T: 'static, Api> CheckpointConsumerBuilder<T, Api> {
 /// The topic and the readers' options, once checked. Not generic: one copy serves every schema and client.
 fn reader_options(
     settings: &Settings,
-    schema: Option<&SchemaInfo>,
+    schema: &SchemaInfo,
     operation_timeout: Duration,
 ) -> Result<(String, ConsumerOptions)> {
     let topic = normalize_topic(settings.topic.as_deref())?;
     let options = ConsumerOptions {
         subscription: reader_subscription(),
         consumer_name: settings.consumer_name.clone(),
-        schema: proto_schema(schema),
+        schema: schema.to_proto(),
         operation_timeout,
         ..ConsumerOptions::default()
     };

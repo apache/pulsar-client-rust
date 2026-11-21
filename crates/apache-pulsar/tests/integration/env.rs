@@ -37,10 +37,15 @@ use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
 const IMAGE: (&str, &str) = ("apachepulsar/pulsar", "5.0.1");
-/// A JDK, to compile the Java test tool: the broker image has a Java runtime only.
+/// A JDK, to compile the Java test tools: the broker image has a Java runtime only.
 const JDK_IMAGE: (&str, &str) = ("eclipse-temurin", "21-jdk-alpine");
-/// What the Java test tool compiles against: the broker's V5 API.
+/// What the Java test tools compile against: the broker's V5 API.
 const V5_API_JAR: &str = "/pulsar/lib/org.apache.pulsar-pulsar-client-api-v5-5.0.1.jar";
+/// The Java test tools, by file name.
+const JAVA_TOOLS: [(&str, &[u8]); 2] = [
+    ("CheckpointTool.java", include_bytes!("CheckpointTool.java")),
+    ("SchemaTool.java", include_bytes!("SchemaTool.java")),
+];
 const NETWORK: &str = "apr-it-net";
 const BROKER: &str = "apr-it-broker";
 const PROXY: &str = "apr-it-proxy";
@@ -60,8 +65,8 @@ pub struct Env {
     dir: PathBuf,
     broker: Container<GenericImage>,
     proxy: Container<GenericImage>,
-    /// Set once the Java test tool is in the broker container.
-    java_tool: OnceLock<()>,
+    /// Set once the Java test tools are in the broker container.
+    java_tools: OnceLock<()>,
 }
 
 impl Env {
@@ -109,7 +114,7 @@ impl Env {
         // The web server starts after the binary protocol's listeners.
         let proxy = start(proxy, "Server started at end point");
 
-        Env { token: secrets.token(TOKEN_ROLE), dir, broker, proxy, java_tool: OnceLock::new() }
+        Env { token: secrets.token(TOKEN_ROLE), dir, broker, proxy, java_tools: OnceLock::new() }
     }
 
     pub fn ca(&self) -> PathBuf {
@@ -190,9 +195,8 @@ impl Env {
     /// admin, from `start`: `earliest`, `latest`, or a checkpoint's bytes in hex. Returns the messages as
     /// `(key, value)`, and the consumer's checkpoint after them, in hex.
     pub fn java_checkpoint_read(&self, topic: &str, start: &str, count: usize) -> (Vec<(String, String)>, String) {
-        self.java_tool.get_or_init(|| self.install_java_tool());
         let count = count.to_string();
-        let output = self.exec(&["java", "-cp", "/pulsar/lib/*:/tmp/tool", "CheckpointTool", topic, start, &count]);
+        let output = self.java(&["CheckpointTool", topic, start, &count]);
         let mut messages = Vec::new();
         let mut checkpoint = None;
         for line in output.lines() {
@@ -206,24 +210,46 @@ impl Env {
         (messages, checkpoint.unwrap_or_else(|| panic!("the Java tool printed no checkpoint:\n{output}")))
     }
 
-    /// Compiles `CheckpointTool.java` against the broker's V5 API in a JDK container, and copies the class into the
-    /// broker container.
-    fn install_java_tool(&self) {
+    /// Publishes `values` to `topic` with the Java client's V5 producer, as the admin, with `schema`: the name of the
+    /// V5 factory that makes it, such as `int32`. `SchemaTool.java` lists them.
+    pub fn java_produce(&self, schema: &str, topic: &str, values: &[&str]) {
+        self.java(&[&["SchemaTool", "produce", schema, topic], values].concat());
+    }
+
+    /// Reads `count` messages of `topic` from its start with a Java Queue consumer of `schema`, as [`Env::java_produce`]
+    /// names it, and returns their values as Java prints them.
+    pub fn java_consume(&self, schema: &str, topic: &str, count: usize) -> Vec<String> {
+        let output = self.java(&["SchemaTool", "consume", schema, topic, &count.to_string()]);
+        output.lines().filter_map(|line| line.strip_prefix("value ")).map(str::to_string).collect()
+    }
+
+    /// Runs one of the Java test tools in the broker container, with its arguments, and returns what it printed.
+    fn java(&self, args: &[&str]) -> String {
+        self.java_tools.get_or_init(|| self.install_java_tools());
+        self.exec(&[&["java", "-cp", "/pulsar/lib/*:/tmp/tools.jar"], args].concat())
+    }
+
+    /// Compiles the Java test tools against the broker's V5 API in a JDK container, and copies them into the broker
+    /// container, as `/tmp/tools.jar`.
+    fn install_java_tools(&self) {
         let api = self.broker.copy_file_from(V5_API_JAR, Vec::new()).unwrap();
-        let jdk = GenericImage::new(JDK_IMAGE.0, JDK_IMAGE.1)
-            .with_copy_to("/work/api.jar", api)
-            .with_copy_to("/work/CheckpointTool.java", include_bytes!("CheckpointTool.java").to_vec())
+        let mut jdk = GenericImage::new(JDK_IMAGE.0, JDK_IMAGE.1).with_copy_to("/work/api.jar", api);
+        for (name, source) in JAVA_TOOLS {
+            jdk = jdk.with_copy_to(format!("/work/src/{name}"), source.to_vec());
+        }
+        let jdk = jdk
             .with_cmd(["sleep", "600"])
             .start()
             .unwrap_or_else(|error| panic!("starting {JDK_IMAGE:?} failed: {error}"));
-        let javac = ["javac", "--release", "21", "-cp", "/work/api.jar", "-d", "/work", "/work/CheckpointTool.java"];
-        let mut result = jdk.exec(ExecCommand::new(javac).with_cmd_ready_condition(CmdWaitFor::exit())).unwrap();
+        let build = "javac --release 21 -cp /work/api.jar -d /work/classes /work/src/*.java \
+                     && jar cf /work/tools.jar -C /work/classes .";
+        let mut result =
+            jdk.exec(ExecCommand::new(["sh", "-c", build]).with_cmd_ready_condition(CmdWaitFor::exit())).unwrap();
         let errors = String::from_utf8_lossy(&result.stderr_to_vec().unwrap()).into_owned();
-        assert_eq!(result.exit_code().unwrap(), Some(0), "javac failed:\n{errors}");
-        let class = jdk.copy_file_from("/work/CheckpointTool.class", Vec::new()).unwrap();
-        let class = base64::engine::general_purpose::STANDARD.encode(class);
-        let install = format!("mkdir -p /tmp/tool && echo {class} | base64 -d > /tmp/tool/CheckpointTool.class");
-        self.exec(&["bash", "-c", &install]);
+        assert_eq!(result.exit_code().unwrap(), Some(0), "building the Java tools failed:\n{errors}");
+        let jar = jdk.copy_file_from("/work/tools.jar", Vec::new()).unwrap();
+        let jar = base64::engine::general_purpose::STANDARD.encode(jar);
+        self.exec(&["bash", "-c", &format!("echo {jar} | base64 -d > /tmp/tools.jar")]);
     }
 
     fn exec(&self, command: &[&str]) -> String {
