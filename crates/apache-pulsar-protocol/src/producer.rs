@@ -27,9 +27,11 @@
 //! - **Routing** is the layout's (*client-behavior* §2). A segment's producer is created on the first message
 //!   routed to it, or for every active segment under an exclusive access mode, so that a conflict fails `create`.
 //! - **Each segment has its own producer**, named `<name>-seg-<id>` when the application named the producer, with
-//!   its own sequence ids. A message gets its sequence id when it is first written, and keeps it, and its bytes,
-//!   when it is written again after a reconnect.
-//! - **Every entry is a batch of one message**, stamped with the key's entry-bucket hash (*key-shared* §3).
+//!   its own sequence ids. A message gets its sequence id when it goes into a batch, once the segment's producer is
+//!   registered, and keeps it, and its entry's bytes, when the entry is written again after a reconnect.
+//! - **Every entry is a batch**, stamped with the range of its messages' entry-bucket hashes (*key-shared* §3). A
+//!   segment has one open batch per entry bucket; they close together, on the maximum messages, bytes or delay of
+//!   [`Batching`], as Java's `EntryBucketBatchContainer` does. Without batching, each message is an entry of its own.
 //! - **A segment that is gone** (its topic terminated by a split, a merge or a migration) retires: its messages
 //!   that the broker didn't store are parked, and new messages whose keys it owned are held. Once the layout no
 //!   longer has the segment and none of its messages is in flight, the parked messages are routed again in call
@@ -43,7 +45,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use buffa::Message;
+use buffa::{Message, SizeCache};
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::backoff::{Backoff, Jitter};
@@ -82,6 +84,32 @@ pub struct ProducerOptions {
     pub schema: Option<Schema>,
     /// How long the first registration of a segment's producer may keep failing with errors worth retrying.
     pub operation_timeout: Duration,
+    /// How messages are grouped into entries; `None` puts each message in an entry of its own.
+    pub batching: Option<Batching>,
+}
+
+/// How each segment's producer groups messages into entries (docs/5-segment-engine.md §2), as Java's
+/// `BatchingPolicy` configures it.
+///
+/// A segment has one open batch per entry bucket, and they close together, as in Java's `EntryBucketBatchContainer`:
+/// when the messages in them reach `max_messages` or their payloads `max_bytes`, or `max_delay` after the first went
+/// in. That bounds the wait batching adds to a message, as Java's `BatchingPolicy` documents it; Java's timer counts
+/// from the last batch sent, so a batch can wait a little longer there. Their entries then go out in the order of
+/// their sequence ids, each entry's being its highest message's: the broker drops an entry whose sequence id isn't
+/// above the last one it took from the producer, as a duplicate.
+///
+/// A message that would take the open batches over `max_bytes` closes them first, so a message too large for the
+/// broker goes alone, and fails alone. A message with a delivery time or replication clusters, which are its
+/// entry's, goes in an entry of its own, after the open batches, as Java's does with a delivery time; so does one
+/// whose sequence id is at or below the last one given, which the broker may drop as a duplicate, with its entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Batching {
+    /// The most messages a segment's open batches hold together; 0 for no limit.
+    pub max_messages: usize,
+    /// The most payload bytes they hold together, and at most the broker's largest message, which 0 stands for.
+    pub max_bytes: usize,
+    /// How long the first message in them waits for others.
+    pub max_delay: Duration,
 }
 
 /// A message to publish.
@@ -173,15 +201,86 @@ enum Link {
     Closed,
 }
 
-/// A message on a segment's queue.
+/// A message routed to a segment whose producer isn't registered: it gets its sequence id once it is.
 #[derive(Debug)]
-struct Queued {
+struct Waiting {
     send: SendId,
-    /// Set when the message is first written: its sequence id, metadata and payload, written again unchanged
-    /// after a reconnect.
-    frame: Option<(u64, MessageMetadata, Bytes)>,
+    deadline: Option<Instant>,
+}
+
+/// A message in an open batch.
+#[derive(Debug)]
+struct Batched {
+    send: SendId,
+    sequence: u64,
+    /// Its entry-bucket hash: 0 without a key.
+    hash: u16,
+    deadline: Option<Instant>,
+}
+
+/// A segment's open batches, one per entry bucket, which close together (see [`Batching`]).
+#[derive(Debug, Default)]
+struct Batches {
+    /// Each bucket's messages, in call order.
+    buckets: BTreeMap<usize, Vec<Batched>>,
+    messages: usize,
+    bytes: usize,
+    /// When they close: the maximum delay after their first message.
+    close_at: Option<Instant>,
+}
+
+impl Batching {
+    /// The most payload bytes the open batches hold, on a connection that takes messages up to `max_message_size`:
+    /// no more than that, so that only a message too large on its own, or the metadata of many, can take an entry
+    /// past it.
+    fn byte_limit(&self, max_message_size: usize) -> usize {
+        match self.max_bytes {
+            0 => max_message_size,
+            max => max.min(max_message_size),
+        }
+    }
+}
+
+impl Batches {
+    fn is_empty(&self) -> bool {
+        self.messages == 0
+    }
+
+    /// Whether a message with a payload of `size` bytes can join them. They are never full by count: they close as
+    /// they get there.
+    fn fits(&self, size: usize, batching: &Batching, max_message_size: usize) -> bool {
+        self.bytes + size <= batching.byte_limit(max_message_size)
+    }
+
+    fn full(&self, batching: &Batching, max_message_size: usize) -> bool {
+        let bytes = self.bytes >= batching.byte_limit(max_message_size);
+        bytes || (batching.max_messages > 0 && self.messages >= batching.max_messages)
+    }
+
+    fn add(&mut self, bucket: usize, message: Batched, size: usize) {
+        self.buckets.entry(bucket).or_default().push(message);
+        self.messages += 1;
+        self.bytes += size;
+    }
+
+    fn sends(self) -> impl Iterator<Item = SendId> {
+        self.buckets.into_values().flatten().map(|b| b.send)
+    }
+}
+
+/// An entry: a closed batch, written once the segment's producer is registered, and again, unchanged, after a
+/// reconnect.
+#[derive(Debug)]
+struct Entry {
+    /// Its messages, in batch order.
+    sends: Vec<SendId>,
+    /// Its sequence id: its messages' highest, as Java gives an entry-bucket batch.
+    sequence: u64,
+    metadata: MessageMetadata,
+    payload: Bytes,
     /// Whether it was written on the current registration, so a receipt or an error may come for it.
     sent: bool,
+    /// Its messages' earliest deadline.
     deadline: Option<Instant>,
 }
 
@@ -189,6 +288,8 @@ struct Queued {
 struct Segment {
     topic: String,
     legacy: bool,
+    /// The start hashes of its entry buckets 1..N-1; a batch holds one bucket's messages.
+    bucket_splits: Vec<u16>,
     link: Link,
     /// Registration attempts so far: `CommandProducer.epoch`.
     attempts: u64,
@@ -199,11 +300,16 @@ struct Segment {
     max_message_size: usize,
     next_sequence: u64,
     last_published: i64,
+    /// The highest sequence id given to a message.
+    last_pushed: i64,
     registered_once: bool,
     /// When the first registration stops retrying.
     first_deadline: Instant,
     backoff: Backoff,
-    queue: VecDeque<Queued>,
+    /// Its messages, oldest first: entries, then the open batches, then those waiting for a registration.
+    entries: VecDeque<Entry>,
+    batches: Batches,
+    waiting: VecDeque<Waiting>,
     /// The segment is gone, or the layout dropped it with messages on it: see the module documentation.
     retiring: bool,
     parked: Vec<SendId>,
@@ -261,6 +367,8 @@ pub struct Producer {
     jitter: Jitter,
     /// How many times a send was parked or held, for tests and metrics.
     waited: u64,
+    /// The last send a flush covers: a batch it goes into closes at once, however much later it gets there.
+    flushed: Option<SendId>,
 }
 
 impl Producer {
@@ -282,6 +390,7 @@ impl Producer {
             round_robin: 0,
             jitter: Jitter::new(now.elapsed().as_nanos() as u64),
             waited: 0,
+            flushed: None,
         };
         if producer.exclusive() {
             let active: Vec<u64> = producer.layout.active().map(|s| s.id).collect();
@@ -422,11 +531,13 @@ impl Producer {
         if s.next_sequence == 0 && initial.is_none() {
             let last = success.last_sequence_id.unwrap_or(-1);
             s.last_published = last;
+            s.last_pushed = s.last_pushed.max(last);
             s.next_sequence = (last + 1).max(0) as u64;
         }
+        // The messages that got into a batch got their deadlines then.
         if let Some(timeout) = send_timeout {
-            for queued in &mut s.queue {
-                queued.deadline.get_or_insert(now + timeout);
+            for waiting in &mut s.waiting {
+                waiting.deadline.get_or_insert(now + timeout);
             }
         }
         if self.state == State::Creating {
@@ -436,7 +547,7 @@ impl Producer {
                 self.actions.push_back(Action::Created(Ok(())));
             }
         }
-        self.write(segment);
+        self.write(segment, now);
     }
 
     /// Registering `segment`'s producer failed.
@@ -470,8 +581,7 @@ impl Producer {
         };
         // Refused for good: its messages fail, and a later message tries again.
         s.link = Link::Idle { retry_at: None };
-        let failed: Vec<SendId> = s.queue.drain(..).map(|q| q.send).collect();
-        for send in failed {
+        for send in s.take_all() {
             self.fail(send, error.clone());
         }
         if state == State::Creating {
@@ -491,27 +601,29 @@ impl Producer {
         if !s.is_current(generation) {
             return;
         }
-        let Some(head) = s.queue.front().filter(|q| q.sent) else { return };
-        let head_sequence = head.frame.as_ref().map(|(sequence, ..)| *sequence).unwrap_or_default();
-        if receipt.sequence_id < head_sequence {
-            // For a message that timed out already.
+        let Some(head) = s.entries.front().filter(|e| e.sent) else { return };
+        if receipt.sequence_id < head.sequence {
+            // For an entry that timed out already.
             return;
         }
-        if receipt.sequence_id > head_sequence {
+        if receipt.sequence_id > head.sequence {
             self.actions.push_back(Action::Disconnect { segment, generation });
             return;
         }
-        let head = s.queue.pop_front().unwrap();
+        let head = s.entries.pop_front().unwrap();
         let highest = receipt.highest_sequence_id.map(|h| h as i64).unwrap_or(-1);
         s.last_published = s.last_published.max(receipt.sequence_id as i64).max(highest);
-        let entry = receipt.message_id.as_option().map_or(EntryId::EARLIEST, |id| EntryId {
-            ledger_id: id.ledgerId as i64,
-            entry_id: id.entryId as i64,
-            partition: -1,
-            batch_index: 0,
-            batch_size: 1,
-        });
-        self.finish(head.send, Ok(MessageId::new(segment as i64, entry)));
+        let batch_size = head.sends.len() as i32;
+        for (batch_index, send) in (0..).zip(head.sends) {
+            let entry = receipt.message_id.as_option().map_or(EntryId::EARLIEST, |id| EntryId {
+                ledger_id: id.ledgerId as i64,
+                entry_id: id.entryId as i64,
+                partition: -1,
+                batch_index,
+                batch_size,
+            });
+            self.finish(send, Ok(MessageId::new(segment as i64, entry)));
+        }
         self.after_resolution(segment, now);
     }
 
@@ -521,18 +633,18 @@ impl Producer {
         if !s.is_current(generation) {
             return;
         }
-        let head = s.queue.front().filter(|q| q.sent).map(|q| (q.send, q.frame.as_ref().map(|f| f.0)));
+        let head_sequence = s.entries.front().filter(|e| e.sent).map(|e| e.sequence);
         match error.error {
             ServerError::TopicTerminatedError => {
                 let gone = SendError::Server { error: error.error, message: error.message.clone() };
                 self.segment_gone(segment, gone, now);
             }
             ServerError::NotAllowedError => {
-                if let Some((send, Some(sequence))) = head
-                    && sequence == error.sequence_id
-                {
-                    s.queue.pop_front();
-                    self.fail(send, SendError::Server { error: error.error, message: error.message.clone() });
+                if head_sequence == Some(error.sequence_id) {
+                    let head = s.entries.pop_front().unwrap();
+                    for send in head.sends {
+                        self.fail(send, SendError::Server { error: error.error, message: error.message.clone() });
+                    }
                     self.after_resolution(segment, now);
                 }
             }
@@ -548,8 +660,8 @@ impl Producer {
             Link::Closing { generation: g } if g == generation => self.on_producer_closed(segment, generation, now),
             // A registration in progress fails instead, and a segment the layout dropped is closing.
             Link::Ready { generation: g, .. } if g == generation => {
-                for queued in &mut s.queue {
-                    queued.sent = false;
+                for entry in &mut s.entries {
+                    entry.sent = false;
                 }
                 self.retry_later(segment, now);
             }
@@ -566,8 +678,7 @@ impl Producer {
         s.link = Link::Closed;
         // The broker answers once its pending writes are done: what is left was not stored.
         if matches!(self.state, State::Closing | State::Closed) {
-            let left: Vec<SendId> = s.queue.drain(..).map(|q| q.send).collect();
-            for send in left {
+            for send in s.take_all() {
                 self.fail(send, SendError::AlreadyClosed);
             }
         } else {
@@ -608,17 +719,19 @@ impl Producer {
             s.retirement_check = None;
             let failed: Vec<SendId> = match s.link {
                 Link::Ready { generation, .. } => {
-                    // Everything it has is written, and waits for its receipt or the close's answer.
-                    debug_assert!(s.queue.iter().all(|q| q.sent), "a ready segment writes what it queues");
+                    // Its entries are written, and wait for their receipts or the close's answer. What its open
+                    // batches hold was never written.
+                    debug_assert!(s.entries.iter().all(|e| e.sent), "a ready segment writes its entries");
+                    debug_assert!(s.waiting.is_empty(), "a ready segment batches what it gets");
                     s.link = Link::Closing { generation };
                     self.actions.push_back(Action::CloseProducer { segment: id, generation });
-                    Vec::new()
+                    std::mem::take(&mut s.batches).sends().collect()
                 }
                 // A registration still running is closed when it completes (`on_registered`).
-                Link::Connecting { .. } | Link::Closing { .. } => s.queue.drain(..).map(|q| q.send).collect(),
+                Link::Connecting { .. } | Link::Closing { .. } => s.take_all(),
                 Link::Idle { .. } | Link::Gone | Link::Closed => {
                     s.link = Link::Closed;
-                    s.queue.drain(..).map(|q| q.send).collect()
+                    s.take_all()
                 }
             };
             for send in failed {
@@ -638,15 +751,18 @@ impl Producer {
                     Link::Idle { retry_at } => retry_at,
                     _ => None,
                 };
-                let deadline = s.queue.front().and_then(|q| q.deadline);
-                [retry, deadline, s.retirement_check.map(|(_, at)| at)]
+                // Deadlines grow in a segment's order: the oldest of the entries, and of the waiting messages, is
+                // first. The open batches close before their messages' deadlines, unless the delay is the longer.
+                let entry = s.entries.front().and_then(|e| e.deadline);
+                let waiting = s.waiting.front().and_then(|w| w.deadline);
+                [retry, entry, waiting, s.batches.close_at, s.retirement_check.map(|(_, at)| at)]
             })
             .flatten()
             .min()
     }
 
-    /// Lets time pass: reconnects segments whose backoff is over, fails messages past their send timeout, and runs
-    /// the retirement checks.
+    /// Lets time pass: reconnects segments whose backoff is over, closes open batches whose delay is over, fails
+    /// messages past their send timeout, and runs the retirement checks.
     pub fn handle_timeout(&mut self, now: Instant) {
         let exclusive = self.exclusive();
         let ids: Vec<u64> = self.segments.keys().copied().collect();
@@ -655,21 +771,29 @@ impl Producer {
             if let Link::Idle { retry_at: Some(at) } = s.link
                 && at <= now
             {
-                if s.queue.is_empty() && !exclusive {
+                if s.is_empty() && !exclusive {
                     // Nothing to send: connect again when something is.
                     s.link = Link::Idle { retry_at: None };
                 } else {
                     self.connect(id, now);
                 }
             }
+            if self.segments[&id].batches.close_at.is_some_and(|at| at <= now) {
+                self.close_batches(id);
+            }
+            // An entry fails whole: its messages are stored together or not at all.
             let s = self.segments.get_mut(&id).unwrap();
             let mut expired = Vec::new();
-            while s.queue.front().is_some_and(|q| q.deadline.is_some_and(|d| d <= now)) {
-                expired.push(s.queue.pop_front().unwrap().send);
+            while s.entries.front().is_some_and(|e| e.deadline.is_some_and(|d| d <= now)) {
+                expired.extend(s.entries.pop_front().unwrap().sends);
+            }
+            while s.waiting.front().is_some_and(|w| w.deadline.is_some_and(|d| d <= now)) {
+                expired.push(s.waiting.pop_front().unwrap().send);
             }
             for send in expired {
                 self.fail(send, SendError::Timeout);
             }
+            self.write_entries(id);
             if self.segments[&id].retirement_check.is_some_and(|(_, at)| at <= now) {
                 self.check_retirement(id, now);
             }
@@ -723,9 +847,9 @@ impl Producer {
             return;
         }
         let deadline = send_timeout.filter(|_| s.registered_once).map(|timeout| now + timeout);
-        s.queue.push_back(Queued { send: id, frame: None, sent: false, deadline });
+        s.waiting.push_back(Waiting { send: id, deadline });
         self.sends.get_mut(&id).unwrap().place = Place::Queued(segment);
-        self.write(segment);
+        self.write(segment, now);
     }
 
     /// The producer of a segment of the current layout, created and connecting if new.
@@ -744,6 +868,7 @@ impl Producer {
         let segment = Segment {
             topic: info.topic.clone(),
             legacy: info.is_legacy(),
+            bucket_splits: info.bucket_splits.clone(),
             link: Link::Idle { retry_at: None },
             attempts: 0,
             topic_epoch: None,
@@ -752,10 +877,13 @@ impl Producer {
             max_message_size: usize::MAX,
             next_sequence: initial_next,
             last_published: initial_last,
+            last_pushed: initial_last,
             registered_once: false,
             first_deadline: now + self.options.operation_timeout,
             backoff: Backoff::new(RECONNECT_BACKOFF.0, RECONNECT_BACKOFF.1),
-            queue: VecDeque::new(),
+            entries: VecDeque::new(),
+            batches: Batches::default(),
+            waiting: VecDeque::new(),
             retiring: false,
             parked: Vec::new(),
             retirement_check: None,
@@ -781,55 +909,119 @@ impl Producer {
         s.link = Link::Idle { retry_at: Some(now + delay) };
     }
 
-    /// Writes the segment's messages that aren't on its current registration yet, in order.
-    fn write(&mut self, id: u64) {
-        let Some(s) = self.segments.get_mut(&id) else { return };
-        let Link::Ready { producer_id, .. } = s.link else { return };
-        let mut too_large = Vec::new();
-        for queued in s.queue.iter_mut().filter(|q| !q.sent) {
-            if queued.frame.is_none() {
-                let pending = &self.sends[&queued.send];
-                let sequence = match pending.message.sequence_id {
-                    Some(sequence) => sequence,
-                    None => {
-                        let sequence = s.next_sequence;
-                        s.next_sequence += 1;
-                        sequence
-                    }
-                };
-                let name = s.name.clone().unwrap_or_default();
-                let (metadata, payload) = encode_message(
-                    &name,
-                    sequence,
-                    pending.publish_time,
-                    &pending.message,
-                    s.schema_version.as_deref(),
-                );
-                let size = payload.len() + metadata.encoded_len() as usize;
-                if size > s.max_message_size {
-                    too_large.push((queued.send, size));
-                    continue;
-                }
-                queued.frame = Some((sequence, metadata, payload));
+    /// Once the segment's producer is registered: puts the messages waiting for it into batches, and writes the
+    /// entries not written on the registration yet.
+    fn write(&mut self, id: u64, now: Instant) {
+        let s = &self.segments[&id];
+        if !matches!(s.link, Link::Ready { .. }) {
+            return;
+        }
+        // Messages a flush covers close their batches, once all of them joined.
+        let flushed = s.waiting.front().is_some_and(|w| self.flushed.is_some_and(|last| w.send <= last));
+        while let Some(waiting) = self.segments.get_mut(&id).unwrap().waiting.pop_front() {
+            self.batch(id, waiting, now);
+        }
+        if flushed {
+            self.close_batches(id);
+        }
+        self.write_entries(id);
+    }
+
+    /// Gives a message its sequence id and puts it in its bucket's batch. The open batches close before it when it
+    /// can't join them, and after it when they are full or it goes alone (see [`Batching`]).
+    fn batch(&mut self, id: u64, waiting: Waiting, now: Instant) {
+        let message = &self.sends[&waiting.send].message;
+        let s = self.segments.get_mut(&id).unwrap();
+        let sequence = match message.sequence_id {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = s.next_sequence;
+                s.next_sequence += 1;
+                sequence
             }
-            let (sequence, metadata, payload) = queued.frame.clone().unwrap();
+        };
+        let duplicate = sequence as i64 <= s.last_pushed;
+        s.last_pushed = s.last_pushed.max(sequence as i64);
+        let alone = duplicate || message.deliver_at.is_some() || message.replicate_to.is_some();
+        let batching = self.options.batching.filter(|_| !alone);
+        let hash = message.key.as_ref().map_or(0, |key| KeyHash::of(key.as_bytes()).bucket_hash());
+        let bucket = s.bucket_splits.iter().take_while(|&&split| split <= hash).count();
+        let size = message.payload.len();
+        if !batching.is_some_and(|b| s.batches.fits(size, &b, s.max_message_size)) {
+            self.close_batches(id);
+        }
+        let s = self.segments.get_mut(&id).unwrap();
+        let batched = Batched { send: waiting.send, sequence, hash, deadline: waiting.deadline };
+        s.batches.add(bucket, batched, size);
+        match batching.filter(|b| !s.batches.full(b, s.max_message_size)) {
+            Some(b) => {
+                s.batches.close_at.get_or_insert(now + b.max_delay);
+            }
+            None => self.close_batches(id),
+        }
+    }
+
+    /// Closes the segment's open batches, each into an entry. The entries go in the order of their sequence ids:
+    /// the broker takes a producer's entries only in increasing sequence order.
+    fn close_batches(&mut self, id: u64) {
+        let s = self.segments.get_mut(&id).unwrap();
+        let mut batches: Vec<Vec<Batched>> = std::mem::take(&mut s.batches).buckets.into_values().collect();
+        batches.sort_by_key(|batch| batch.iter().map(|b| b.sequence).max());
+        for batch in batches {
+            self.close_entry(id, batch);
+        }
+    }
+
+    /// Encodes a closed batch as an entry, at the end of the segment's queue, or fails its messages if the broker
+    /// can't take it.
+    fn close_entry(&mut self, id: u64, batch: Vec<Batched>) {
+        let s = self.segments.get_mut(&id).unwrap();
+        let messages: Vec<(&Batched, &Pending)> = batch.iter().map(|b| (b, &self.sends[&b.send])).collect();
+        let name = s.name.as_deref().unwrap_or_default();
+        let (metadata, payload) = encode_entry(name, s.schema_version.as_deref(), &messages);
+        let size = payload.len() + metadata.encoded_len() as usize;
+        if size > s.max_message_size {
+            let limit = s.max_message_size;
+            for b in batch {
+                self.fail(b.send, SendError::TooLarge { size, limit });
+            }
+            return;
+        }
+        let deadline = batch.iter().filter_map(|b| b.deadline).min();
+        let sends = batch.into_iter().map(|b| b.send).collect();
+        let entry = Entry { sends, sequence: metadata.sequence_id, metadata, payload, sent: false, deadline };
+        s.entries.push_back(entry);
+    }
+
+    /// Writes, in order, the entries not written on the segment's current registration: the last ones in its queue.
+    fn write_entries(&mut self, id: u64) {
+        let s = self.segments.get_mut(&id).unwrap();
+        let Link::Ready { producer_id, .. } = s.link else { return };
+        let written = s.entries.len() - s.entries.iter().rev().take_while(|e| !e.sent).count();
+        for entry in s.entries.range_mut(written..) {
+            let messages = entry.sends.len() as i32;
             let send = CommandSend {
                 producer_id,
-                sequence_id: sequence,
-                highest_sequence_id: Some(sequence),
+                sequence_id: entry.sequence,
+                highest_sequence_id: Some(entry.sequence),
+                num_messages: (messages > 1).then_some(messages),
                 ..Default::default()
             };
             let command = BaseCommand { r#type: Type::SEND.into(), send: send.into(), ..Default::default() };
-            let (command, metadata) = (Box::new(command), Box::new(metadata));
-            self.actions.push_back(Action::Send { segment: id, command, metadata, payload });
-            queued.sent = true;
+            let (command, metadata) = (Box::new(command), Box::new(entry.metadata.clone()));
+            self.actions.push_back(Action::Send { segment: id, command, metadata, payload: entry.payload.clone() });
+            entry.sent = true;
         }
-        if !too_large.is_empty() {
-            let limit = s.max_message_size;
-            s.queue.retain(|q| !too_large.iter().any(|(send, _)| *send == q.send));
-            for (send, size) in too_large {
-                self.fail(send, SendError::TooLarge { size, limit });
-            }
+    }
+
+    /// Lets no message sent so far wait out the batching delay: the open batches close and are written, and the
+    /// messages not in a batch yet, waiting for a registration or a layout, close theirs once they are in them.
+    pub fn flush(&mut self) {
+        self.flushed = self.next_send.checked_sub(1);
+        let ids: Vec<u64> = self.segments.keys().copied().collect();
+        for id in ids {
+            self.close_batches(id);
+            self.write_entries(id);
         }
     }
 
@@ -839,8 +1031,7 @@ impl Producer {
     fn segment_gone(&mut self, id: u64, error: SendError, now: Instant) {
         let s = self.segments.get_mut(&id).unwrap();
         s.link = Link::Gone;
-        let queued: Vec<SendId> = s.queue.drain(..).map(|q| q.send).collect();
-        for send in queued {
+        for send in s.take_all() {
             self.park(send, id, error.clone());
         }
         self.start_retiring(id, now);
@@ -852,7 +1043,7 @@ impl Producer {
     fn drop_segment(&mut self, id: u64, old: &Rc<Layout>, now: Instant) {
         let s = self.segments.get_mut(&id).unwrap();
         s.dropped = true;
-        let idle = s.queue.is_empty() && s.parked.is_empty() && !s.retiring;
+        let idle = s.is_empty() && s.parked.is_empty() && !s.retiring;
         if !s.retiring && !idle {
             s.retiring = true;
             self.hold_scopes.push((id, old.clone()));
@@ -863,8 +1054,12 @@ impl Producer {
         match s.link {
             Link::Ready { generation, .. } => {
                 s.link = Link::Closing { generation };
-                // Everything it has is written: what the broker didn't store comes back with the close's answer.
+                // Its entries are written: what the broker didn't store comes back with the close's answer.
                 self.actions.push_back(Action::CloseProducer { segment: id, generation });
+                let error = gone_error(id);
+                for send in std::mem::take(&mut s.batches).sends().collect::<Vec<_>>() {
+                    self.park(send, id, error.clone());
+                }
             }
             Link::Connecting { .. } => self.retire_queue(id, now),
             Link::Idle { .. } => {
@@ -878,8 +1073,7 @@ impl Producer {
 
     /// Parks every message left on a retiring segment.
     fn retire_queue(&mut self, id: u64, _now: Instant) {
-        let s = self.segments.get_mut(&id).unwrap();
-        let left: Vec<SendId> = s.queue.drain(..).map(|q| q.send).collect();
+        let left = self.segments.get_mut(&id).unwrap().take_all();
         let error = gone_error(id);
         for send in left {
             self.park(send, id, error.clone());
@@ -920,7 +1114,7 @@ impl Producer {
         let Some((check, _)) = s.retirement_check else { return };
         debug_assert!(s.retiring, "a retirement check for a segment not retiring");
         // A gone segment queues nothing: its messages are parked.
-        debug_assert!(s.queue.is_empty(), "a gone segment with queued messages");
+        debug_assert!(s.is_empty(), "a gone segment with queued messages");
         if check < MAX_SEND_ATTEMPTS {
             s.retirement_check = Some((check + 1, now + retirement_delay(check + 1)));
             return;
@@ -946,7 +1140,7 @@ impl Producer {
     fn forget_if_done(&mut self, id: u64) {
         let Some(s) = self.segments.get(&id) else { return };
         let done = s.dropped
-            && s.queue.is_empty()
+            && s.is_empty()
             && s.parked.is_empty()
             && matches!(s.link, Link::Closed | Link::Gone | Link::Idle { .. });
         if done && !s.retiring {
@@ -978,7 +1172,7 @@ impl Producer {
                 if !s.retiring {
                     continue;
                 }
-                let in_flight = !s.queue.is_empty();
+                let in_flight = !s.is_empty();
                 if !in_flight && !active {
                     batch.append(&mut s.parked);
                     s.retiring = false;
@@ -1049,6 +1243,21 @@ impl Segment {
     fn is_current(&self, generation: u64) -> bool {
         matches!(self.link, Link::Ready { generation: g, .. } | Link::Closing { generation: g } if g == generation)
     }
+
+    /// Whether it holds no message: none in an entry, an open batch, or waiting for a registration.
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.batches.is_empty() && self.waiting.is_empty()
+    }
+
+    /// Takes every message it holds, in call order.
+    fn take_all(&mut self) -> Vec<SendId> {
+        let mut sends: Vec<SendId> = self.entries.drain(..).flat_map(|e| e.sends).collect();
+        sends.extend(std::mem::take(&mut self.batches).sends());
+        sends.extend(self.waiting.drain(..).map(|w| w.send));
+        // A segment's entries go out in sequence order, which isn't call order across buckets.
+        sends.sort_unstable();
+        sends
+    }
 }
 
 /// Whether a broker's refusal to register a producer or consumer is worth retrying.
@@ -1076,44 +1285,50 @@ fn key_value(key: &str, value: &str) -> KeyValue {
     KeyValue { key: key.to_string(), value: value.to_string(), ..Default::default() }
 }
 
-/// Encodes one message as a batch of one (docs/5-segment-engine.md §2): the entry's metadata, stamped with the
-/// key's entry-bucket hash (0 without a key), and the batch payload with the message's own metadata.
-pub fn encode_message(
+/// Encodes a batch as one entry (docs/5-segment-engine.md §2): the entry's metadata, which takes its first message's
+/// key, publish time, delivery time and replication clusters, as Java's batch container does, with the entry's
+/// sequence id, its messages' highest, and a stamp of the range of their entry-bucket hashes; and the batch payload,
+/// each message with its own metadata.
+fn encode_entry(
     producer_name: &str,
-    sequence_id: u64,
-    publish_time: u64,
-    message: &OutgoingMessage,
     schema_version: Option<&[u8]>,
+    batch: &[(&Batched, &Pending)],
 ) -> (MessageMetadata, Bytes) {
-    let bucket = message.key.as_ref().map_or(0, |key| u32::from(KeyHash::of(key.as_bytes()).bucket_hash()));
+    let first = &batch[0].1;
+    let sequence = batch.iter().map(|(b, _)| b.sequence).max().unwrap_or_default();
+    let (min, max) = batch.iter().fold((u16::MAX, 0), |(min, max), (b, _)| (min.min(b.hash), max.max(b.hash)));
     let metadata = MessageMetadata {
         producer_name: producer_name.to_string(),
-        sequence_id,
-        publish_time,
-        partition_key: message.key.clone(),
-        partition_key_b64_encoded: message.key.as_ref().map(|_| false),
-        replicate_to: message.replicate_to.clone().unwrap_or_default(),
-        num_messages_in_batch: Some(1),
+        sequence_id: sequence,
+        publish_time: first.publish_time,
+        partition_key: first.message.key.clone(),
+        partition_key_b64_encoded: first.message.key.as_ref().map(|_| false),
+        replicate_to: first.message.replicate_to.clone().unwrap_or_default(),
+        num_messages_in_batch: Some(batch.len() as i32),
         schema_version: schema_version.map(<[u8]>::to_vec),
-        deliver_at_time: message.deliver_at,
-        highest_sequence_id: Some(sequence_id),
-        entry_hash_min: Some(bucket),
-        entry_hash_max: Some(bucket),
+        deliver_at_time: first.message.deliver_at,
+        highest_sequence_id: Some(sequence),
+        entry_hash_min: Some(u32::from(min)),
+        entry_hash_max: Some(u32::from(max)),
         ..Default::default()
     };
-    let single = SingleMessageMetadata {
-        properties: message.properties.iter().map(|(k, v)| key_value(k, v)).collect(),
-        partition_key: message.key.clone(),
-        partition_key_b64_encoded: message.key.as_ref().map(|_| false),
-        payload_size: message.payload.len() as i32,
-        event_time: message.event_time,
-        sequence_id: Some(sequence_id),
-        ..Default::default()
-    };
-    let single_size = single.encoded_len() as usize;
-    let mut payload = BytesMut::with_capacity(4 + single_size + message.payload.len());
-    payload.put_u32(single_size as u32);
-    payload.put_slice(&single.encode_to_vec());
-    payload.put_slice(&message.payload);
+    let size = batch.iter().map(|(_, p)| 16 + p.message.payload.len()).sum();
+    let mut payload = BytesMut::with_capacity(size);
+    for (batched, pending) in batch {
+        let message = &pending.message;
+        let single = SingleMessageMetadata {
+            properties: message.properties.iter().map(|(k, v)| key_value(k, v)).collect(),
+            partition_key: message.key.clone(),
+            partition_key_b64_encoded: message.key.as_ref().map(|_| false),
+            payload_size: message.payload.len() as i32,
+            event_time: message.event_time,
+            sequence_id: Some(batched.sequence),
+            ..Default::default()
+        };
+        let mut cache = SizeCache::new();
+        payload.put_u32(single.compute_size(&mut cache));
+        single.write_to(&mut cache, &mut payload);
+        payload.put_slice(&message.payload);
+    }
     (metadata, payload.freeze())
 }

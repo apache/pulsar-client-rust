@@ -93,7 +93,7 @@ deterministically on the simulated broker and with a split during traffic on a r
 ### 3.4 Flush and close
 
 *Flush* waits for every message sent before the call, on every segment, and fails if one of them failed, as
-Java's does. On a closed producer it fails with `AlreadyClosed` (*client-api* §2), where Java's succeeds
+Java's does. Their batches go out at once, without waiting out the batching delay ([5](5-segment-engine.md) §2). On a closed producer it fails with `AlreadyClosed` (*client-api* §2), where Java's succeeds
 ([J2](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). *Close* fails the sends still waiting
 (parked, held, or not written yet) with `AlreadyClosed`, closes every per-segment producer, which waits for what
 the brokers already have, releases its layout watch, and can be called again safely (*client-api* §3.3). It

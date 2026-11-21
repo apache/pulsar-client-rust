@@ -66,7 +66,8 @@ pub struct Harness {
     pub registrations: BTreeMap<u64, usize>,
 }
 
-/// Options for a test producer: shared, named `p`, no send timeout.
+/// Options for a test producer: shared, named `p`, no send timeout, and each message in an entry of its own, so
+/// that a send goes out without the clock moving.
 pub fn options() -> ProducerOptions {
     ProducerOptions {
         name: Some("p".into()),
@@ -76,6 +77,7 @@ pub fn options() -> ProducerOptions {
         properties: Vec::new(),
         schema: None,
         operation_timeout: Duration::from_secs(30),
+        batching: None,
     }
 }
 
@@ -115,9 +117,19 @@ impl Harness {
             payload: bytes::Bytes::copy_from_slice(value.as_bytes()),
             ..Default::default()
         };
+        self.send_message(message)
+    }
+
+    pub fn send_message(&mut self, message: OutgoingMessage) -> SendId {
         let id = self.producer.send(message, PUBLISH_TIME, self.clock.now()).expect("the producer refused a send");
         self.pump();
         id
+    }
+
+    /// Sends the open batches at once.
+    pub fn flush(&mut self) {
+        self.producer.flush();
+        self.pump();
     }
 
     /// Moves the clock, lets the producer act on it, and pumps.

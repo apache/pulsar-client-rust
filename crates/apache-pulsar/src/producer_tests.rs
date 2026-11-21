@@ -44,7 +44,7 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{FuturesOrdered, StreamExt};
 
 use crate::error::ErrorKind;
-use crate::{ProducerAccessMode, PulsarClient, Schema, local};
+use crate::{BatchingPolicy, ProducerAccessMode, PulsarClient, Schema, local};
 
 pub(crate) const TOPIC: &str = "topic://acme/orders/events";
 
@@ -183,10 +183,17 @@ pub(crate) async fn local_client(server: &WorldServer) -> local::PulsarClient {
 /// The values stored per key, as a reader draining parents first would see them.
 fn stored_by_key(server: &WorldServer) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for stored in server.world.borrow().stored(TOPIC) {
-        out.entry(stored.key.unwrap_or_default()).or_default().push(String::from_utf8(stored.value.to_vec()).unwrap());
+    for message in server.world.borrow().messages(TOPIC) {
+        out.entry(message.key.unwrap_or_default())
+            .or_default()
+            .push(String::from_utf8(message.payload.to_vec()).unwrap());
     }
     out
+}
+
+/// The values stored, in the order a reader draining parents first would see them.
+fn stored_values(server: &WorldServer) -> Vec<String> {
+    server.world.borrow().messages(TOPIC).iter().map(|m| String::from_utf8(m.payload.to_vec()).unwrap()).collect()
 }
 
 #[test]
@@ -204,7 +211,7 @@ fn local_producer_sends_flushes_and_closes() {
         assert_ne!(keyed, keyless);
         assert_eq!(MessageIdSegment::of(&keyed), MessageIdSegment::of(&keyed));
         producer.flush().await.unwrap();
-        assert_eq!(server.world.borrow().stored(TOPIC).len(), 2);
+        assert_eq!(server.world.borrow().messages(TOPIC).len(), 2);
         // Segment producers are named after the producer.
         let names: Vec<String> = server
             .world
@@ -273,8 +280,8 @@ fn keys_keep_their_order_across_a_split_during_traffic() {
             result.unwrap();
         }
         assert_eq!(stored_by_key(&server), expected);
-        let segments: std::collections::BTreeSet<u64> =
-            server.world.borrow().stored(TOPIC).iter().map(|s| s.segment).collect();
+        let segments: std::collections::BTreeSet<i64> =
+            server.world.borrow().messages(TOPIC).iter().map(|m| m.id.segment_id).collect();
         assert!(segments.len() > 1, "the split was not reached: {segments:?}");
         producer.close().await.unwrap();
         client.close().await.unwrap();
@@ -446,9 +453,7 @@ fn a_lost_connection_writes_unacknowledged_messages_again() {
         while let Some(result) = pending.next().await {
             result.unwrap();
         }
-        let values: Vec<String> =
-            server.world.borrow().stored(TOPIC).iter().map(|s| String::from_utf8(s.value.to_vec()).unwrap()).collect();
-        assert_eq!(values, ["before", "m0", "m1", "m2"]);
+        assert_eq!(stored_values(&server), ["before", "m0", "m1", "m2"]);
         client.close().await.unwrap();
     });
 }
@@ -547,10 +552,20 @@ fn the_blocking_api_sends_from_a_plain_thread() {
     });
     let worker = std::thread::spawn(move || {
         let client = crate::blocking::PulsarClient::builder().service_url(url).build().unwrap();
-        let producer = client.new_producer(Schema::string()).topic(TOPIC).producer_name("sync").create().unwrap();
+        // A blocking send sends its batch at once, as Java's does: it never waits out this delay.
+        let policy = BatchingPolicy { max_publish_delay: Duration::from_secs(60), ..Default::default() };
+        let started = std::time::Instant::now();
+        let producer = client
+            .new_producer(Schema::string())
+            .topic(TOPIC)
+            .producer_name("sync")
+            .batching_policy(policy)
+            .create()
+            .unwrap();
         let first = producer.new_message().key("k").value("one".to_string()).send().unwrap();
         let second = producer.send("two".to_string()).unwrap();
         assert!(first < second, "one segment: ids in publish order");
+        assert!(started.elapsed() < Duration::from_secs(30), "a blocking send waited for the batching delay");
         producer.flush().unwrap();
         producer.close().unwrap();
         client.close().unwrap();
@@ -561,10 +576,59 @@ fn the_blocking_api_sends_from_a_plain_thread() {
         }
     });
     worker.join().unwrap();
-    let values: Vec<String> = rt.block_on(async {
-        server.world.borrow().stored(TOPIC).iter().map(|s| String::from_utf8(s.value.to_vec()).unwrap()).collect()
-    });
+    let values: Vec<String> = rt.block_on(async { stored_values(&server) });
     assert_eq!(values, ["one", "two"]);
+}
+
+/// Pipelined sends share entries, as batching is on by default; without it, each message is an entry of its own.
+#[test]
+fn pipelined_sends_share_entries_unless_batching_is_off() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        let send = |i: usize| producer.new_message().key("k").value(format!("{i:03}")).send();
+        let ids: Vec<_> = futures_util::future::join_all((0..100).map(send)).await;
+        let ids: Vec<_> = ids.into_iter().map(Result::unwrap).collect();
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "ids in send order");
+        let entries = server.world.borrow().stored(TOPIC).len();
+        assert!(entries < 100, "{entries} entries for 100 messages");
+        let expected: Vec<String> = (0..100).map(|i| format!("{i:03}")).collect();
+        assert_eq!(stored_values(&server), expected);
+
+        let unbatched = client
+            .new_producer(Schema::string())
+            .topic(TOPIC)
+            .batching_policy(BatchingPolicy::disabled())
+            .create()
+            .await
+            .unwrap();
+        let results = futures_util::future::join_all((0..10).map(|i| unbatched.send(format!("u{i}")))).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(server.world.borrow().stored(TOPIC).len(), entries + 10);
+        client.close().await.unwrap();
+    });
+}
+
+/// A flush sends the open batches at once, without waiting out the batching delay.
+#[test]
+fn a_flush_sends_the_open_batches() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let policy = BatchingPolicy { max_publish_delay: Duration::from_secs(60), ..Default::default() };
+        let producer =
+            client.new_producer(Schema::string()).topic(TOPIC).batching_policy(policy).create().await.unwrap();
+        let mut sends: FuturesOrdered<_> = (0..3).map(|i| producer.send(format!("m{i}"))).collect();
+        assert!(sends.next().now_or_never().is_none(), "the batch waits for the delay");
+        let flushed = compio::time::timeout(Duration::from_secs(10), producer.flush()).await;
+        flushed.expect("the flush waited for the delay").unwrap();
+        while let Some(result) = sends.next().await {
+            result.unwrap();
+        }
+        assert_eq!(server.world.borrow().stored(TOPIC).len(), 1);
+        client.close().await.unwrap();
+    });
 }
 
 /// A local client with a short operation timeout, for tests that wait past it.
@@ -648,7 +712,7 @@ fn close_completes_the_sends_the_broker_has() {
         }
         assert!(pending.next().now_or_never().is_none(), "the receipts are held");
         // Let the sends reach the broker before closing.
-        wait_until("the sends are stored", || server.world.borrow().stored(TOPIC).len() == 4).await;
+        wait_until("the sends are stored", || server.world.borrow().messages(TOPIC).len() == 4).await;
         producer.close().await.unwrap();
         while let Some(result) = pending.next().await {
             result.unwrap();
@@ -701,7 +765,7 @@ fn sends_wait_for_room_at_the_memory_limit() {
             .collect::<Vec<_>>()
             .await;
         assert!(results.iter().all(Result::is_ok));
-        assert_eq!(server.world.borrow().stored(TOPIC).len(), 200);
+        assert_eq!(server.world.borrow().messages(TOPIC).len(), 200);
         wait_until("the memory is released", || client.memory().used() == 0).await;
         client.close().await.unwrap();
     });
@@ -775,9 +839,7 @@ fn a_refused_send_is_written_again() {
         producer.send("first".to_string()).await.unwrap();
         server.with(|w| w.fail_sends.push_back(apache_pulsar_protocol::proto::ServerError::ChecksumError));
         producer.send("second".to_string()).await.unwrap();
-        let values: Vec<String> =
-            server.world.borrow().stored(TOPIC).iter().map(|s| String::from_utf8(s.value.to_vec()).unwrap()).collect();
-        assert_eq!(values, ["first", "second"]);
+        assert_eq!(stored_values(&server), ["first", "second"]);
         assert_eq!(server.received(Type::PRODUCER), 2, "registered again");
         client.close().await.unwrap();
     });

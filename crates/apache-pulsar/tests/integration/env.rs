@@ -176,6 +176,16 @@ impl Env {
         self.exec(&["bash", "-c", &delete]);
     }
 
+    /// Turns off the automatic splits and merges of scalable topic `tenant/namespace/name`, as Java's tests do to keep
+    /// a layout: `POST /admin/v2/scalable/…/autoScalePolicy`, which `pulsar-admin` 5.0.1 has no command for.
+    pub fn disable_auto_scale(&self, name: &str) {
+        let url = format!("http://localhost:8080/admin/v2/scalable/{name}/autoScalePolicy");
+        let auth = "-H \"Authorization: Bearer $(cat /it/admin.token)\"";
+        let post =
+            format!("curl -sSf -X POST {auth} -H 'Content-Type: application/json' -d '{{\"enabled\":false}}' '{url}'");
+        self.exec(&["bash", "-c", &post]);
+    }
+
     /// Reads `count` messages of `topic` with the Java client's Checkpoint consumer in the broker container, as the
     /// admin, from `start`: `earliest`, `latest`, or a checkpoint's bytes in hex. Returns the messages as
     /// `(key, value)`, and the consumer's checkpoint after them, in hex.

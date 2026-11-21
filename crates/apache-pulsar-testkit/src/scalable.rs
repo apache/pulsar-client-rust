@@ -48,7 +48,8 @@ mod subscriptions;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use apache_pulsar_protocol::frame::{Frame, FrameDecoder, encode_command, encode_payload_command};
+use apache_pulsar_protocol::entry::{self, ReceivedMessage};
+use apache_pulsar_protocol::frame::{Frame, FrameDecoder, PayloadSection, encode_command, encode_payload_command};
 use apache_pulsar_protocol::hash::KeyHash;
 use apache_pulsar_protocol::layout::Layout;
 use apache_pulsar_protocol::proto::base_command::Type;
@@ -85,6 +86,21 @@ pub struct Stored {
     pub single: Option<SingleMessageMetadata>,
     /// The entry's payload as it came: one message or a whole batch, compressed or not. Consumers get it as is.
     pub payload: Bytes,
+}
+
+impl Stored {
+    /// Every message of the entry, as a consumer reads them: decompressed, and split out of its batch.
+    pub fn messages(&self) -> Vec<ReceivedMessage> {
+        let section = PayloadSection {
+            broker_entry_metadata: None,
+            checksum_valid: Some(true),
+            metadata: self.metadata.encode_to_vec().into(),
+            payload: self.payload.clone(),
+        };
+        let id = MessageIdData { ledgerId: self.ledger_id, entryId: self.entry_id, ..Default::default() };
+        let message = CommandMessage { message_id: id.into(), ..Default::default() };
+        entry::decode(self.segment as i64, &message, &section).expect("an entry a consumer can't read").messages
+    }
 }
 
 #[derive(Debug)]
@@ -568,6 +584,11 @@ impl World {
     /// What one segment stored, in order.
     pub fn stored_in(&self, topic: &str, segment: u64) -> Vec<Stored> {
         self.topic(topic).segments[&segment].entries.clone()
+    }
+
+    /// The messages of [`World::stored`]'s entries, in the same order.
+    pub fn messages(&self, topic: &str) -> Vec<ReceivedMessage> {
+        self.stored(topic).iter().flat_map(Stored::messages).collect()
     }
 
     /// Pushes the topic's layout again to every watch, with the epoch it already has.

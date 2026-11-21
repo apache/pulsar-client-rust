@@ -41,11 +41,11 @@ ready", then again on the same request once the producer gets the topic; the req
 meanwhile.
 
 **Sequence ids.** Each segment's producer has its own sequence ids, as Java's v4 producers do. They start after the
-configured initial id, or, without one, after the broker's last id for the name. A message gets its id when it is
-first written, keeps it, with its bytes, when it is written again after a reconnect, and takes a new one when it
-is routed to another segment. An id set by the application is used as is and doesn't move the counter. The
-producer's last sequence id is the highest the brokers confirmed, over its segments' producers
-([spec gap 14](../DESIGN.md#spec-gaps-to-raise-upstream)).
+configured initial id, or, without one, after the broker's last id for the name. A message gets its id when it goes
+into a batch, once the segment's producer is registered, keeps it, with its entry's bytes, when the entry is
+written again after a reconnect, and takes a new one when it is routed to another segment. An id set by the
+application is used as is and doesn't move the counter. The producer's last sequence id is the highest the brokers
+confirmed, over its segments' producers ([spec gap 14](../DESIGN.md#spec-gaps-to-raise-upstream)).
 
 **Sending.** Messages flow through:
 
@@ -64,13 +64,30 @@ producer's last sequence id is the highest the brokers confirmed, over its segme
   another segment, as in Java ([spec gap 15](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - A message larger than the broker's `max_message_size` fails alone.
 - **Batch format, always.** Every entry is a batch: `num_messages_in_batch` in the metadata, and a
-  `SingleMessageMetadata` before each message. There is one encoding path, whatever the batch size.
-- **One message per batch first.** A one-message batch lies in one bucket by construction, so it is allowed
-  without bucketing (*key-shared* §3). It is stamped `entry_hash_min = entry_hash_max =` the message's bucket hash.
-  A keyless message has bucket hash 0, as in Java (`EntryBucketBatchContainer`).
-- **Then multi-message batches.** One open batch per entry bucket of the segment (*key-shared* §3). A batch
-  closes on the maximum messages, the maximum bytes or the maximum delay, and is stamped with the smallest and
-  largest bucket hash in it. A segment with one bucket is the same code with one open batch.
+  `SingleMessageMetadata` before each message. There is one encoding path, whatever the batch size; Java sends a
+  lone message as a plain entry.
+- **One batch per entry bucket.** A segment's producer keeps one open batch per entry bucket of the segment
+  (*key-shared* §3), so that an entry holds keys of one bucket only, and stamps each entry with the smallest and
+  largest bucket hash in it. A keyless message has bucket hash 0, as in Java (`EntryBucketBatchContainer`). A
+  segment with one bucket is the same code with one open batch.
+- **The batches of a segment close together**, as in Java's `EntryBucketBatchContainer`: once the messages in them
+  reach the maximum count, or their payloads the maximum bytes, which is at most the broker's largest message, or
+  the maximum delay after the first went in. The delay so bounds each message's wait, as Java's `BatchingPolicy`
+  documents it; Java's timer counts from the last batch sent, so a batch can wait a little longer there. Their
+  entries go out in the order of their sequence ids, each entry's being its highest message's, while every message
+  keeps its own in its `SingleMessageMetadata`. The order matters: the broker drops, as a duplicate, an entry whose
+  sequence id isn't above the last one it took from the producer, which batches closing one by one would send.
+- **What goes alone.** A message that would take the open batches past the maximum bytes closes them first, so a
+  message too large for the broker fails alone. A message with a delivery time or replication clusters, which are
+  its entry's, goes in an entry of its own, after the open batches: Java does so for a delivery time, but gives
+  every message of a batch its first message's clusters
+  ([J20](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). So does a message whose sequence id is at
+  or below the last one given, as in Java: the broker may drop it as a duplicate, and its entry with it.
+- **The defaults** are Java V5's `BatchingPolicy`: on, a 1 ms delay, 1000 messages, 128 KiB. Without batching, each
+  message is an entry of its own. A flush closes the open batches, and covers the messages still waiting for a
+  registration or a layout too; the blocking API's send flushes, as Java's blocking send does.
+- **An entry is stored whole or not at all.** Its messages time out together, at its first message's deadline, and
+  a close fails what the open batches hold, never written, as Java fails its batch container.
 - End-to-end encryption publishes one message per entry, as in Java.
 - **Compression** applies to each entry's payload. The metadata records the codec and the uncompressed size.
 - **Chunking** is a later capability ([1](1-scope.md) §2).
