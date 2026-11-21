@@ -86,10 +86,10 @@ struct Subscribed {
 
 /// The registration with the controller: its link, the commands the controller pushes for it, and the assignment it
 /// answered with.
-struct Session {
-    link: Link,
-    pushes: mpsc::UnboundedReceiver<Push>,
-    assignment: ScalableConsumerAssignment,
+pub(super) struct Session {
+    pub(super) link: Link,
+    pub(super) pushes: mpsc::UnboundedReceiver<Push>,
+    pub(super) assignment: ScalableConsumerAssignment,
 }
 
 /// A receive waiting for its messages.
@@ -489,7 +489,7 @@ impl Task {
 }
 
 /// Finds the topic's controller, connects, and registers there: `command` is the `CommandScalableTopicSubscribe`.
-async fn register(
+pub(super) async fn register(
     client: &local::PulsarClient,
     topic: &str,
     mut command: BaseCommand,

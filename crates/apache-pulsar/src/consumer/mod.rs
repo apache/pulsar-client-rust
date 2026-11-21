@@ -305,7 +305,8 @@ async fn subscribe_on(client: local::PulsarClient, topic: String, options: Consu
 }
 
 /// Opens the topic's layout watch on `client`'s loop, starts the task of the consumer `machine` makes on the first
-/// layout, and waits until it is subscribed.
+/// layout, and waits until it is subscribed. A Checkpoint consumer in a group holds the watch only until then: its
+/// task's first look for the controller shares it.
 async fn start(
     client: local::PulsarClient,
     topic: String,
@@ -316,7 +317,11 @@ async fn start(
     let resolved = Arc::from(machine.topic());
     let (requests, receiver) = mpsc::unbounded();
     let (subscribed, is_subscribed) = oneshot::channel();
-    let task = Task::new(machine, client.clone(), watch, receiver, subscribed);
+    let (layouts, _held) = match machine.follows_layouts() {
+        true => (Some(watch), None),
+        false => (None, Some(watch)),
+    };
+    let task = Task::new(machine, client.clone(), topic, layouts, receiver, subscribed);
     let closer = requests.clone();
     let close = move || {
         let _ = closer.unbounded_send(Request::Close { reply: None });

@@ -23,6 +23,9 @@
 //! each segment's consumer, the layouts and the passing of time. It hands the application its messages as receives ask
 //! for them, in the order they asked, and takes its acks, its checkpoints and its close. Everything is polled from
 //! one future.
+//!
+//! A Checkpoint consumer in a group follows the assignments of the topic's controller instead of the layout: the task
+//! registers it there and leaves, as the Stream consumer's task does, and feeds it what the controller pushes.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -32,6 +35,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use apache_pulsar_protocol::assignment::AssignmentSession;
 use apache_pulsar_protocol::checkpoint::Checkpoint;
 use apache_pulsar_protocol::checkpoint_consumer::{self, CheckpointConsumer};
 use apache_pulsar_protocol::connection::IdKind;
@@ -48,6 +52,7 @@ use futures_channel::{mpsc, oneshot};
 use futures_util::stream::{FuturesUnordered, SelectAll};
 use futures_util::{Stream, StreamExt};
 
+use super::stream_task::{Session, register};
 use crate::conn::{ConnHandle, Push};
 use crate::error::{Error, ErrorKind, Result, server_error_kind};
 use crate::local;
@@ -81,10 +86,10 @@ pub(crate) enum Request {
 }
 
 /// The answer to a receive: its messages, and where a Checkpoint consumer's checkpoint was for their segments before
-/// them, to go back to if they come back.
+/// them, to go back to if they come back: per segment, with the attachment of its messages.
 pub(crate) struct Delivery {
     pub(crate) messages: Vec<ReceivedMessage>,
-    undo: Vec<(i64, EntryId)>,
+    undo: Vec<(i64, u64, EntryId)>,
 }
 
 /// The consumer a task runs.
@@ -95,6 +100,8 @@ pub(crate) enum Machine {
 
 /// What a consumer asks of its task, whichever it is.
 enum Action {
+    Register { generation: u64 },
+    Unregister { generation: u64 },
     Connect { segment: u64, generation: u64, topic: String },
     Send { segment: u64, command: Box<BaseCommand> },
     CloseConsumer { segment: u64, generation: u64 },
@@ -108,6 +115,15 @@ impl Machine {
         match self {
             Machine::Queue(queue) => queue.topic(),
             Machine::Checkpoint(reader) => reader.topic(),
+        }
+    }
+
+    /// Whether it follows the topic's layouts: all but a Checkpoint consumer in a group, which follows its
+    /// assignments.
+    pub(crate) fn follows_layouts(&self) -> bool {
+        match self {
+            Machine::Queue(_) => true,
+            Machine::Checkpoint(reader) => !reader.is_grouped(),
         }
     }
 
@@ -174,10 +190,10 @@ impl Machine {
         }
     }
 
-    fn on_closed(&mut self, segment: u64, generation: u64) {
+    fn on_closed(&mut self, segment: u64, generation: u64, now: Instant) {
         match self {
             Machine::Queue(queue) => queue.on_closed(segment, generation),
-            Machine::Checkpoint(reader) => reader.on_closed(segment, generation),
+            Machine::Checkpoint(reader) => reader.on_closed(segment, generation, now),
         }
     }
 
@@ -189,10 +205,10 @@ impl Machine {
     }
 
     /// A message reached the application. Returns where a Checkpoint consumer's checkpoint was for its segment.
-    fn deliver(&mut self, id: &MessageId) -> Option<EntryId> {
+    fn deliver(&mut self, message: &ReceivedMessage) -> Option<EntryId> {
         match self {
             Machine::Queue(_) => None,
-            Machine::Checkpoint(reader) => reader.deliver(id),
+            Machine::Checkpoint(reader) => reader.deliver(message),
         }
     }
 
@@ -224,6 +240,8 @@ impl Machine {
                 queue_consumer::Action::Closed => Action::Closed,
             }),
             Machine::Checkpoint(reader) => reader.poll_action().map(|action| match action {
+                checkpoint_consumer::Action::Register { generation } => Action::Register { generation },
+                checkpoint_consumer::Action::Unregister { generation } => Action::Unregister { generation },
                 checkpoint_consumer::Action::Connect { segment, generation, topic } => {
                     Action::Connect { segment, generation, topic }
                 }
@@ -243,6 +261,8 @@ impl Machine {
 
 type Sleep = Pin<Box<dyn Future<Output = ()>>>;
 type Subscription = Pin<Box<dyn Future<Output = Subscribed>>>;
+type Registration = Pin<Box<dyn Future<Output = (u64, std::result::Result<Session, RegisterError>)>>>;
+type Ending = Pin<Box<dyn Future<Output = u64>>>;
 type Closing = Pin<Box<dyn Future<Output = (u64, u64)>>>;
 /// A last message id asked for a segment's subscription of a generation: the id, or `None` if the broker didn't give
 /// it.
@@ -284,9 +304,20 @@ struct Waiter {
 pub(crate) struct Task {
     machine: Machine,
     client: local::PulsarClient,
-    watch: LayoutWatch,
+    /// The topic as the application named it, to find a group's controller.
+    topic: String,
+    /// The layouts, for a consumer that follows them ([`Machine::follows_layouts`]).
+    watch: Option<LayoutWatch>,
     /// The client keeps a sender of its own, to close the consumer: the channel doesn't end while the task runs.
     requests: mpsc::UnboundedReceiver<Request>,
+    /// A member's registrations with the controller, in flight.
+    registrations: FuturesUnordered<Registration>,
+    /// The last registration: its generation and link, kept after its connection closes until a newer one replaces
+    /// it.
+    session: Option<(u64, Link)>,
+    session_pushes: SelectAll<Pushes>,
+    /// Unsubscribes in flight.
+    endings: FuturesUnordered<Ending>,
     links: HashMap<u64, Link>,
     subscriptions: FuturesUnordered<Subscription>,
     /// Subscribes in flight, and where they registered, once they did: to close them if the consumer goes before
@@ -309,15 +340,21 @@ impl Task {
     pub(crate) fn new(
         machine: Machine,
         client: local::PulsarClient,
-        watch: LayoutWatch,
+        topic: String,
+        watch: Option<LayoutWatch>,
         requests: mpsc::UnboundedReceiver<Request>,
         subscribed: oneshot::Sender<Result<()>>,
     ) -> Self {
         Self {
             machine,
             client,
+            topic,
             watch,
             requests,
+            registrations: FuturesUnordered::new(),
+            session: None,
+            session_pushes: SelectAll::new(),
+            endings: FuturesUnordered::new(),
             links: HashMap::new(),
             subscriptions: FuturesUnordered::new(),
             registering: HashMap::new(),
@@ -353,6 +390,7 @@ impl Task {
             let mut progressed = false;
             progressed |= self.poll_requests(cx);
             progressed |= self.poll_layouts(cx);
+            progressed |= self.poll_session(cx);
             progressed |= self.poll_subscriptions(cx);
             progressed |= self.poll_pushes(cx);
             progressed |= self.poll_closes(cx);
@@ -407,10 +445,51 @@ impl Task {
     }
 
     fn poll_layouts(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(watch) = &mut self.watch else { return false };
         let mut progressed = false;
-        while let Poll::Ready(Some(layout)) = self.watch.updates.poll_next_unpin(cx) {
+        while let Poll::Ready(Some(layout)) = watch.updates.poll_next_unpin(cx) {
             progressed = true;
             self.machine.on_layout(layout, Instant::now());
+        }
+        progressed
+    }
+
+    /// A member's registrations, what the controller pushes to it, and the ends of its unsubscribes.
+    fn poll_session(&mut self, cx: &mut Context<'_>) -> bool {
+        let Machine::Checkpoint(reader) = &mut self.machine else { return false };
+        let mut progressed = false;
+        while let Poll::Ready(Some((generation, outcome))) = self.registrations.poll_next_unpin(cx) {
+            progressed = true;
+            match outcome {
+                Ok(Session { link, pushes, assignment }) => {
+                    // Its pushes, from here: none of them goes before the answer.
+                    self.session_pushes.push(Box::pin(pushes.map(move |push| (0, generation, push))));
+                    self.session = Some((generation, link));
+                    reader.on_registered(generation, &assignment, Instant::now());
+                }
+                Err(error) => reader.on_register_failed(generation, error, Instant::now()),
+            }
+        }
+        while let Poll::Ready(Some((_, generation, push))) = self.session_pushes.poll_next_unpin(cx) {
+            progressed = true;
+            let now = Instant::now();
+            let update = match &push {
+                Push::Command(frame) => frame.command_view().ok().and_then(|command| {
+                    let update = command.scalableTopicAssignmentUpdate.as_option()?;
+                    update.assignment.as_option()?.to_owned_message().ok()
+                }),
+                Push::Closed(_) => None,
+            };
+            match update {
+                Some(assignment) => reader.on_assignment(generation, &assignment, now),
+                // The connection closed. The link stays until a new registration replaces it: an unsubscribe asked
+                // meanwhile fails on it, and is done all the same.
+                None => reader.on_session_lost(generation, now),
+            }
+        }
+        while let Poll::Ready(Some(generation)) = self.endings.poll_next_unpin(cx) {
+            progressed = true;
+            reader.on_unregistered(generation);
         }
         progressed
     }
@@ -474,7 +553,7 @@ impl Task {
         let mut progressed = false;
         while let Poll::Ready(Some((segment, generation))) = self.closes.poll_next_unpin(cx) {
             progressed = true;
-            self.machine.on_closed(segment, generation);
+            self.machine.on_closed(segment, generation, Instant::now());
         }
         progressed
     }
@@ -486,7 +565,7 @@ impl Task {
             // Only a Checkpoint consumer asks.
             let Machine::Checkpoint(reader) = &mut self.machine else { continue };
             match id {
-                Some(id) => reader.on_last_message_id(segment, generation, id),
+                Some(id) => reader.on_last_message_id(segment, generation, id, Instant::now()),
                 None => reader.on_last_message_id_failed(segment, generation, Instant::now()),
             }
         }
@@ -559,13 +638,13 @@ impl Task {
     /// Answers a receive: its messages reach the application. One that went away gives its messages back, for the
     /// next ones.
     fn answer(&mut self, waiter: Waiter) {
-        let mut undo: Vec<(i64, EntryId)> = Vec::new();
+        let mut undo: Vec<(i64, u64, EntryId)> = Vec::new();
         for message in &waiter.got {
             let segment = message.id.segment_id;
-            if let Some(before) = self.machine.deliver(&message.id)
-                && !undo.iter().any(|(s, _)| *s == segment)
+            if let Some(before) = self.machine.deliver(message)
+                && !undo.iter().any(|(s, _, _)| *s == segment)
             {
-                undo.push((segment, before));
+                undo.push((segment, message.attachment, before));
             }
         }
         if let Err(delivery) = waiter.reply.send(Delivery { messages: waiter.got, undo }) {
@@ -576,9 +655,9 @@ impl Task {
     /// Takes back messages that didn't reach the application, for the next receives. A Checkpoint consumer's
     /// checkpoint names what it named before them again.
     fn take_back(&mut self, delivery: Delivery) {
-        for (segment, position) in delivery.undo {
+        for (segment, attachment, position) in delivery.undo {
             let Machine::Checkpoint(reader) = &mut self.machine else { break };
-            reader.rewind(segment, position);
+            reader.rewind(segment, attachment, position);
         }
         for message in delivery.messages.into_iter().rev() {
             self.returned.push_front(message);
@@ -590,6 +669,8 @@ impl Task {
         while let Some(action) = self.machine.poll_action() {
             progressed = true;
             match action {
+                Action::Register { generation } => self.register(generation),
+                Action::Unregister { generation } => self.unregister(generation),
                 Action::Connect { segment, generation, topic } => self.connect(segment, generation, topic),
                 Action::Send { segment, command } => self.send(segment, *command),
                 Action::CloseConsumer { segment, generation } => self.close_consumer(segment, generation),
@@ -611,6 +692,31 @@ impl Task {
             }
         }
         progressed
+    }
+
+    /// Registers a member of a group with the topic's controller.
+    fn register(&mut self, generation: u64) {
+        let Machine::Checkpoint(reader) = &self.machine else { return };
+        let Some(command) = reader.register_command(0) else { return };
+        let client = self.client.clone();
+        let topic = self.topic.clone();
+        self.registrations.push(Box::pin(async move { (generation, register(&client, &topic, command).await) }));
+    }
+
+    /// Leaves the controller's group on the registration's connection.
+    fn unregister(&mut self, generation: u64) {
+        let (_, link) = self.session.take().expect("the registration that unregisters");
+        self.endings.push(Box::pin(async move {
+            let consumer_id = link.consumer_id;
+            let command = move |request_id| {
+                let mut command = AssignmentSession::unregister_command(consumer_id);
+                command.scalableTopicUnsubscribe.get_or_insert_default().request_id = request_id;
+                command
+            };
+            // Best effort: on any failure, the controller's grace period takes over.
+            let _ = link.connection.request(command).await;
+            generation
+        }));
     }
 
     fn connect(&mut self, segment: u64, generation: u64, topic: String) {

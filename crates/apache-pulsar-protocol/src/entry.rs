@@ -55,6 +55,10 @@ pub struct ReceivedMessage {
     /// The entry's metadata, which the messages of a batch share: the producer's name, the publish time, the schema
     /// version.
     pub entry: Arc<MessageMetadata>,
+    /// For a Checkpoint consumer, its attachment to the segment the message came from, which a segment that leaves a
+    /// group member's assignment and comes back renews: a message of an earlier one moves no checkpoint. Zero
+    /// otherwise.
+    pub attachment: u64,
 }
 
 impl ReceivedMessage {
@@ -70,6 +74,7 @@ impl ReceivedMessage {
             sequence_id: entry.sequence_id,
             null_value: entry.null_value == Some(true),
             entry,
+            attachment: 0,
         }
     }
 
@@ -92,6 +97,7 @@ impl ReceivedMessage {
             event_time: single.event_time,
             null_value: single.null_value == Some(true),
             entry: entry.clone(),
+            attachment: 0,
         }
     }
 }

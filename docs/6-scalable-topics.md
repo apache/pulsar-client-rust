@@ -284,9 +284,41 @@ among them.
 
 ### 6.2 Grouped
 
-Registers like the Stream consumer (§5.1) with type `CHECKPOINT`, and reads its assigned segments with
-readers. No cursor is persisted: each member starts from its own start position or restored checkpoint
-(*client-api* §4.3).
+A member of a group registers with the topic's controller like the Stream consumer (§5.1), with type `CHECKPOINT`,
+the group as the subscription, and its name; one without a name gets a random one, `v5-checkpoint-` and 8 letters
+and digits, as in Java. It reads the segments the controller assigns it with the readers of §6.1, each named
+`<name>-seg-<id>`. No cursor is persisted: each member starts from its own start position or restored checkpoint
+(*client-api* §4.3), and its checkpoint names only its own segments.
+
+- **What the 5.0.1 controller does.** It assigns a group every segment of the layout, active and sealed, each whole
+  to one member, round robin over the members sorted by name; members beyond the segments get none. It orders
+  nothing for a group: no cursor shows it how far the group read a parent, so it hands out a split's children at
+  once.
+- **No parents first.** An assignment carries no lineage, so a member reads each of its segments as messages come,
+  as Java's does, and asks for no sealed segment's end: no child waits for it. A key's messages keep their order
+  within a segment, but not across a split or a merge, whether the parent and the child go to one member or two
+  ([spec gap 7](../DESIGN.md#spec-gaps-to-raise-upstream)).
+- **A segment that leaves the assignment** gives nothing more, not even what its reader had in, and leaves the
+  checkpoint; its reader is closed. One that comes back gets a new reader once the last one is closed and the last
+  message id it asked for, if any, is answered: a member's readers share one subscription, on which the broker
+  refuses a second reader, and the answer must reach no other reader. The new reader starts at the member's start,
+  as in Java. A message taken from a reader before its segment left, and given to the application only after, as a
+  batch receive waiting for more does, moves no checkpoint: each message carries its segment's attachment, which a
+  segment that comes back renews, as Java fences its positions by reader attachment.
+- **The latest position** applies to each segment a member gets, whenever it gets it: an assignment doesn't tell a
+  segment created after the member started from one moved to it. Java does the same. A segment that a restored
+  checkpoint doesn't name is read from its start.
+- **Create and close.** The create completes once the controller registered the member and every reader of its
+  assignment is subscribed and knows where it starts; a member assigned nothing completes too. A refused
+  registration, or a connection lost before its answer, fails the create, as in Java. Closing unsubscribes, so that
+  the controller hands the member's segments over at once, and closes the readers.
+- **Reconnects.** The registration comes back as the Stream consumer's does (§5.1). The readers go on meanwhile, and
+  within the controller's grace period the same assignment comes back.
+
+Ported scenarios from `V5CheckpointConsumerGroupTest`, the grouped ones of `V5CheckpointConsumerDagReplayTest` and
+`V5CheckpointConsumerUntouchedSegmentTest`, and the managed ones of `ScalableCheckpointConsumerTest` and
+`ScalableCheckpointConsumerReconcileTest`, check these rules on the simulated cluster
+(`crates/apache-pulsar-testkit/tests/checkpoint_group.rs`), and integration tests on the real broker.
 
 ## 7. Namespace subscription (later)
 

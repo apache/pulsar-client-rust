@@ -15,18 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Drives a [`CheckpointConsumer`] against a simulated [`World`], doing what the driver does for each [`Action`], on
-//! a clock the test moves by hand. One connection carries the topic's layout watch and every segment's reader.
-//! Deterministic: no sockets, no sleeps.
+//! Drives [`CheckpointConsumer`]s against a simulated [`World`], doing what the driver does for each [`Action`], on
+//! a clock the test moves by hand. Deterministic: no sockets, no sleeps.
 //!
+//! - [`CheckpointHarness`] drives a consumer on its own: one connection carries the topic's layout watch and every
+//!   segment's reader.
+//! - [`GroupHarness`] drives the members of a group, each on its own connection, which carries its registration with
+//!   the topic's controller and its readers.
+//!
+//! [`CheckpointHarness`]: crate::checkpoint::CheckpointHarness
+//! [`GroupHarness`]: crate::checkpoint::GroupHarness
 //! [`CheckpointConsumer`]: apache_pulsar_protocol::checkpoint_consumer::CheckpointConsumer
 //! [`Action`]: apache_pulsar_protocol::checkpoint_consumer::Action
 //! [`World`]: crate::scalable::World
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use apache_pulsar_protocol::assignment::AssignmentSession;
 use apache_pulsar_protocol::checkpoint::Checkpoint;
 use apache_pulsar_protocol::checkpoint_consumer::{Action, CheckpointConsumer};
 use apache_pulsar_protocol::consumer::ConsumerOptions;
@@ -53,17 +60,9 @@ pub struct CheckpointHarness {
     pub consumer: CheckpointConsumer,
     pub clock: Clock,
     topic: String,
-    conn: ConnId,
+    wire: Wire,
     session_id: u64,
     next_id: u64,
-    /// Subscribes waiting for an answer: request id to `(segment, generation, consumer id)`.
-    subscribing: HashMap<u64, (u64, u64, u64)>,
-    /// Registered readers, until the answer to their close: consumer id to `(segment, generation)`.
-    registered: HashMap<u64, (u64, u64)>,
-    /// Closes waiting for an answer: request id to consumer id.
-    closing: HashMap<u64, u64>,
-    /// Last message ids asked, waiting for an answer: request id to `(segment, generation)`.
-    asking: HashMap<u64, (u64, u64)>,
     /// How the create went.
     pub subscribed: Option<Result<(), RegisterError>>,
     pub closed: bool,
@@ -87,20 +86,16 @@ impl CheckpointHarness {
             ),
             clock,
             topic: topic.to_string(),
-            conn,
+            wire: Wire::new(conn),
             session_id: 0,
             next_id: 1,
-            subscribing: HashMap::new(),
-            registered: HashMap::new(),
-            closing: HashMap::new(),
-            asking: HashMap::new(),
             subscribed: None,
             closed: false,
             subscribes: BTreeMap::new(),
         };
-        harness.handshake();
+        handshake(&mut harness.world, conn);
         harness.open_session();
-        let command = decode(&harness.world.output(harness.conn)).pop().expect("no answer to the scalable lookup");
+        let command = decode(&harness.world.output(conn)).pop().expect("no answer to the scalable lookup");
         let update = &command.scalableTopicUpdate;
         assert!(update.error.is_none(), "lookup failed: {:?} {:?}", update.error, update.message);
         let layout = Layout::from_dag(&update.dag, &harness.topic).unwrap();
@@ -121,7 +116,7 @@ impl CheckpointHarness {
         while taken.len() < max
             && let Some(message) = self.consumer.next_message()
         {
-            self.consumer.deliver(&message.id);
+            self.consumer.deliver(&message);
             taken.push(message);
             self.pump();
         }
@@ -159,7 +154,7 @@ impl CheckpointHarness {
     /// Drops the connection, as a network failure would: the readers' registrations are lost, and the watch reopens
     /// on a new connection.
     pub fn drop_connection(&mut self) {
-        self.world.kill(self.conn);
+        self.world.kill(self.wire.conn);
         self.pump();
     }
 
@@ -169,15 +164,27 @@ impl CheckpointHarness {
             let mut progressed = false;
             while let Some(action) = self.consumer.poll_action() {
                 progressed = true;
-                self.act(action);
+                match self.wire.act(&mut self.world, &mut self.next_id, &self.consumer, action) {
+                    Some(Report::Subscribe(segment)) => *self.subscribes.entry(segment).or_default() += 1,
+                    Some(Report::Subscribed(result)) => self.subscribed = Some(result),
+                    Some(Report::Closed) => self.closed = true,
+                    None => {}
+                }
             }
-            let output = self.world.output(self.conn);
+            let output = self.world.output(self.wire.conn);
             if !output.is_empty() {
                 progressed = true;
-                self.answer(&output);
+                let now = self.clock.now();
+                // The only commands that aren't for the consumer's readers: the layouts, on the session open now.
+                for command in self.wire.answer(&mut self.consumer, &output, now) {
+                    let update = &command.scalableTopicUpdate;
+                    assert_eq!((update.session_id, update.error), (self.session_id, None), "{command:?}");
+                    let layout = Layout::from_dag(&update.dag, &self.topic).unwrap();
+                    self.consumer.on_layout(Rc::new(layout), now);
+                }
             }
             // The world closed the connection, or the test did: connect again.
-            if !self.world.is_open(self.conn) {
+            if !self.world.is_open(self.wire.conn) {
                 progressed = true;
                 self.reconnect();
             }
@@ -185,13 +192,6 @@ impl CheckpointHarness {
                 return;
             }
         }
-    }
-
-    fn handshake(&mut self) {
-        let connect =
-            CommandConnect { client_version: "testkit".into(), protocol_version: Some(21), ..Default::default() };
-        self.write(&BaseCommand { r#type: Type::CONNECT.into(), connect: connect.into(), ..Default::default() });
-        let _connected = self.world.output(self.conn);
     }
 
     fn open_session(&mut self) {
@@ -202,152 +202,407 @@ impl CheckpointHarness {
             create_if_missing: Some(true),
             ..Default::default()
         };
-        self.write(&BaseCommand {
+        let lookup = BaseCommand {
             r#type: Type::SCALABLE_TOPIC_LOOKUP.into(),
             scalableTopicLookup: lookup.into(),
             ..Default::default()
-        });
+        };
+        write(&mut self.world, self.wire.conn, &lookup);
     }
 
     fn reconnect(&mut self) {
-        self.world.disconnected(self.conn);
-        self.conn = self.world.connect();
-        self.handshake();
-        // What was registered, subscribing or asked on the old connection is gone with it.
-        self.closing.clear();
-        let now = self.clock.now();
-        for (_, (segment, generation)) in std::mem::take(&mut self.registered) {
-            self.consumer.on_disconnected(segment, generation, now);
-        }
-        for (_, (segment, generation, _)) in std::mem::take(&mut self.subscribing) {
-            let lost = RegisterError::Unavailable("disconnected".into());
-            self.consumer.on_subscribe_failed(segment, generation, lost, now);
-        }
-        for (_, (segment, generation)) in std::mem::take(&mut self.asking) {
-            self.consumer.on_last_message_id_failed(segment, generation, now);
-        }
+        self.world.disconnected(self.wire.conn);
+        let conn = self.world.connect();
+        handshake(&mut self.world, conn);
+        self.wire.lost(conn, &mut self.consumer, self.clock.now());
         self.open_session();
     }
+}
 
-    fn act(&mut self, action: Action) {
+/// See the module documentation.
+#[derive(Debug)]
+pub struct GroupHarness {
+    pub world: World,
+    pub clock: Clock,
+    topic: String,
+    group: String,
+    pub members: Vec<Member>,
+    next_id: u64,
+}
+
+/// A member of the group, and what its driver keeps.
+#[derive(Debug)]
+pub struct Member {
+    pub consumer: CheckpointConsumer,
+    wire: Wire,
+    /// How the create went.
+    pub subscribed: Option<Result<(), RegisterError>>,
+    pub closed: bool,
+    /// How many `CommandSubscribe` it sent, per segment.
+    pub subscribes: BTreeMap<u64, usize>,
+    /// Its process died: nothing drives it any more.
+    crashed: bool,
+}
+
+impl GroupHarness {
+    /// The group `group` of Checkpoint consumers of `topic`, the name the broker resolved, in `world`. Members join it
+    /// with [`GroupHarness::join`].
+    pub fn new(world: World, topic: &str, group: &str) -> GroupHarness {
+        let (topic, group) = (topic.to_string(), group.to_string());
+        GroupHarness { world, clock: Clock::default(), topic, group, members: Vec::new(), next_id: 1 }
+    }
+
+    /// A new member named `name`, starting at `start`: it registers with the topic's controller on a connection of
+    /// its own. Returns its index.
+    pub fn join(&mut self, name: &str, options: ConsumerOptions, start: Checkpoint) -> usize {
+        let conn = self.world.connect();
+        handshake(&mut self.world, conn);
+        let (topic, group) = (self.topic.clone(), self.group.clone());
+        let consumer = CheckpointConsumer::grouped(options, start, topic, group, name.into(), self.clock.now());
+        let member = Member {
+            consumer,
+            wire: Wire::new(conn),
+            subscribed: None,
+            closed: false,
+            subscribes: BTreeMap::new(),
+            crashed: false,
+        };
+        self.members.push(member);
+        self.pump();
+        self.members.len() - 1
+    }
+
+    /// Every message the member has in, as the application gets them, after what the world has for it.
+    pub fn take(&mut self, member: usize) -> Vec<ReceivedMessage> {
+        self.pump();
+        let mut taken = Vec::new();
+        while let Some(message) = self.members[member].consumer.next_message() {
+            self.members[member].consumer.deliver(&message);
+            taken.push(message);
+            self.pump();
+        }
+        taken
+    }
+
+    /// The values of every message the member has in, as text.
+    pub fn take_values(&mut self, member: usize) -> Vec<String> {
+        values(&self.take(member))
+    }
+
+    /// The member's checkpoint, through its bytes, as an application stores and restores it.
+    pub fn checkpoint(&self, member: usize) -> Checkpoint {
+        Checkpoint::from_bytes(&self.members[member].consumer.checkpoint().to_bytes()).unwrap()
+    }
+
+    pub fn close(&mut self, member: usize) {
+        self.members[member].consumer.close();
+        self.pump();
+    }
+
+    /// Moves the clock, lets every member act on each deadline that passes, in order, and pumps.
+    pub fn advance(&mut self, by: Duration) {
+        let until = self.clock.now() + by;
+        loop {
+            let next = self.members.iter().filter(|m| !m.crashed).filter_map(|m| m.consumer.poll_timeout());
+            let next = next.min().filter(|at| *at <= until);
+            let at = next.unwrap_or(until);
+            self.clock.advance(at.saturating_duration_since(self.clock.now()));
+            for member in self.members.iter_mut().filter(|member| !member.crashed) {
+                member.consumer.handle_timeout(self.clock.now());
+            }
+            self.pump();
+            if next.is_none() {
+                return;
+            }
+        }
+    }
+
+    /// Drops a member's connection, as a network failure would: its registration and its readers are lost, and come
+    /// back on a new connection.
+    pub fn drop_connection(&mut self, member: usize) {
+        self.world.kill(self.members[member].wire.conn);
+        self.pump();
+    }
+
+    /// Stops a member for good, as if its process died: its connection closes, and nothing drives it any more. The
+    /// controller keeps it registered for the grace period.
+    pub fn crash(&mut self, member: usize) {
+        self.members[member].crashed = true;
+        self.world.kill(self.members[member].wire.conn);
+        self.pump();
+    }
+
+    /// Does what the members and the world ask until none has anything left to do.
+    pub fn pump(&mut self) {
+        loop {
+            let mut progressed = false;
+            for member in self.members.iter_mut().filter(|member| !member.crashed) {
+                while let Some(action) = member.consumer.poll_action() {
+                    progressed = true;
+                    match member.wire.act(&mut self.world, &mut self.next_id, &member.consumer, action) {
+                        Some(Report::Subscribe(segment)) => *member.subscribes.entry(segment).or_default() += 1,
+                        Some(Report::Subscribed(result)) => member.subscribed = Some(result),
+                        Some(Report::Closed) => member.closed = true,
+                        None => {}
+                    }
+                }
+                let output = self.world.output(member.wire.conn);
+                if !output.is_empty() {
+                    progressed = true;
+                    let others = member.wire.answer(&mut member.consumer, &output, self.clock.now());
+                    assert!(others.is_empty(), "a member opened no layout watch: {others:?}");
+                }
+                // The world closed the connection, or the test did: connect again.
+                if !self.world.is_open(member.wire.conn) {
+                    progressed = true;
+                    self.world.disconnected(member.wire.conn);
+                    let conn = self.world.connect();
+                    handshake(&mut self.world, conn);
+                    member.wire.lost(conn, &mut member.consumer, self.clock.now());
+                }
+            }
+            if !progressed {
+                return;
+            }
+        }
+    }
+}
+
+/// What a driver keeps for a consumer: its connection, and what is registered and in flight there.
+#[derive(Debug)]
+struct Wire {
+    conn: ConnId,
+    /// Subscribes waiting for an answer: request id to `(segment, generation, consumer id)`.
+    subscribing: HashMap<u64, (u64, u64, u64)>,
+    /// Registered readers, until the answer to their close: consumer id to `(segment, generation)`.
+    registered: HashMap<u64, (u64, u64)>,
+    /// Closes waiting for an answer: request id to consumer id.
+    closing: HashMap<u64, u64>,
+    /// Last message ids asked, waiting for an answer: request id to `(segment, generation)`.
+    asking: HashMap<u64, (u64, u64)>,
+    /// A member's registrations waiting for an answer: request id to `(generation, consumer id)`.
+    registering: HashMap<u64, (u64, u64)>,
+    /// A member's registration: `(generation, consumer id)`.
+    session: Option<(u64, u64)>,
+    /// A member's unsubscribes waiting for an answer: request id to generation.
+    unregistering: HashMap<u64, u64>,
+}
+
+/// What a consumer's action tells the test.
+enum Report {
+    /// A `CommandSubscribe` went out for the segment's reader.
+    Subscribe(u64),
+    Subscribed(Result<(), RegisterError>),
+    Closed,
+}
+
+impl Wire {
+    fn new(conn: ConnId) -> Wire {
+        Wire {
+            conn,
+            subscribing: HashMap::new(),
+            registered: HashMap::new(),
+            closing: HashMap::new(),
+            asking: HashMap::new(),
+            registering: HashMap::new(),
+            session: None,
+            unregistering: HashMap::new(),
+        }
+    }
+
+    /// Does what the consumer asks, on the connection, with ids from `ids`.
+    fn act(
+        &mut self,
+        world: &mut World,
+        ids: &mut u64,
+        consumer: &CheckpointConsumer,
+        action: Action,
+    ) -> Option<Report> {
+        let mut id = || {
+            *ids += 1;
+            *ids - 1
+        };
         match action {
+            Action::Register { generation } => {
+                let (consumer_id, request_id) = (id(), id());
+                let mut command = consumer.register_command(consumer_id).expect("a member of a group");
+                command.scalableTopicSubscribe.get_or_insert_default().request_id = request_id;
+                self.registering.insert(request_id, (generation, consumer_id));
+                write(world, self.conn, &command);
+            }
+            Action::Unregister { generation } => {
+                let request_id = id();
+                let (_, consumer_id) = self.session.filter(|(g, _)| *g == generation).expect("a registration");
+                let mut command = AssignmentSession::unregister_command(consumer_id);
+                command.scalableTopicUnsubscribe.get_or_insert_default().request_id = request_id;
+                self.unregistering.insert(request_id, generation);
+                write(world, self.conn, &command);
+            }
             Action::Connect { segment, generation, .. } => {
-                let (consumer_id, request_id) = (self.next_id, self.next_id + 1);
-                self.next_id += 2;
-                let mut command = self.consumer.subscribe_command(segment, consumer_id).expect("a segment's reader");
+                let (consumer_id, request_id) = (id(), id());
+                let mut command = consumer.subscribe_command(segment, consumer_id).expect("a segment's reader");
                 command.subscribe.get_or_insert_default().request_id = request_id;
                 self.subscribing.insert(request_id, (segment, generation, consumer_id));
-                *self.subscribes.entry(segment).or_default() += 1;
-                self.write(&command);
+                write(world, self.conn, &command);
+                return Some(Report::Subscribe(segment));
             }
-            Action::Send { command, .. } => self.write(&command),
+            Action::Send { command, .. } => write(world, self.conn, &command),
             Action::CloseConsumer { segment, generation } => {
                 // Without a registration, the broker closed the reader, and the consumer heard it.
-                let Some(consumer_id) = self.consumer_id(segment, generation) else { return };
-                let request_id = self.request_id();
+                let consumer_id = self.consumer_id(segment, generation)?;
+                let request_id = id();
                 self.closing.insert(request_id, consumer_id);
                 let close = CommandCloseConsumer { consumer_id, request_id, ..Default::default() };
-                self.write(&BaseCommand {
+                let close = BaseCommand {
                     r#type: Type::CLOSE_CONSUMER.into(),
                     close_consumer: close.into(),
                     ..Default::default()
-                });
+                };
+                write(world, self.conn, &close);
             }
             Action::GetLastMessageId { segment, generation } => {
                 // Without a registration, the broker closed the reader, and the consumer heard it.
-                let Some(consumer_id) = self.consumer_id(segment, generation) else { return };
-                let request_id = self.request_id();
+                let consumer_id = self.consumer_id(segment, generation)?;
+                let request_id = id();
                 self.asking.insert(request_id, (segment, generation));
                 let get = CommandGetLastMessageId { consumer_id, request_id, ..Default::default() };
-                self.write(&BaseCommand {
+                let get = BaseCommand {
                     r#type: Type::GET_LAST_MESSAGE_ID.into(),
                     getLastMessageId: get.into(),
                     ..Default::default()
-                });
+                };
+                write(world, self.conn, &get);
             }
-            Action::Subscribed(result) => self.subscribed = Some(result),
-            Action::Closed => self.closed = true,
+            Action::Subscribed(result) => return Some(Report::Subscribed(result)),
+            Action::Closed => return Some(Report::Closed),
         }
+        None
     }
 
     fn consumer_id(&self, segment: u64, generation: u64) -> Option<u64> {
         self.registered.iter().find(|(_, v)| **v == (segment, generation)).map(|(id, _)| *id)
     }
 
-    fn request_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id - 1
-    }
-
-    fn answer(&mut self, output: &[u8]) {
+    /// Feeds the consumer what the world sent on the connection: what answers what the driver wrote on it, or concerns
+    /// a reader or the registration there. Returns the other commands: the layouts of a watch.
+    fn answer(&mut self, consumer: &mut CheckpointConsumer, output: &[u8], now: Instant) -> Vec<BaseCommand> {
         let decoder = FrameDecoder::default();
         let mut buf = BytesMut::from(output);
-        let now = self.clock.now();
+        let mut others = Vec::new();
         while let Some(frame) = decoder.decode(&mut buf).expect("the world sent a bad frame") {
             let command = BaseCommand::decode_from_slice(&frame.command).expect("undecodable command");
             let EnumValue::Known(kind) = command.r#type else { panic!("unknown command {command:?}") };
-            // What the world sends on a connection answers what the harness wrote on it, or concerns a reader or the
-            // watch session registered there.
             match kind {
                 Type::SUCCESS => {
                     let request = command.success.request_id;
                     if let Some((segment, generation, consumer_id)) = self.subscribing.remove(&request) {
                         self.registered.insert(consumer_id, (segment, generation));
-                        self.consumer.on_subscribed(segment, generation, consumer_id);
+                        consumer.on_subscribed(segment, generation, consumer_id);
+                    } else if let Some(generation) = self.unregistering.remove(&request) {
+                        self.session = None;
+                        consumer.on_unregistered(generation);
                     } else {
                         let consumer_id = self.closing.remove(&request).expect("an answer to a close");
                         // The broker may have closed it meanwhile.
                         let Some((segment, generation)) = self.registered.remove(&consumer_id) else { continue };
-                        self.consumer.on_closed(segment, generation);
+                        consumer.on_closed(segment, generation, now);
                     }
                 }
                 Type::ERROR => {
                     let error = &command.error;
                     if let Some((segment, generation)) = self.asking.remove(&error.request_id) {
-                        self.consumer.on_last_message_id_failed(segment, generation, now);
+                        consumer.on_last_message_id_failed(segment, generation, now);
                         continue;
                     }
                     let (segment, generation, _) =
                         self.subscribing.remove(&error.request_id).expect("an answer to a subscribe");
                     let refused = RegisterError::Server { error: error.error, message: error.message.clone() };
-                    self.consumer.on_subscribe_failed(segment, generation, refused, now);
+                    consumer.on_subscribe_failed(segment, generation, refused, now);
                 }
                 Type::GET_LAST_MESSAGE_ID_RESPONSE => {
                     let response = &command.getLastMessageIdResponse;
                     let (segment, generation) = self.asking.remove(&response.request_id).expect("an asked id");
                     let id = EntryId::from_proto(&response.last_message_id);
-                    self.consumer.on_last_message_id(segment, generation, id);
+                    consumer.on_last_message_id(segment, generation, id, now);
                 }
                 Type::MESSAGE => {
                     let (segment, generation) = self.registered[&command.message.consumer_id];
                     let section = frame.payload.as_ref().expect("a message without a payload");
-                    self.consumer.on_message(segment, generation, &command.message, section);
+                    consumer.on_message(segment, generation, &command.message, section);
                 }
                 Type::REACHED_END_OF_TOPIC => {
                     let (segment, generation) = self.registered[&command.reachedEndOfTopic.consumer_id];
-                    self.consumer.on_reached_end_of_topic(segment, generation);
+                    consumer.on_reached_end_of_topic(segment, generation);
                 }
                 // The broker closed the reader: an unload, a deleted segment.
                 Type::CLOSE_CONSUMER => {
                     let (segment, generation) = self.registered.remove(&command.close_consumer.consumer_id).unwrap();
-                    self.consumer.on_disconnected(segment, generation, now);
+                    consumer.on_disconnected(segment, generation, now);
                 }
-                // The only other command the world sends: a layout, on the session open now.
-                _ => {
-                    let update = &command.scalableTopicUpdate;
-                    assert_eq!((update.session_id, update.error), (self.session_id, None), "{command:?}");
-                    let layout = Layout::from_dag(&update.dag, &self.topic).unwrap();
-                    self.consumer.on_layout(Rc::new(layout), now);
+                Type::SCALABLE_TOPIC_SUBSCRIBE_RESPONSE => {
+                    let response = &command.scalableTopicSubscribeResponse;
+                    let (generation, consumer_id) =
+                        self.registering.remove(&response.request_id).expect("an answer to a registration");
+                    match response.error {
+                        Some(error) => {
+                            let message = response.message.clone().unwrap_or_default();
+                            consumer.on_register_failed(generation, RegisterError::Server { error, message }, now);
+                        }
+                        None => {
+                            self.session = Some((generation, consumer_id));
+                            consumer.on_registered(generation, &response.assignment, now);
+                        }
+                    }
                 }
+                Type::SCALABLE_TOPIC_ASSIGNMENT_UPDATE => {
+                    let update = &command.scalableTopicAssignmentUpdate;
+                    let (generation, consumer_id) = self.session.expect("a registration");
+                    assert_eq!(update.consumer_id, consumer_id, "an update for another registration");
+                    consumer.on_assignment(generation, &update.assignment, now);
+                }
+                _ => others.push(command),
             }
         }
+        others
     }
 
-    fn write(&mut self, command: &BaseCommand) {
-        let mut buf = BytesMut::new();
-        encode_command(command, &mut buf).unwrap();
-        self.world.input(self.conn, &buf);
+    /// The connection closed, and the driver moved to `conn`: what was registered, subscribing or asked on the old one
+    /// is gone with it, a reader being closed and the registration included.
+    fn lost(&mut self, conn: ConnId, consumer: &mut CheckpointConsumer, now: Instant) {
+        self.conn = conn;
+        self.closing.clear();
+        for (_, (segment, generation)) in std::mem::take(&mut self.registered) {
+            consumer.on_disconnected(segment, generation, now);
+        }
+        for (_, (segment, generation, _)) in std::mem::take(&mut self.subscribing) {
+            let lost = RegisterError::Unavailable("disconnected".into());
+            consumer.on_subscribe_failed(segment, generation, lost, now);
+        }
+        for (_, (segment, generation)) in std::mem::take(&mut self.asking) {
+            consumer.on_last_message_id_failed(segment, generation, now);
+        }
+        for (_, (generation, _)) in std::mem::take(&mut self.registering) {
+            consumer.on_register_failed(generation, RegisterError::Unavailable("disconnected".into()), now);
+        }
+        if let Some((generation, _)) = self.session.take() {
+            consumer.on_session_lost(generation, now);
+        }
+        for (_, generation) in std::mem::take(&mut self.unregistering) {
+            consumer.on_unregistered(generation);
+        }
     }
+}
+
+fn handshake(world: &mut World, conn: ConnId) {
+    let connect = CommandConnect { client_version: "testkit".into(), protocol_version: Some(21), ..Default::default() };
+    write(world, conn, &BaseCommand { r#type: Type::CONNECT.into(), connect: connect.into(), ..Default::default() });
+    let _connected = world.output(conn);
+}
+
+fn write(world: &mut World, conn: ConnId, command: &BaseCommand) {
+    let mut buf = BytesMut::new();
+    encode_command(command, &mut buf).unwrap();
+    world.input(conn, &buf);
 }
 
 /// The messages' values, as text.
