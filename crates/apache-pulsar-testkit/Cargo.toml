@@ -29,7 +29,7 @@ publish = false
 workspace = true
 
 [dependencies]
-apache-pulsar-protocol.workspace = true
+apache-pulsar-protocol = { workspace = true, features = ["lz4", "zlib", "snappy", "zstd"] }
 buffa.workspace = true
 bytes.workspace = true
 

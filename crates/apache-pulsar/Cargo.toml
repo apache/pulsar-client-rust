@@ -51,6 +51,15 @@ ring = "0.17"
 serde_json = "1"
 testcontainers = { version = "0.28", features = ["blocking", "watchdog"] }
 
+# The compression codecs, each behind a feature, all on by default (docs/3-protocol.md §6). ZSTD binds the C
+# `libzstd`, so building it needs a C compiler.
+[features]
+default = ["lz4", "zlib", "snappy", "zstd"]
+lz4 = ["apache-pulsar-protocol/lz4"]
+zlib = ["apache-pulsar-protocol/zlib"]
+snappy = ["apache-pulsar-protocol/snappy"]
+zstd = ["apache-pulsar-protocol/zstd"]
+
 # Against a broker and a proxy in Docker. Not run by `cargo test`: `cargo test -p apache-pulsar --test integration`.
 [[test]]
 name = "integration"

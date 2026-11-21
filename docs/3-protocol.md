@@ -129,12 +129,19 @@ connection to frame.
 
 | Codec | Crate | Notes |
 |---|---|---|
-| LZ4 | `lz4_flex` | Pure Rust. |
-| ZLIB | `flate2` with `miniz_oxide` | Pure Rust. Java flushes its stream and never finishes it, so it has no final block or checksum: decode the recorded size and no further, as Java's `Inflater` does ([spec gap 22](../DESIGN.md#spec-gaps-to-raise-upstream)). |
-| Snappy | `snap` | Pure Rust. |
-| ZSTD | `zstd` | Binds the C `libzstd`. There is no mature pure-Rust encoder; `ruzstd` only decodes well. |
+| LZ4 | `lz4_flex` | Pure Rust. A block without a frame, as Java's. |
+| ZLIB | `flate2` with `miniz_oxide` | Pure Rust. Java flushes its stream and never finishes it, so it has no final block or checksum: decode the recorded size and no further, as Java's `Inflater` does ([spec gap 22](../DESIGN.md#spec-gaps-to-raise-upstream)). The producer writes a finished, standard stream, at the default level, as the C++ and Go clients do: the Java, C++ and Go readers stop at the recorded size, so they read it ([J15](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). |
+| Snappy | `snap` | Pure Rust. A block without a frame, as Java's. |
+| ZSTD | `zstd` | Binds the C `libzstd`. There is no mature pure-Rust encoder; `ruzstd` only decodes well. A standard frame, at level 3, as Java's. |
 
-Each codec sits behind a feature, all on by default. ZSTD binds the C `libzstd`, so building needs a C compiler.
+A producer compresses each entry's payload whole: a batch with every message's own metadata
+([5](5-segment-engine.md) §2). The metadata records the codec and the uncompressed size, which a consumer
+decompresses to and checks.
+
+Each codec sits behind a feature of `apache-pulsar-protocol`, all on by default, and `apache-pulsar` forwards them:
+`lz4`, `zlib`, `snappy` and `zstd`. ZSTD binds the C `libzstd`, so building it needs a C compiler. A producer
+configured with a codec its build leaves out fails `create` with `InvalidConfiguration`, and a consumer leaves an entry
+compressed with one for a consumer that can read it.
 
 ## 7. Open questions
 

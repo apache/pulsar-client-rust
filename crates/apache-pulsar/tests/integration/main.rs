@@ -22,6 +22,7 @@
 //! last lines of their logs are printed. What the Rust producer stored is read back with the Java client, and what
 //! the Java client stored is read with the Rust consumer, both Java clients run in the broker container.
 
+mod bridge;
 mod env;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,8 +30,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apache_pulsar::{
-    Checkpoint, ClientBuilder, ErrorKind, Local, Message, ProducerAccessMode, Schema, SubscriptionInitialPosition,
-    TlsAuthentication, Token, local,
+    Checkpoint, ClientBuilder, CompressionPolicy, CompressionType, ErrorKind, Local, Message, ProducerAccessMode,
+    Schema, SubscriptionInitialPosition, TlsAuthentication, Token, local,
 };
 use apache_pulsar_protocol::hash::KeyHash;
 use env::Env;
@@ -55,6 +56,8 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("a_queue_consumer_reads_and_acknowledges_every_segment", a_queue_consumer_reads_and_acknowledges_every_segment),
     ("a_queue_consumer_reads_what_java_produced", a_queue_consumer_reads_what_java_produced),
     ("a_queue_consumer_reads_compressed_java_batches", a_queue_consumer_reads_compressed_java_batches),
+    ("a_payload_reads_back_with_each_codec", a_payload_reads_back_with_each_codec),
+    ("a_java_consumer_reads_rust_compressed_batches", a_java_consumer_reads_rust_compressed_batches),
     ("a_split_during_consumption_loses_no_message", a_split_during_consumption_loses_no_message),
     ("a_latest_consumer_gets_what_the_children_stored_first", a_latest_consumer_gets_what_the_children_stored_first),
     ("queue_consumers_share_a_subscription", queue_consumers_share_a_subscription),
@@ -91,14 +94,19 @@ fn main() {
     let args = Arguments::from_args();
     // Listing the tests needs no environment.
     let env = (!args.list).then(|| Arc::new(Env::start()));
+    let ignored = bridge::IGNORED.iter().map(|test| (test, true));
     let trials = TESTS
         .iter()
-        .map(|&(name, test)| {
+        .chain(bridge::TESTS)
+        .map(|test| (test, false))
+        .chain(ignored)
+        .map(|(&(name, test), ignored)| {
             let env = env.clone();
-            Trial::test(name, move || {
+            let trial = Trial::test(name, move || {
                 test(env.as_deref().expect("the environment is started unless listing"));
                 Ok(())
-            })
+            });
+            trial.with_ignored_flag(ignored)
         })
         .collect();
     let conclusion = libtest_mimic::run(&args, trials);
@@ -536,6 +544,66 @@ fn a_queue_consumer_reads_compressed_java_batches(env: &Env) {
     }
 }
 
+/// Java's `V5ProducerCompressionTest`: a payload compressed with each codec, or with no policy set, reads back as sent
+/// through a Queue consumer.
+fn a_payload_reads_back_with_each_codec(env: &Env) {
+    let payload = "x".repeat(4096);
+    let of = CompressionPolicy::of;
+    let policies = [
+        Some(CompressionPolicy::disabled()),
+        Some(of(CompressionType::Lz4)),
+        Some(of(CompressionType::Zlib)),
+        Some(of(CompressionType::Zstd)),
+        Some(of(CompressionType::Snappy)),
+        None,
+    ];
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        for policy in policies {
+            let topic = format!("topic://public/default/{}", unique("compression"));
+            let mut builder = client.new_producer(Schema::string()).topic(&topic);
+            if let Some(policy) = policy {
+                builder = builder.compression_policy(policy);
+            }
+            let producer = builder.create().await.unwrap();
+            let consumer =
+                queue_consumer(&client, Schema::string(), &topic, SubscriptionInitialPosition::Earliest).await;
+            producer.new_message().value(payload.clone()).send().await.unwrap();
+            let message = consumer.receive_timeout(Duration::from_secs(5)).await.unwrap();
+            let message = message.unwrap_or_else(|| panic!("{policy:?}: nothing within 5 s"));
+            assert_eq!(message.value().unwrap(), payload, "{policy:?}");
+            consumer.acknowledge(message.id()).await.unwrap();
+        }
+        client.close().await.unwrap();
+    });
+}
+
+/// A Java consumer reads what a Rust producer stored in batches compressed with each codec, and the broker stored
+/// far fewer bytes than the messages hold.
+fn a_java_consumer_reads_rust_compressed_batches(env: &Env) {
+    for codec in [CompressionType::Lz4, CompressionType::Zlib, CompressionType::Zstd, CompressionType::Snappy] {
+        let name = unique(&format!("rust-{codec:?}").to_lowercase());
+        let topic = format!("topic://public/default/{name}");
+        let sent: Vec<String> = (0..100).map(|i| format!("{i:03}-{}", "x".repeat(1024))).collect();
+        run(async {
+            let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+            let policy = CompressionPolicy::of(codec);
+            let producer =
+                client.new_producer(Schema::string()).topic(&topic).compression_policy(policy).create().await.unwrap();
+            let sends = sent.iter().map(|value| producer.new_message().key(&value[..2]).value(value.clone()).send());
+            for result in futures_util::future::join_all(sends).await {
+                result.unwrap();
+            }
+            client.close().await.unwrap();
+        });
+        let mut received: Vec<String> = env.consume(&topic, sent.len()).into_iter().map(|m| m.value).collect();
+        received.sort();
+        assert_eq!(received, sent, "{codec:?}");
+        let stored: u64 = segment_stats(env, &name).iter().map(|s| s["storageSize"].as_u64().unwrap()).sum();
+        assert!(stored < 100 * 1024 / 4, "{codec:?}: {stored} bytes stored for 100 KiB of messages");
+    }
+}
+
 /// Java's `V5SegmentSplitTest`: a split while the producer sends and the consumer receives, and every message
 /// received once.
 fn a_split_during_consumption_loses_no_message(env: &Env) {
@@ -870,6 +938,9 @@ fn stream_consumers_share_batched_entries_by_bucket(env: &Env) {
         assert!(ids.iter().any(|id| !id.ends_with(":0")), "no entry of several messages");
         let (from_alice, from_bob) = futures_util::join!(stream_all(&alice, 320), stream_all(&bob, 320));
         assert!(!from_alice.is_empty() && !from_bob.is_empty(), "alice {}, bob {}", from_alice.len(), from_bob.len());
+        if from_alice.len() + from_bob.len() != 320 {
+            eprintln!("the subscription on the segment: {:#}", segment_stats(env, &name)[0]["subscriptions"][SUB]);
+        }
         assert_eq!(from_alice.len() + from_bob.len(), 320);
         let keys = |messages: &[Message<String>]| -> BTreeMap<String, Vec<String>> {
             let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -890,13 +961,18 @@ fn stream_consumers_share_batched_entries_by_bucket(env: &Env) {
     assert_eq!(stream_backlog(env, &name), 0);
 }
 
-/// Waits until `members` consumers share the one segment of scalable topic `public/default/<name>`, `Key_Shared`.
-async fn wait_for_shared_segment(env: &Env, name: &str, members: usize) {
+/// The stats of each segment of scalable topic `public/default/<name>`, as `pulsar-admin` gives a regular topic's.
+fn segment_stats(env: &Env, name: &str) -> Vec<serde_json::Value> {
     let topic = stats(env, &["scalable-topics", "stats", &format!("public/default/{name}")]);
     let segments = topic["layout"]["segments"].as_object().expect("the layout's segments");
-    let segment = segments.values().next().and_then(|s| s["name"].as_str()).expect("a segment").to_string();
+    let names = segments.values().map(|s| s["name"].as_str().expect("a segment's name"));
+    names.map(|segment| stats(env, &["scalable-topics", "segment-stats", segment])).collect()
+}
+
+/// Waits until `members` consumers share the one segment of scalable topic `public/default/<name>`, `Key_Shared`.
+async fn wait_for_shared_segment(env: &Env, name: &str, members: usize) {
     let shared = || {
-        let subscription = &stats(env, &["scalable-topics", "segment-stats", &segment])["subscriptions"][SUB];
+        let subscription = &segment_stats(env, name)[0]["subscriptions"][SUB];
         subscription["type"] == "Key_Shared" && subscription["consumers"].as_array().map_or(0, Vec::len) == members
     };
     wait_for(shared, "the members share the segment").await;

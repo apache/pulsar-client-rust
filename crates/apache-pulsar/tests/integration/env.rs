@@ -126,10 +126,67 @@ impl Env {
 
     /// Runs `pulsar-admin` in the broker container, as the admin, and returns what it printed.
     pub fn admin(&self, args: &[&str]) -> String {
+        self.try_admin(args).unwrap_or_else(|error| panic!("pulsar-admin {args:?} failed:\n{error}"))
+    }
+
+    /// Runs `pulsar-admin` as [`Env::admin`] does, and returns what it printed, or, if it failed, what it printed on
+    /// its error output.
+    pub fn try_admin(&self, args: &[&str]) -> Result<String, String> {
         let mut command = vec!["bin/pulsar-admin", "--admin-url", "http://localhost:8080"];
         command.extend(TOKEN_AUTH);
         command.extend(args);
-        self.exec(&command)
+        let (code, stdout, stderr) = self.run(&command);
+        if code == Some(0) { Ok(stdout) } else { Err(stderr) }
+    }
+
+    /// Starts a Java v4 consumer of `topic` on `subscription`, of type `kind` (`Exclusive`, `Shared`, …), from the
+    /// earliest message, in the broker container: a `pulsar-client consume` that acknowledges each message it prints,
+    /// and runs until [`Env::stop`].
+    pub fn v4_consumer(&self, topic: &str, subscription: &str, kind: &str) -> Background {
+        let mut command = vec!["bin/pulsar-client", "--url", "pulsar://localhost:6650"];
+        command.extend(TOKEN_AUTH);
+        command.extend(["consume", "-s", subscription, "-t", kind, "-p", "Earliest", "-n", "0", topic]);
+        self.spawn(&command)
+    }
+
+    /// Starts a Java v4 producer of `topic` in the broker container: a `pulsar-perf produce` of ten messages a second
+    /// that runs until [`Env::stop`].
+    pub fn v4_producer(&self, topic: &str) -> Background {
+        let mut command = vec!["bin/pulsar-perf", "produce", "-u", "pulsar://localhost:6650"];
+        command.extend(TOKEN_AUTH);
+        command.extend(["-r", "10", "-m", "0", topic]);
+        self.spawn(&command)
+    }
+
+    /// Stops a Java consumer started in the background, and returns the messages it printed.
+    pub fn stop(&self, background: Background) -> Vec<Consumed> {
+        self.stop_output(background).lines().filter_map(Consumed::parse).collect()
+    }
+
+    /// What a Java client started in the background has printed so far.
+    pub fn output(&self, background: &Background) -> String {
+        self.exec(&["cat", &background.log])
+    }
+
+    /// Stops a Java client started in the background, and returns all it printed.
+    pub fn stop_output(&self, background: Background) -> String {
+        let Background { pid, log } = background;
+        // The broker is the container's first process and reaps no child: a client that exited stays a zombie.
+        let state = format!("awk '{{print $3}}' /proc/{pid}/stat 2>/dev/null");
+        let stop = format!(
+            "kill {pid}; for _ in $(seq 100); do s=$({state}); [ -z \"$s\" ] || [ \"$s\" = Z ] && break; sleep 0.1; \
+             done; cat {log}"
+        );
+        self.exec(&["bash", "-c", &stop])
+    }
+
+    /// Runs `command` in the background in the broker container, its output going to a file of its own.
+    fn spawn(&self, command: &[&str]) -> Background {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let log = format!("/tmp/background-{}.log", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let quoted: Vec<String> = command.iter().map(|arg| format!("'{arg}'")).collect();
+        let start = format!("nohup {} > {log} 2>&1 & echo $!", quoted.join(" "));
+        Background { pid: self.exec(&["bash", "-c", &start]).trim().to_string(), log }
     }
 
     /// Reads `count` messages of `topic` from the beginning with the Java client in the broker container (its V5
@@ -227,13 +284,19 @@ impl Env {
     }
 
     fn exec(&self, command: &[&str]) -> String {
+        let (code, stdout, stderr) = self.run(command);
+        assert_eq!(code, Some(0), "{command:?} failed:\n{stdout}\n{stderr}");
+        stdout
+    }
+
+    /// Runs `command` in the broker container, and returns its exit code, and what it printed on its output and on its
+    /// error output.
+    fn run(&self, command: &[&str]) -> (Option<i64>, String, String) {
         let exec = ExecCommand::new(command.iter().copied()).with_cmd_ready_condition(CmdWaitFor::exit());
         let mut result = self.broker.exec(exec).unwrap_or_else(|e| panic!("{command:?}: {e}"));
         let stdout = String::from_utf8_lossy(&result.stdout_to_vec().unwrap()).into_owned();
         let stderr = String::from_utf8_lossy(&result.stderr_to_vec().unwrap()).into_owned();
-        let code = result.exit_code().unwrap();
-        assert_eq!(code, Some(0), "{command:?} failed:\n{stdout}\n{stderr}");
-        stdout
+        (result.exit_code().unwrap(), stdout, stderr)
     }
 
     /// Prints the last lines of both containers' logs, for a failed run.
@@ -257,6 +320,13 @@ const TOKEN_AUTH: [&str; 4] = [
     "--auth-params",
     "file:///it/admin.token",
 ];
+
+/// A Java client running in the background in the broker container: its process id there, and its output's file.
+#[must_use = "stop it with `Env::stop`"]
+pub struct Background {
+    pid: String,
+    log: String,
+}
 
 /// A message as `pulsar-client consume` printed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
