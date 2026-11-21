@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apache_pulsar::{
-    ClientBuilder, ErrorKind, Local, Message, ProducerAccessMode, Schema, SubscriptionInitialPosition,
+    Checkpoint, ClientBuilder, ErrorKind, Local, Message, ProducerAccessMode, Schema, SubscriptionInitialPosition,
     TlsAuthentication, Token, local,
 };
 use apache_pulsar_protocol::hash::KeyHash;
@@ -59,6 +59,13 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("queue_consumers_share_a_subscription", queue_consumers_share_a_subscription),
     ("a_negative_ack_brings_a_message_back", a_negative_ack_brings_a_message_back),
     ("batch_index_acks_settle_whole_batches", batch_index_acks_settle_whole_batches),
+    ("a_checkpoint_consumer_resumes_across_a_split", a_checkpoint_consumer_resumes_across_a_split),
+    ("a_latest_checkpoint_consumer_reads_a_later_split", a_latest_checkpoint_consumer_reads_a_later_split),
+    ("a_checkpoint_consumer_skips_a_deleted_segment", a_checkpoint_consumer_skips_a_deleted_segment),
+    (
+        "a_checkpoint_round_trips_with_java_across_layout_changes",
+        a_checkpoint_round_trips_with_java_across_layout_changes,
+    ),
 ];
 
 fn main() {
@@ -643,4 +650,168 @@ fn batch_index_acks_settle_whole_batches(env: &Env) {
     });
     let backlog = &stats(env, &["topics", "stats", &topic])["subscriptions"][SUB]["msgBacklog"];
     assert_eq!(backlog.as_u64(), Some(0), "{backlog}");
+}
+
+/// Publishes `count` messages `<prefix>-<i>`, with keys `k0`..`k4` in turn, and records them per key.
+async fn publish_keyed(
+    producer: &local::Producer<String>,
+    prefix: &str,
+    count: usize,
+    sent: &mut BTreeMap<String, Vec<String>>,
+) {
+    for i in 0..count {
+        let (key, value) = (format!("k{}", i % 5), format!("{prefix}-{i}"));
+        producer.new_message().key(key.clone()).value(value.clone()).send().await.unwrap();
+        sent.entry(key).or_default().push(value);
+    }
+}
+
+/// Receives `count` messages, each within the time a split or a merge takes to show.
+async fn read<T: 'static>(consumer: &local::CheckpointConsumer<T>, count: usize) -> Vec<Message<T>> {
+    let mut got = Vec::new();
+    while got.len() < count {
+        match consumer.receive_timeout(Duration::from_secs(30)).await.unwrap() {
+            Some(message) => got.push(message),
+            None => panic!("received {} of {count} messages", got.len()),
+        }
+    }
+    got
+}
+
+/// The messages' values, per key, in the order received.
+fn by_key(messages: impl IntoIterator<Item = (String, String)>) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, value) in messages {
+        out.entry(key).or_default().push(value);
+    }
+    out
+}
+
+fn keyed(messages: &[Message<String>]) -> Vec<(String, String)> {
+    messages.iter().map(|m| (m.key().unwrap().to_string(), m.value().unwrap())).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+}
+
+/// Java's `V5CheckpointConsumerOrderingTest.testPerKeyOrderResumingCheckpointAcrossSplit`, on the broker: a consumer
+/// restored from a checkpoint taken before a split reads the rest of the sealed parent, then its children, every key
+/// in order.
+fn a_checkpoint_consumer_resumes_across_a_split(env: &Env) {
+    let name = unique("checkpoint-split");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &format!("public/default/{name}")]);
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut sent = BTreeMap::new();
+        publish_keyed(&producer, "pre", 20, &mut sent).await;
+        let first =
+            client.new_checkpoint_consumer(Schema::string()).topic(&topic).start_position(Checkpoint::earliest());
+        let first = first.create().await.unwrap();
+        let mut received = keyed(&read(&first, 10).await);
+        let checkpoint = first.checkpoint().await.unwrap();
+        first.close().await.unwrap();
+        env.admin(&["scalable-topics", "split-segment", "-s", "0", &format!("public/default/{name}")]);
+        publish_keyed(&producer, "post", 20, &mut sent).await;
+        let resumed = client.new_checkpoint_consumer(Schema::string()).topic(&topic).start_position(checkpoint);
+        let resumed = resumed.create().await.unwrap();
+        received.extend(keyed(&read(&resumed, 30).await));
+        assert_eq!(by_key(received), sent);
+        assert!(resumed.receive_timeout(Duration::from_millis(500)).await.unwrap().is_none());
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `V5CheckpointConsumerLatestStartTest`, on the broker: a consumer at the latest position reads the children
+/// of a later split from their start.
+fn a_latest_checkpoint_consumer_reads_a_later_split(env: &Env) {
+    let name = unique("checkpoint-latest");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &format!("public/default/{name}")]);
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        producer.new_message().key("k").value("history".to_string()).send().await.unwrap();
+        let consumer = client.new_checkpoint_consumer(Schema::string()).topic(&topic).create().await.unwrap();
+        producer.new_message().key("k").value("before".to_string()).send().await.unwrap();
+        assert_eq!(read(&consumer, 1).await[0].value().unwrap(), "before");
+        env.admin(&["scalable-topics", "split-segment", "-s", "0", &format!("public/default/{name}")]);
+        let mut sent = BTreeMap::new();
+        publish_keyed(&producer, "post-split", 20, &mut sent).await;
+        assert_eq!(by_key(keyed(&read(&consumer, 20).await)), sent);
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `V5CheckpointConsumerSkipDeletedSegmentTest`, on the broker: a segment whose topic is deleted while the
+/// layout still has it is skipped, and the others are read.
+fn a_checkpoint_consumer_skips_a_deleted_segment(env: &Env) {
+    let name = unique("checkpoint-deleted");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "2", &format!("public/default/{name}")]);
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut kept = Vec::new();
+        for i in 0..20 {
+            let key = format!("key-{i}");
+            let value = format!("v-{i}");
+            let id = producer.new_message().key(key).value(value.clone()).send().await.unwrap();
+            if id.to_string().starts_with("1:") {
+                kept.push(value);
+            }
+        }
+        assert!(!kept.is_empty() && kept.len() < 20, "both segments need messages: {kept:?}");
+        env.delete_segment(&format!("segment://public/default/{name}/0000-7fff-0"));
+        let consumer = client.new_checkpoint_consumer(Schema::string()).topic(&topic);
+        let consumer = consumer.start_position(Checkpoint::earliest()).create().await.unwrap();
+        let got = read(&consumer, kept.len()).await;
+        kept.sort();
+        assert_eq!(sorted_values(&got), kept);
+        assert!(consumer.receive_timeout(Duration::from_millis(500)).await.unwrap().is_none());
+        client.close().await.unwrap();
+    });
+}
+
+/// A checkpoint round-trips with the Java client across layout changes (*conformance* §5): Java reads part of a
+/// topic and takes a checkpoint; a split; Rust restores Java's checkpoint, reads part of what is left and takes its own;
+/// a merge; Java restores Rust's checkpoint and reads the rest. Between them they read every message once, every key
+/// in order.
+fn a_checkpoint_round_trips_with_java_across_layout_changes(env: &Env) {
+    let name = unique("checkpoint-java");
+    let topic = format!("topic://public/default/{name}");
+    let path = format!("public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &path]);
+    let rt = compio::runtime::Runtime::new().unwrap();
+    let (client, producer) = rt.block_on(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        (client, producer)
+    });
+    let mut sent = BTreeMap::new();
+    rt.block_on(publish_keyed(&producer, "pre", 20, &mut sent));
+    let (mut received, java_checkpoint) = env.java_checkpoint_read(&topic, "earliest", 8);
+    env.admin(&["scalable-topics", "split-segment", "-s", "0", &path]);
+    rt.block_on(publish_keyed(&producer, "post", 20, &mut sent));
+    let rust_checkpoint = rt.block_on(async {
+        let start = Checkpoint::from_bytes(&unhex(&java_checkpoint)).unwrap();
+        let consumer = client.new_checkpoint_consumer(Schema::string()).topic(&topic).start_position(start);
+        let consumer = consumer.create().await.unwrap();
+        received.extend(keyed(&read(&consumer, 20).await));
+        let checkpoint = consumer.checkpoint().await.unwrap();
+        consumer.close().await.unwrap();
+        checkpoint
+    });
+    env.admin(&["scalable-topics", "merge-segments", "--segment-id-1", "1", "--segment-id-2", "2", &path]);
+    rt.block_on(publish_keyed(&producer, "after", 10, &mut sent));
+    let (rest, _) = env.java_checkpoint_read(&topic, &hex(&rust_checkpoint.to_bytes()), 22);
+    received.extend(rest);
+    assert_eq!(by_key(received), sent);
+    rt.block_on(client.close()).unwrap();
 }

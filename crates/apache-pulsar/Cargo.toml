@@ -43,6 +43,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 apache-pulsar-testkit = { path = "../apache-pulsar-testkit" }
+base64 = "0.22"
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 libtest-mimic = "0.8"
 rcgen = "0.14"

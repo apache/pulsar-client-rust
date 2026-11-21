@@ -23,7 +23,9 @@ A **layout watch** holds a topic's current `ScalableTopicDAG` and pushes changes
   only to find the controller, then close it, as Java does: their segments come from the assignment (§5).
 - **Opening:** connect as described in [4](4-connections.md) §3, check `supports_scalable_topics`, and send
   `CommandScalableTopicLookup`. If the first `CommandScalableTopicUpdate` carries an `error`, the create or
-  subscribe that opened the watch fails with the mapped category, `NotFound` included (*error-model* §2).
+  subscribe that opened the watch fails with the mapped category, `NotFound` included (*error-model* §2). An
+  error in a later update is logged and the session kept: a new one opens when the connection closes. Java
+  drops the session instead ([spec gap 16](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - **Updates:** a layout is applied only if its epoch is greater than the last applied (*client-behavior* §1,
   [spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)). Each applied layout reaches every user of the watch
   as a new immutable snapshot.
@@ -89,10 +91,12 @@ deterministically on the simulated broker and with a split during traffic on a r
 ### 3.4 Flush and close
 
 *Flush* waits for every message sent before the call, on every segment, and fails if one of them failed, as
-Java's does. *Close* fails the sends still waiting (parked, held, or not written yet) with `AlreadyClosed`,
-closes every per-segment producer, which waits for what the brokers already have, releases its layout watch, and
-can be called again safely (*client-api* §3.3). It follows Java: it does not flush, and a registration still
-waiting for exclusive access doesn't hold it up. An application that wants everything published flushes first.
+Java's does. On a closed producer it fails with `AlreadyClosed` (*client-api* §2), where Java's succeeds
+([J2](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). *Close* fails the sends still waiting
+(parked, held, or not written yet) with `AlreadyClosed`, closes every per-segment producer, which waits for what
+the brokers already have, releases its layout watch, and can be called again safely (*client-api* §3.3). It
+follows Java: it does not flush, and a registration still waiting for exclusive access doesn't hold it up. An
+application that wants everything published flushes first.
 
 ## 4. Queue consumer
 
@@ -102,14 +106,15 @@ waiting for exclusive access doesn't hold it up. An application that wants every
   subscribed at the earliest position: it is the child of a split or a merge, created after the subscription,
   and the broker creates the children with the subscriptions registered on the scalable topic, which a Queue
   consumer's subscribe doesn't register. Java subscribes it at the initial position, so a consumer at `Latest`
-  (the default) loses what a producer stored in the children before the consumer heard of the layout. A consumer
-  created on a layout that is already stale can likewise see a few messages from before it subscribed.
+  (the default) loses what a producer stored in the children before the consumer heard of the layout
+  ([spec gap 20](../DESIGN.md#spec-gaps-to-raise-upstream)). A consumer created on a layout that is already stale
+  can likewise see a few messages from before it subscribed.
 
   This narrows the hole without closing it. Until the consumer subscribes to a child, no subscription holds the
   child's ledgers, so a ledger rolled over and trimmed meanwhile is lost, though a rollover takes at least 10 minutes
   by default. And a subscription with no consumer running during the split is created on the children at the
   initial position when one comes back. Only the broker can close it, by giving the children their parents'
-  subscriptions when it creates them.
+  subscriptions when it creates them ([J14](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)).
 - **Subscribe is all or nothing**, as in Java: it completes once every segment is subscribed, those of layouts
   that come meanwhile included, and fails, closing every segment's consumer, if one can't be.
 - **Retries.** A segment whose consumer gives up, because a subscribe failed for good, is subscribed again after
@@ -125,8 +130,14 @@ waiting for exclusive access doesn't hold it up. An application that wants every
   the end of the topic (`CommandReachedEndOfTopic`, which Java sees as `TopicTerminatedException`), and every
   message this consumer received from the segment has been acknowledged. Requiring the acks as well keeps a late
   ack or negative ack from being lost after the close. Java means to close at the end of the topic, but that code
-  never runs, so its segment consumers stay subscribed until the segment leaves the layout. A segment that leaves
-  the layout before it is drained is detached anyway.
+  never runs, so its segment consumers stay subscribed until the segment leaves the layout
+  ([spec gap 19](../DESIGN.md#spec-gaps-to-raise-upstream)). A segment that leaves the layout before it is
+  drained is detached anyway.
+- **Garbage collection.** The controller doesn't know a Queue consumer's subscription: nothing registers it on
+  the scalable topic. Once a sealed segment is past retention, the controller checks only the registered
+  subscriptions' backlog before it deletes the segment, so it can delete messages a Queue subscription hasn't
+  acknowledged. Only the broker can fix this, by checking every subscription on the segment
+  ([spec gap 21](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - Dead-letter (later): [5](5-segment-engine.md) §5.
 
 ## 5. Stream consumer
@@ -222,22 +233,54 @@ full (Java's format, [7](7-api.md) §7).
 
 ### 6.1 Ungrouped
 
-- A layout watch, and one reader per segment, starting at the configured start position (*client-behavior*
-  §5, *wire-protocol* §6.3).
-- **Parents first:** a segment's reader starts only once every parent that is still in the layout has been
-  read to its end. The parents hold the older messages of the segment's keys, so this keeps per-key order
-  across a split or a merge. The spec doesn't state it; the Java client does it from the layout's lineage
+- A layout watch, and one reader per segment, active or sealed, in step with each new layout (*client-behavior*
+  §5, *wire-protocol* §6.3). A reader is a segment consumer ([5](5-segment-engine.md) §4) on an Exclusive
+  subscription that isn't durable, under a random `reader-…` name, as Java's v4 reader has. A segment that a layout
+  drops leaves the checkpoint, and its reader is closed.
+- **Where a reader starts.** Each subscribe names the reader's position: where it starts, then the last message
+  taken from it, so a reconnect resumes there. The broker sends the entry of that position again, and the reader
+  leaves out what it read, as Java's v4 consumer does: a message of a batch by its index, a message not in a batch
+  as its whole entry ([spec gap 25](../DESIGN.md#spec-gaps-to-raise-upstream)).
+- **Parents first:** a segment's messages are delivered only once every parent that is still in the layout has
+  been read to its end, or is gone. The parents hold the older messages of the segment's keys, so this keeps
+  per-key order across a split or a merge. Its reader subscribes at once and buffers meanwhile, as Java's does. The
+  spec doesn't state it; the Java client does it from the layout's lineage
   ([spec gap 7](../DESIGN.md#spec-gaps-to-raise-upstream)).
-- `checkpoint()` snapshots, for each segment, the position of the last message handed to the application, not
-  of anything prefetched. Being on one loop makes the snapshot atomic without locks (*client-behavior* §7).
+- **The end of a sealed segment.** Once a layout says a segment is sealed, the consumer asks for its last message
+  id (`CommandGetLastMessageId`), which no longer changes, since the controller terminates a segment before it
+  commits the layout that seals it. The segment is read to its end once its reader took that message. Then its
+  reader is closed, and its position stays in the checkpoint, so that a restore doesn't read it again. The broker
+  sends `CommandReachedEndOfTopic` to a reader only once the reader has acknowledged everything, and these readers
+  don't acknowledge: it comes only to a reader that starts at the end
+  ([spec gap 23](../DESIGN.md#spec-gaps-to-raise-upstream)). Java asks for the last message id too.
+- **`checkpoint()`** snapshots, for each segment, the position of the last message a receive returned, not of
+  anything prefetched. A receive dropped with messages gives them back, and the checkpoint goes back to before
+  them. Being on one loop makes the snapshot atomic without locks (*client-behavior* §7). Segments nothing was
+  received from are in it too, at their start: a restore would otherwise read them from their beginning.
 - **Restore:** each segment in the checkpoint resumes right after its saved position. Segments created after
-  the checkpoint start at their beginning, behind the parents-first rule. A segment whose backing topic has
-  since been deleted (retention) is skipped.
+  the checkpoint start at their beginning, behind the parents-first rule.
+- **A segment that is gone**, its topic deleted while the layout still has it (by the controller's garbage
+  collection, past retention), is skipped: its subscribe fails with `TopicNotFound`. It leaves the checkpoint and
+  holds no child back ([spec gap 26](../DESIGN.md#spec-gaps-to-raise-upstream)). The controller creates a split's
+  children before it commits their layout, so a segment that isn't found was deleted.
 - **`latest`:** a `latest` start becomes "the end of each segment in the first layout". Segments that appear
-  later are then read from their beginning, like the segments missing from a restored checkpoint.
+  later are then read from their beginning, like the segments missing from a restored checkpoint. Each of those
+  readers subscribes at the latest position without permits, asks for the segment's last message id, and reads
+  after it, leaving out what the broker sends from before it. A checkpoint taken before any message then names
+  that message, not a moving latest, and restores what the consumer read
+  ([spec gap 24](../DESIGN.md#spec-gaps-to-raise-upstream)). Java asks a separate reader before it attaches the
+  real one.
+- **Create** is all or nothing, as in Java: it completes once every reader is subscribed and knows where it
+  starts, and fails, closing them all, if one can't be. A reader that gives up later is attached again after a
+  backoff shared by all segments (100 ms doubling to 30 s), or at once when a new layout comes.
+- A reader on a legacy segment carries the V5-managed property, as the Queue consumer's do, so that a migration
+  doesn't count it as a v4 client. Java's readers don't.
 
 These rules follow the Java client (`ScalableCheckpointConsumer`, `CheckpointV5.latestOf`). Ported scenarios from
-`V5CheckpointConsumerLatestStartTest` and `V5CheckpointConsumerSkipDeletedSegmentTest` check them.
+`ScalableCheckpointConsumerTest`, `ScalableCheckpointConsumerReconcileTest` and the `V5CheckpointConsumer*Test`
+classes check them on the simulated cluster (`crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`), and
+integration tests on the real broker, a checkpoint round trip with the Java client across a split and a merge
+among them.
 
 ### 6.2 Grouped
 
