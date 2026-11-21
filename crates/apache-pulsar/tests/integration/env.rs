@@ -163,6 +163,11 @@ impl Env {
         self.stop_output(background).lines().filter_map(Consumed::parse).collect()
     }
 
+    /// What a Java client started in the background has printed so far.
+    pub fn output(&self, background: &Background) -> String {
+        self.exec(&["cat", &background.log])
+    }
+
     /// Stops a Java client started in the background, and returns all it printed.
     pub fn stop_output(&self, background: Background) -> String {
         let Background { pid, log } = background;

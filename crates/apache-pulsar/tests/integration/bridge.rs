@@ -274,9 +274,9 @@ fn a_v4_client_holds_off_a_migration_unless_forced(env: &Env) {
     assert_eq!(from_v4, sent);
     let stored = messages_in(env, &topic, partitions);
     let v4_producer = env.v4_producer(&topic);
-    std::thread::sleep(Duration::from_secs(5));
-    let output = env.stop_output(v4_producer);
-    assert!(output.contains("TopicTerminated"), "the v4 producer wasn't refused:\n{output}");
+    // Refused once it is up and asks for the topic: its JVM takes a few seconds to start.
+    eventually("the v4 producer is refused", || env.output(&v4_producer).contains("TopicTerminated"));
+    env.stop_output(v4_producer);
     assert_eq!(messages_in(env, &topic, partitions), stored);
 }
 
@@ -482,8 +482,8 @@ fn v4_and_rust_clients_across_a_forced_migration(env: &Env) {
         client.close().await.unwrap();
         (legacy, rust)
     });
-    let output = env.stop_output(v4_producer);
-    assert!(output.contains("TopicTerminated"), "the v4 producer wasn't refused:\n{output}");
+    eventually("the v4 producer is refused", || env.output(&v4_producer).contains("TopicTerminated"));
+    env.stop_output(v4_producer);
     assert_eq!(messages_in(env, &topic, partitions), legacy);
     eventually("the v4 consumer reads the regular topic to its end", || {
         attached_and_drained(env, &topic, partitions, "v4")
