@@ -16,20 +16,24 @@
 // under the License.
 
 //! The migration bridge (docs/6-scalable-topics.md §8): Rust clients on regular `persistent://` topics, through the
-//! synthetic layouts the broker gives them, beside Java v4 clients, up to the broker's migration of a topic.
+//! synthetic layouts the broker gives them, beside Java v4 clients, before, while and after the broker migrates a
+//! topic to a scalable one.
 //!
 //! The v4 clients are `pulsar-client consume` and `pulsar-perf produce`, running in the broker container while the
 //! Rust clients work.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use apache_pulsar::{Checkpoint, ErrorKind, Message, Schema, SubscriptionInitialPosition};
+use apache_pulsar::{Checkpoint, ErrorKind, Message, MessageId, Schema, SubscriptionInitialPosition};
 use apache_pulsar_protocol::hash::KeyHash;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesOrdered;
 
 use super::{
-    Env, SUB, by_key, proxy_client, publish_keyed, queue_consumer, read, receive_all, run, stats, stream_all,
-    stream_consumer, unique,
+    Env, SUB, by_key, checkpoint_member, drain, keyed, proxy_client, publish_keyed, queue_consumer, read, receive_all,
+    run, sorted_values, stats, stream_all, stream_consumer, unique, wait_for,
 };
 
 pub(super) const TESTS: &[(&str, fn(&Env))] = &[
@@ -38,6 +42,10 @@ pub(super) const TESTS: &[(&str, fn(&Env))] = &[
     ("rust_clients_on_a_regular_topic_are_marked_v5_managed", rust_clients_on_a_regular_topic_are_marked_v5_managed),
     ("a_v4_client_holds_off_a_migration_unless_forced", a_v4_client_holds_off_a_migration_unless_forced),
     ("a_checkpoint_group_needs_a_migrated_topic", a_checkpoint_group_needs_a_migrated_topic),
+    ("a_producer_keeps_key_order_across_a_migration", a_producer_keeps_key_order_across_a_migration),
+    ("consumers_follow_a_migration", consumers_follow_a_migration),
+    ("a_migrated_topic_is_read_legacy_segments_first", a_migrated_topic_is_read_legacy_segments_first),
+    ("v4_and_rust_clients_across_a_forced_migration", v4_and_rust_clients_across_a_forced_migration),
 ];
 
 /// What a broker should do and 5.0.1 doesn't: run with `--ignored`.
@@ -106,7 +114,12 @@ fn eventually(what: &str, condition: impl Fn() -> bool) {
 
 /// The segment a message was read from: the first part of its id, `segment:ledger:entry:index`.
 fn segment_of<T>(message: &Message<T>) -> u64 {
-    message.id().to_string().split(':').next().unwrap().parse().unwrap()
+    segment(message.id())
+}
+
+/// The segment of a message id: the first part of `segment:ledger:entry:index`.
+fn segment(id: &MessageId) -> u64 {
+    id.to_string().split(':').next().unwrap().parse().unwrap()
 }
 
 /// The partition a v4 producer sends `key` to: on a synthetic layout, the id of the legacy segment.
@@ -295,4 +308,189 @@ fn a_stream_consumer_reads_a_regular_topic(env: &Env) {
         assert_eq!(by_key(got.iter().map(|m| (m.key().unwrap().to_string(), m.value().unwrap()))), sent);
         client.close().await.unwrap();
     });
+}
+
+/// Java's `V5MigrationEndToEndTest`: the topic migrates while a producer sends, two rounds of keys always in flight. No
+/// send fails, and a producer created afterwards on the same client sends to the new segments. A Stream consumer reads
+/// everything after the migration, every key in the order sent: the controller hands it the new segments once it has
+/// drained the legacy ones, so the order shows the producer stored each key's messages on the legacy segment first.
+fn a_producer_keeps_key_order_across_a_migration(env: &Env) {
+    for partitions in [0, 2] {
+        let (topic, path) = regular_topic(env, "migrating-producer", partitions);
+        let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+        let migrated = AtomicBool::new(false);
+        let mut sent = std::thread::scope(|scope| {
+            let (started, migrate_now) = std::sync::mpsc::channel();
+            let (migrated, path) = (&migrated, &path);
+            scope.spawn(move || {
+                // Once the first sends are in; the producer keeps sending meanwhile.
+                migrate_now.recv().unwrap();
+                env.admin(&["scalable-topics", "migrate", path]);
+                migrated.store(true, Ordering::Release);
+            });
+            run(async {
+                let client = proxy_client(env).build().await.unwrap();
+                let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+                let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut sends = FuturesOrdered::new();
+                let (mut round, mut after) = (0, 0);
+                // Ten rounds after the migration, or a bound that only a stuck migration reaches.
+                while after < 10 && round < 1500 {
+                    if round == 5 {
+                        started.send(()).unwrap();
+                    }
+                    for key in &keys {
+                        let value = format!("{key}-{round:04}");
+                        sends.push_back(producer.new_message().key(key.clone()).value(value.clone()).send());
+                        sent.entry(key.clone()).or_default().push(value);
+                    }
+                    while sends.len() > 2 * keys.len() {
+                        sends.next().await.unwrap().unwrap();
+                    }
+                    after += usize::from(migrated.load(Ordering::Acquire));
+                    round += 1;
+                    compio::time::sleep(Duration::from_millis(20)).await;
+                }
+                while let Some(result) = sends.next().await {
+                    result.unwrap();
+                }
+                assert!(migrated.load(Ordering::Acquire), "the migration did not complete");
+                let late = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+                let id = late.new_message().key("late").value("late".to_string()).send().await.unwrap();
+                assert!(segment(&id) >= u64::from(partitions.max(1)), "{partitions} partitions: late sent to {id}");
+                client.close().await.unwrap();
+                sent
+            })
+        });
+        sent.insert("late".into(), vec!["late".into()]);
+        run(async {
+            let client = proxy_client(env).build().await.unwrap();
+            let consumer = stream_consumer(&client, &topic, "reader").await;
+            let got = stream_all(&consumer, sent.values().map(Vec::len).sum()).await;
+            assert_eq!(by_key(keyed(&got)), sent, "{partitions} partitions");
+            client.close().await.unwrap();
+        });
+    }
+}
+
+/// A Queue consumer and a Checkpoint consumer attached while the topic migrates follow it: each gets every message
+/// once, from the legacy segments, then from the new ones, the Checkpoint consumer every key in order. A checkpoint
+/// taken before the migration resumes after it, and a Queue consumer created after the migration reads the whole topic.
+fn consumers_follow_a_migration(env: &Env) {
+    for partitions in [0, 2] {
+        let (topic, path) = regular_topic(env, "migrating-consumers", partitions);
+        run(async {
+            let client = proxy_client(env).build().await.unwrap();
+            let queue = queue_consumer(&client, Schema::string(), &topic, SubscriptionInitialPosition::Earliest).await;
+            let checkpoint = client.new_checkpoint_consumer(Schema::string()).topic(&topic);
+            let checkpoint = checkpoint.start_position(Checkpoint::earliest()).create().await.unwrap();
+            let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+            let mut sent = BTreeMap::new();
+            publish_keyed(&producer, "pre", 20, &mut sent).await;
+            let first = keyed(&read(&checkpoint, 10).await);
+            let resume_from = checkpoint.checkpoint().await.unwrap();
+            env.admin(&["scalable-topics", "migrate", &path]);
+            publish_keyed(&producer, "post", 20, &mut sent).await;
+            let rest = keyed(&read(&checkpoint, 30).await);
+            assert!(checkpoint.receive_timeout(Duration::from_millis(500)).await.unwrap().is_none());
+            assert_eq!(by_key(first.iter().cloned().chain(rest.iter().cloned())), sent, "{partitions} partitions");
+            let mut all: Vec<String> = sent.values().flatten().cloned().collect();
+            all.sort();
+            assert_eq!(sorted_values(&receive_all(&queue, all.len()).await), all, "{partitions} partitions");
+            let resumed = client.new_checkpoint_consumer(Schema::string()).topic(&topic).start_position(resume_from);
+            let resumed = resumed.create().await.unwrap();
+            assert_eq!(by_key(keyed(&read(&resumed, rest.len()).await)), by_key(rest), "{partitions} partitions");
+            let late = client.new_queue_consumer(Schema::string()).topic(&topic).subscription_name("late");
+            let late = late.subscription_initial_position(SubscriptionInitialPosition::Earliest);
+            let late = late.subscribe().await.unwrap();
+            assert_eq!(sorted_values(&receive_all(&late, all.len()).await), all, "{partitions} partitions");
+            client.close().await.unwrap();
+        });
+    }
+}
+
+/// Java's `testStreamConsumerReadsLegacyParentFirst` and `testCheckpointConsumerGroupReadsLegacyParent`: on a topic
+/// migrated with a backlog, a Stream consumer reads the legacy segments first, with consumers there marked as managed
+/// by a V5 client, then the new segments, every key in order. A member of a Checkpoint consumer group reads both.
+fn a_migrated_topic_is_read_legacy_segments_first(env: &Env) {
+    let partitions = 2;
+    let (topic, path) = regular_topic(env, "migrated-backlog", partitions);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut sent = BTreeMap::new();
+        publish_keyed(&producer, "pre", 20, &mut sent).await;
+        env.admin(&["scalable-topics", "migrate", &path]);
+        publish_keyed(&producer, "post", 20, &mut sent).await;
+        let stream = stream_consumer(&client, &topic, "solo").await;
+        // It holds the legacy segments until it has acknowledged what they have.
+        wait_for(|| attached(env, &topic, partitions, SUB), "the Stream consumer reads the legacy segments").await;
+        assert_all_marked(env, &topic, partitions);
+        assert_eq!(by_key(keyed(&stream_all(&stream, 40).await)), sent);
+        stream.close().await.unwrap();
+        // A member's readers stay on the segments assigned to it, the legacy ones included.
+        let member = checkpoint_member(&client, &topic, "solo").await;
+        let one_reader = |s: &serde_json::Value| client_metadata(s).len() == 1;
+        let readers = || stored_in(env, &topic, partitions).iter().all(one_reader);
+        wait_for(readers, "the group member's readers attach to the legacy segments").await;
+        assert_all_marked(env, &topic, partitions);
+        assert_eq!(drain(&member).await, sent.into_values().flatten().collect::<BTreeSet<_>>());
+        client.close().await.unwrap();
+    });
+}
+
+/// Asserts that every producer and consumer attached to the topics `topic` stores in is marked as managed by a V5
+/// client.
+fn assert_all_marked(env: &Env, topic: &str, partitions: u32) {
+    for stats in stored_in(env, topic, partitions) {
+        for metadata in client_metadata(&stats) {
+            assert_eq!(metadata["__pulsar.v5.managed"], "true", "{stats}");
+        }
+    }
+}
+
+/// v4 and Rust clients side by side through a migration, forced since v4 clients are attached. The v4 consumer reads
+/// what the regular topic stored up to the migration, and the v4 producer stores nothing after it. The Rust producer
+/// carries on into the new segments, and the Rust Queue consumer gets every message both producers stored.
+fn v4_and_rust_clients_across_a_forced_migration(env: &Env) {
+    let partitions = 2;
+    let (topic, path) = regular_topic(env, "forced", partitions);
+    let v4_consumer = env.v4_consumer(&topic, "v4", "Exclusive");
+    eventually("the v4 consumer attaches", || attached(env, &topic, partitions, "v4"));
+    let v4_producer = env.v4_producer(&topic);
+    let publishing = |s: &serde_json::Value| s["publishers"].as_array().is_some_and(|p| !p.is_empty());
+    eventually("the v4 producer attaches", || stored_in(env, &topic, partitions).iter().all(publishing));
+    let (legacy, rust) = run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let queue = queue_consumer(&client, Schema::bytes(), &topic, SubscriptionInitialPosition::Earliest).await;
+        let producer = client.new_producer(Schema::bytes()).topic(&topic).create().await.unwrap();
+        let rust: Vec<String> = (0..40).map(|i| format!("rust-{i:02}")).collect();
+        for (i, value) in rust.iter().enumerate() {
+            if i == 20 {
+                env.admin(&["scalable-topics", "migrate", "--force", &path]);
+            }
+            let message = producer.new_message().key(format!("k{i}")).value(value.clone().into_bytes());
+            let id = message.send().await.unwrap();
+            assert_eq!(segment(&id) >= u64::from(partitions), i >= 20, "{value} sent to {id}");
+        }
+        // The regular topic is terminated: what it stored is final.
+        let legacy = messages_in(env, &topic, partitions);
+        let from_queue = text(&receive_all(&queue, legacy + 20).await);
+        assert_eq!(from_queue.len(), legacy + 20);
+        let read_by_queue: BTreeSet<&String> = from_queue.iter().collect();
+        assert!(rust.iter().all(|value| read_by_queue.contains(value)));
+        client.close().await.unwrap();
+        (legacy, rust)
+    });
+    let output = env.stop_output(v4_producer);
+    assert!(output.contains("TopicTerminated"), "the v4 producer wasn't refused:\n{output}");
+    assert_eq!(messages_in(env, &topic, partitions), legacy);
+    eventually("the v4 consumer reads the regular topic to its end", || {
+        attached_and_drained(env, &topic, partitions, "v4")
+    });
+    let from_v4 = env.stop(v4_consumer);
+    assert_eq!(from_v4.len(), legacy);
+    let read_by_v4: BTreeSet<&str> = from_v4.iter().map(|m| m.value.as_str()).collect();
+    assert!(rust[..20].iter().all(|value| read_by_v4.contains(value.as_str())));
+    assert!(rust[20..].iter().all(|value| !read_by_v4.contains(value.as_str())));
 }

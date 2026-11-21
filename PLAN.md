@@ -161,6 +161,19 @@ Java consumer reads Rust's batches, and with deduplication on, a 5.0.1 broker ta
 **Checks:** the conformance checklist C1–C15 is complete, and `tests/PORTING.md` shows the Java scenarios in scope
 covered.
 
+The migration bridge's end-to-end tests run against 5.0.1, on partitioned and non-partitioned topics, with Java v4
+clients running alongside (`tests/integration/bridge.rs`):
+- **Before a migration:** v4 and Rust clients side by side, and on one Shared subscription. Every Rust producer and
+  consumer is marked as managed by a V5 client, and a v4 client holds a migration off until it is forced.
+- **During one:** a producer keeps each key's order with sends in flight, and the Queue and Checkpoint consumers
+  follow. v4 and Rust clients run through a forced migration.
+- **After one:** a Stream consumer reads the legacy segments first, every key in order, and a member of a Checkpoint
+  consumer group reads them and the new ones.
+
+The 5.0.1 broker gives a migrated topic's first layout the synthetic layout's epoch, which the client allows for
+(spec gap 29). Left to the broker: a Stream consumer or a Checkpoint consumer group can't use a topic before it
+migrates (spec gap 28, J18). An ignored test keeps what a Stream consumer should get there.
+
 ## After the first release
 
 In rough order: OAuth2 authentication, dead-letter policy, namespace subscription, transactions, end-to-end
