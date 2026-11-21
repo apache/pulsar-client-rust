@@ -178,7 +178,7 @@ impl QueueConsumer {
     /// Applies a newer layout: subscribes to the segments it adds, lets go of those it drops, and subscribes again,
     /// at once, to those whose consumers gave up.
     pub fn on_layout(&mut self, layout: Rc<Layout>, now: Instant) {
-        if layout.epoch() <= self.layout.epoch() || self.is_closed() {
+        if !layout.supersedes(&self.layout) || self.is_closed() {
             return;
         }
         self.layout = layout;

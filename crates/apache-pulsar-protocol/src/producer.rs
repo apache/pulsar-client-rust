@@ -338,7 +338,7 @@ impl Producer {
 
     /// Applies a newer layout.
     pub fn on_layout(&mut self, layout: Rc<Layout>, now: Instant) {
-        if layout.epoch() <= self.layout.epoch() || matches!(self.state, State::Closed) {
+        if !layout.supersedes(&self.layout) || matches!(self.state, State::Closed) {
             return;
         }
         let old = std::mem::replace(&mut self.layout, layout);

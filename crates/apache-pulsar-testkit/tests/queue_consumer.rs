@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A Queue consumer against the simulated cluster: every segment of the layout, in step with splits, merges and
-//! garbage collection; acks routed by segment; retries; the all-or-nothing subscribe; close. Ports the scenarios of
-//! Java's `ScalableQueueConsumerReconcileTest`, `V5QueueConsumerBasicTest`, `V5QueueConsumerMultiSegmentAckTest`,
-//! `V5SubscriptionInitialPositionTest`, `V5DAGFollowingTest`, `V5SegmentSplitTest`, `V5SegmentMergeTest`,
-//! `V5ConsumerReceiverQueueSizeTest`, `V5ConsumerSubscriptionPropertiesTest` and `V5DagWatchAutoReconnectTest`.
+//! A Queue consumer against the simulated cluster: every segment of the layout, in step with splits, merges,
+//! migrations and garbage collection; acks routed by segment; retries; the all-or-nothing subscribe; close. Ports the
+//! scenarios of Java's `ScalableQueueConsumerReconcileTest`, `V5QueueConsumerBasicTest`,
+//! `V5QueueConsumerMultiSegmentAckTest`, `V5SubscriptionInitialPositionTest`, `V5DAGFollowingTest`,
+//! `V5SegmentSplitTest`, `V5SegmentMergeTest`, `V5ConsumerReceiverQueueSizeTest`,
+//! `V5ConsumerSubscriptionPropertiesTest`, `V5DagWatchAutoReconnectTest` and `V5MigrationEndToEndTest`.
 
 use std::time::Duration;
 
@@ -62,8 +63,13 @@ fn latest() -> ConsumerOptions {
 
 /// Stores a one-message entry in a segment of [`TOPIC`], as any producer would.
 fn publish(world: &mut World, segment: u64, value: &str) {
+    publish_to(world, TOPIC, segment, value);
+}
+
+/// Stores a one-message entry in a segment of `topic`, as any producer would.
+fn publish_to(world: &mut World, topic: &str, segment: u64, value: &str) {
     let metadata = MessageMetadata { producer_name: "other".into(), publish_time: 1, ..Default::default() };
-    world.publish_raw(TOPIC, segment, metadata, Bytes::copy_from_slice(value.as_bytes()));
+    world.publish_raw(topic, segment, metadata, Bytes::copy_from_slice(value.as_bytes()));
 }
 
 fn segments(h: &QueueHarness) -> Vec<u64> {
@@ -220,6 +226,35 @@ fn consumers_on_legacy_segments_are_marked_as_managed_by_a_v5_client() {
         assert_eq!(command.subscribe.metadata, [kv("__pulsar.v5.managed", "true")]);
         assert_eq!(command.subscribe.consumer_name, None);
     }
+}
+
+/// Java's `V5MigrationEndToEndTest`: a Queue consumer follows its topic's migration, though the 5.0.1 broker gives the
+/// migrated layout the synthetic one's epoch (spec gap 29). It reads the legacy segments to their end, and the managed
+/// ones from their start, even at `Latest`, then lets go of the legacy ones.
+#[test]
+fn follows_a_migration_without_losing_a_message() {
+    let legacy = "persistent://acme/orders/old";
+    let mut world = World::default();
+    world.create_legacy_topic(legacy, 2);
+    let mut h = QueueHarness::new(world, legacy, latest());
+    publish_to(&mut h.world, legacy, 0, "legacy-0");
+    publish_to(&mut h.world, legacy, 1, "legacy-1");
+    let managed = h.world.migrate(legacy);
+    // Stored before the consumer hears of the migration.
+    publish_to(&mut h.world, legacy, managed[0], "managed-0");
+    publish_to(&mut h.world, legacy, managed[1], "managed-1");
+    h.pump();
+    assert_eq!(segments(&h), [0, 1, managed[0], managed[1]]);
+    let latest = Some(InitialPosition::Latest);
+    assert_eq!(positions(&h), [latest, latest, Some(InitialPosition::Earliest), Some(InitialPosition::Earliest)]);
+    let taken = h.take();
+    let values = taken.iter().map(|m| String::from_utf8(m.payload.to_vec()).unwrap()).collect();
+    assert_eq!(sorted(values), ["legacy-0", "legacy-1", "managed-0", "managed-1"]);
+    for message in &taken {
+        h.ack(&message.id);
+    }
+    h.advance(Duration::from_millis(100));
+    assert_eq!(segments(&h), managed);
 }
 
 #[test]

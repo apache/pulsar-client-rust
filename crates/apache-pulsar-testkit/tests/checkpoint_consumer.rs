@@ -72,8 +72,13 @@ fn restore(mut h: CheckpointHarness, start: Checkpoint) -> CheckpointHarness {
 
 /// Stores a one-message entry in a segment, as any producer would.
 fn publish(world: &mut World, segment: u64, value: &str) {
+    publish_to(world, TOPIC, segment, value);
+}
+
+/// Stores a one-message entry in a segment of `topic`, as any producer would.
+fn publish_to(world: &mut World, topic: &str, segment: u64, value: &str) {
     let metadata = MessageMetadata { producer_name: "other".into(), publish_time: 1, ..Default::default() };
-    world.publish_raw(TOPIC, segment, metadata, Bytes::copy_from_slice(value.as_bytes()));
+    world.publish_raw(topic, segment, metadata, Bytes::copy_from_slice(value.as_bytes()));
 }
 
 /// Stores a batch, as any producer would.
@@ -704,6 +709,40 @@ fn readers_on_legacy_segments_are_marked_as_managed_by_a_v5_client() {
     for command in h.world.received(Type::SUBSCRIBE) {
         assert_eq!(command.subscribe.metadata, std::slice::from_ref(&managed));
     }
+}
+
+/// A Checkpoint consumer follows its topic's migration, though the 5.0.1 broker gives the migrated layout the
+/// synthetic one's epoch (spec gap 29): it reads the legacy segments to their end before the managed ones, which have
+/// every legacy segment as a parent. A checkpoint taken before the migration resumes after it.
+#[test]
+fn reads_the_legacy_segments_before_the_migrated_ones() {
+    let legacy = "persistent://acme/orders/legacy";
+    let mut world = World::default();
+    world.create_legacy_topic(legacy, 2);
+    for (segment, value) in [(0, "legacy-0a"), (1, "legacy-1a"), (0, "legacy-0b")] {
+        publish_to(&mut world, legacy, segment, value);
+    }
+    let mut h = CheckpointHarness::new(world, legacy, options(), Checkpoint::Earliest);
+    let first = values(&h.take_up_to(1));
+    let checkpoint = h.checkpoint();
+    let managed = h.world.migrate(legacy);
+    publish_to(&mut h.world, legacy, managed[0], "managed-0");
+    publish_to(&mut h.world, legacy, managed[1], "managed-1");
+    let legacy_first = |read: &[String]| {
+        let is_legacy = |value: &String| value.starts_with("legacy-");
+        assert!(read.iter().skip_while(|v| is_legacy(v)).all(|v| !is_legacy(v)), "{read:?}");
+    };
+    let rest = values(&h.take());
+    legacy_first(&rest);
+    let mut all: Vec<String> = first.iter().chain(&rest).cloned().collect();
+    all.sort();
+    assert_eq!(all, ["legacy-0a", "legacy-0b", "legacy-1a", "managed-0", "managed-1"]);
+    h.close();
+    let mut resumed = CheckpointHarness::new(std::mem::take(&mut h.world), legacy, options(), checkpoint);
+    let again = values(&resumed.take());
+    legacy_first(&again);
+    assert_eq!(again.len(), 4, "{again:?}");
+    assert!(!again.contains(&first[0]), "{again:?}");
 }
 
 /// A reader that loses its connection subscribes again after the last message taken: the broker sends its entry

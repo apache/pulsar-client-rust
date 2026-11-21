@@ -110,9 +110,10 @@ impl World {
             return self.controller.held.push((conn, command.clone()));
         }
         let subscribe = &command.scalableTopicSubscribe;
-        let refusal = match self.topics.contains_key(&subscribe.topic) {
-            true => self.controller.fail_registrations.pop_front(),
-            false => Some(ServerError::TopicNotFound),
+        let topic = self.find_topic(&subscribe.topic);
+        let refusal = match topic {
+            Some(_) => self.controller.fail_registrations.pop_front(),
+            None => Some(ServerError::TopicNotFound),
         };
         if let Some(error) = refusal {
             let response = CommandScalableTopicSubscribeResponse {
@@ -123,7 +124,7 @@ impl World {
             };
             return self.push(conn, subscribe_response(response));
         }
-        let key = (subscribe.topic.clone(), subscribe.subscription.clone());
+        let key = (topic.expect("a topic the world has"), subscribe.subscription.clone());
         let group = self.controller.groups.entry(key.clone()).or_default();
         group.checkpoint |= subscribe.consumer_type == ScalableConsumerType::CHECKPOINT;
         let member = Member { link: Some((conn, subscribe.consumer_id)), unanswered: Some(subscribe.request_id) };

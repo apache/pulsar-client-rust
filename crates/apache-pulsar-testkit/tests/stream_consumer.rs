@@ -17,7 +17,8 @@
 
 //! The Stream consumer against the simulated cluster and its controller. Ported scenarios from Java's
 //! `V5StreamConsumerBasicTest`, `V5StreamConsumerDagReplayTest`, `V5StreamConsumerOrderingTest`,
-//! `V5StreamConsumerAutoReconnectTest` and `V5StreamConsumerAckWatermarkTest`, and members that share segments.
+//! `V5StreamConsumerAutoReconnectTest`, `V5StreamConsumerAckWatermarkTest` and the Stream consumer's case of
+//! `ScalableTopicLegacySegmentTest`, and members that share segments.
 
 use std::time::Duration;
 
@@ -55,6 +56,11 @@ fn world(segments: u32) -> World {
 
 /// Stores a one-message entry in `segment`, with `key`, stamped with the key's bucket hash as a producer does.
 fn publish(world: &mut World, segment: u64, key: &str, value: &str) {
+    publish_to(world, TOPIC, segment, key, value);
+}
+
+/// Stores a one-message entry in `segment` of `topic`, as [`publish`] does.
+fn publish_to(world: &mut World, topic: &str, segment: u64, key: &str, value: &str) {
     let hash = u32::from(KeyHash::of(key.as_bytes()).bucket_hash());
     let metadata = MessageMetadata {
         producer_name: "p".into(),
@@ -63,7 +69,7 @@ fn publish(world: &mut World, segment: u64, key: &str, value: &str) {
         entry_hash_max: Some(hash),
         ..Default::default()
     };
-    world.publish_raw(TOPIC, segment, metadata, Bytes::copy_from_slice(value.as_bytes()));
+    world.publish_raw(topic, segment, metadata, Bytes::copy_from_slice(value.as_bytes()));
 }
 
 fn values(messages: &[ReceivedMessage]) -> Vec<String> {
@@ -158,6 +164,38 @@ fn an_earliest_subscription_reads_a_sealed_parent_first() {
     post.sort();
     assert_eq!(post, ["post-0", "post-1", "post-2", "post-3", "post-4", "post-5"]);
     assert_eq!(h.world.consumer_count(TOPIC, 0, SUB), 0);
+}
+
+/// Java's `testStreamConsumerReadsLegacyParentFirst`: on a migrated topic, found by its scalable name, a Stream
+/// consumer reads the legacy segments first, as a consumer managed by a V5 client, and the controller hands out the
+/// managed segments once the legacy ones are drained.
+#[test]
+fn reads_a_migrated_topics_legacy_segments_first() {
+    let legacy = "persistent://acme/orders/legacy";
+    let mut world = World::default();
+    world.create_legacy_topic(legacy, 2);
+    publish_to(&mut world, legacy, 0, "k0", "pre-0");
+    publish_to(&mut world, legacy, 1, "k1", "pre-1");
+    let managed = world.migrate(legacy);
+    publish_to(&mut world, legacy, managed[0], "k2", "post-0");
+    publish_to(&mut world, legacy, managed[1], "k3", "post-1");
+    let mut h = StreamHarness::new(world, "topic://acme/orders/legacy");
+    let solo = h.join("solo", options());
+    assert_eq!(h.world.assigned(legacy, SUB, "solo"), [(0, false), (1, false)]);
+    let pre = h.take(solo);
+    let mut read = values(&pre);
+    read.sort();
+    assert_eq!(read, ["pre-0", "pre-1"]);
+    for message in &pre {
+        h.ack(solo, &message.id);
+    }
+    assert_eq!(h.world.assigned(legacy, SUB, "solo"), [(managed[0], false), (managed[1], false)]);
+    let mut post = values(&h.take(solo));
+    post.sort();
+    assert_eq!(post, ["post-0", "post-1"]);
+    let marked: Vec<bool> =
+        h.world.received(Type::SUBSCRIBE).iter().map(|c| !c.subscribe.metadata.is_empty()).collect();
+    assert_eq!(marked, [true, true, false, false]);
 }
 
 /// Java's `testEarliestSubscribeAfterTwoSplitsReadsAllBacklog` and `V5StreamConsumerOrderingTest`: across two

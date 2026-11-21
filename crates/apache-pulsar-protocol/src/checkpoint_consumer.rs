@@ -331,7 +331,7 @@ impl CheckpointConsumer {
     /// those it seals, and attaches again, at once, the readers that gave up. A member of a group has no use for it.
     pub fn on_layout(&mut self, layout: Rc<Layout>, now: Instant) {
         let Source::Layout(current) = &self.source else { return };
-        if layout.epoch() <= current.epoch() || self.is_closed() {
+        if !layout.supersedes(current) || self.is_closed() {
             return;
         }
         self.source = Source::Layout(layout.clone());

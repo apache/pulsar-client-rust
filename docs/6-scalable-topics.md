@@ -27,8 +27,10 @@ A **layout watch** holds a topic's current `ScalableTopicDAG` and pushes changes
   error in a later update is logged and the session kept: a new one opens when the connection closes. Java
   drops the session instead ([spec gap 16](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - **Updates:** a layout is applied only if its epoch is greater than the last applied (*client-behavior* §1,
-  [spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)). Each applied layout reaches every user of the watch
-  as a new immutable snapshot.
+  [spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)), or if it is a migrated topic's first layout, which the
+  5.0.1 broker gives the epoch of the synthetic layout it replaces, 0 (§8,
+  [spec gap 29](../DESIGN.md#spec-gaps-to-raise-upstream)). Each applied layout reaches every user of the watch as
+  a new immutable snapshot.
 - **Reconnecting:** after a connection loss the watch re-sends the lookup with backoff, and keeps serving
   the last layout until a new one arrives.
 
@@ -335,7 +337,8 @@ one segment for a non-partitioned topic, one per partition for a partitioned one
 - While every active segment is legacy, keyed messages route mod-N (§3.1). So each key keeps its v4 partition,
   and v4 and v5 clients can run side by side during a migration.
 - A cutover to managed segments shows up as an ordinary layout change: legacy segments seal and managed
-  successors appear. §3.3 and §6.1 handle it like any split.
+  successors appear, each a child of every legacy segment. §3.3 and §6.1 handle it like any split. The 5.0.1 broker
+  gives the new layout the synthetic one's epoch, which the watch allows for (§2).
 
 ## 9. Transactions (later)
 

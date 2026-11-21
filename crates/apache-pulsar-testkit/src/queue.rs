@@ -88,7 +88,8 @@ impl QueueHarness {
         let command = decode(&harness.world.output(harness.conn)).pop().expect("no answer to the scalable lookup");
         let update = &command.scalableTopicUpdate;
         assert!(update.error.is_none(), "lookup failed: {:?} {:?}", update.error, update.message);
-        let layout = Layout::from_dag(&update.dag, &harness.topic).unwrap();
+        let layout =
+            Layout::from_dag(&update.dag, update.resolved_topic_name.as_deref().unwrap_or(&harness.topic)).unwrap();
         harness.queue = QueueConsumer::new(options, Rc::new(layout), harness.clock.now());
         harness.pump();
         harness
@@ -283,7 +284,9 @@ impl QueueHarness {
                 _ => {
                     let update = &command.scalableTopicUpdate;
                     assert_eq!((update.session_id, update.error), (self.session_id, None), "{command:?}");
-                    let layout = Layout::from_dag(&update.dag, &self.topic).unwrap();
+                    let layout =
+                        Layout::from_dag(&update.dag, update.resolved_topic_name.as_deref().unwrap_or(&self.topic))
+                            .unwrap();
                     self.queue.on_layout(Rc::new(layout), now);
                 }
             }

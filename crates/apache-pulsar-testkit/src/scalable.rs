@@ -21,7 +21,8 @@
 //! [`World`] is sans IO like the rest of the testkit: a test, or a socket server, feeds each connection's bytes to
 //! [`World::input`] and writes out what [`World::output`] returns. Admin operations ([`World::split`],
 //! [`World::merge`], [`World::terminate`]) behave like the 5.0.1 broker's: sealing a segment terminates its topic,
-//! which disconnects its producers with `CommandCloseProducer`, then the new layout goes to every watch. The
+//! which disconnects its producers with `CommandCloseProducer`, then the new layout goes to every watch. A
+//! migration ([`World::migrate`]) goes the other way round, as on 5.0.1: the new layout first. The
 //! children of a split or a merge start with only the subscriptions registered on the scalable topic, which a Queue
 //! consumer's subscribe doesn't register, and a Stream or Checkpoint consumer's registration does. The controller's garbage collection of a sealed segment is two steps, which a test takes in either
 //! order: [`World::prune`] drops it from the layout, [`World::delete_segment`] deletes its topic.
@@ -153,6 +154,9 @@ struct Topic {
     epoch: u64,
     segments: BTreeMap<u64, Segment>,
     next_segment: u64,
+    /// The scalable topic a regular one became, once [`World::migrate`] migrated it: the name its layouts give, which
+    /// a lookup finds it by too.
+    migrated: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -312,7 +316,7 @@ impl World {
     pub fn create_topic(&mut self, topic: &str, segments: u32) {
         assert!(segments > 0 && topic.starts_with("topic://"), "bad topic {topic} or segment count");
         let ledger = &mut self.next_ledger;
-        let mut topic_state = Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0 };
+        let mut topic_state = Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0, migrated: None };
         let parent = &topic["topic://".len()..];
         for i in 0..segments {
             let start = (u64::from(i) * 0x1_0000 / u64::from(segments)) as u32;
@@ -336,7 +340,7 @@ impl World {
     /// non-partitioned topic (`partitions == 0`).
     pub fn create_legacy_topic(&mut self, topic: &str, partitions: u32) {
         assert!(topic.starts_with("persistent://"), "bad topic {topic}");
-        let mut topic_state = Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0 };
+        let mut topic_state = Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0, migrated: None };
         let names: Vec<String> = match partitions {
             0 => vec![topic.to_string()],
             n => (0..n).map(|i| format!("{topic}-partition-{i}")).collect(),
@@ -382,6 +386,52 @@ impl World {
         let (low, high) = if a_range.0 < b_range.0 { (a_range, b_range) } else { (b_range, a_range) };
         assert_eq!(low.1 + 1, high.0, "segments {a} and {b} are not adjacent");
         self.replace(topic, &[a, b], &[(low.0, high.1)])[0]
+    }
+
+    /// Migrates a regular topic, made with [`World::create_legacy_topic`], to a scalable one, as `pulsar-admin
+    /// scalable-topics migrate` does on 5.0.1, and returns the new segments' ids. The legacy segments seal, and as many
+    /// managed segments split the hash ring evenly, each a child of every legacy segment. The new layout keeps the
+    /// synthetic one's epoch, 0, as 5.0.1's does, and names the scalable topic `topic://…`, which a lookup finds the
+    /// topic by from then on, as by its `persistent://` name. It goes to every watch before the legacy segments'
+    /// topics are terminated. The new segments start with no subscription.
+    pub fn migrate(&mut self, topic: &str) -> Vec<u64> {
+        let path = topic.strip_prefix("persistent://").expect("a regular topic").to_string();
+        let mut ledgers = Vec::new();
+        let legacy: Vec<u64> = self.topic(topic).segments.keys().copied().collect();
+        for _ in &legacy {
+            self.next_ledger += 1;
+            ledgers.push(self.next_ledger);
+        }
+        let state = self.topic_mut(topic);
+        assert!(state.migrated.is_none(), "{topic} is migrated already");
+        state.migrated = Some(format!("topic://{path}"));
+        let count = legacy.len() as u64;
+        let children: Vec<u64> = (count..2 * count).collect();
+        for (i, (&id, ledger)) in children.iter().zip(ledgers).enumerate() {
+            let start = (i as u64 * 0x1_0000 / count) as u32;
+            let end = ((i as u64 + 1) * 0x1_0000 / count - 1) as u32;
+            let info = SegmentInfoProto {
+                segment_id: id,
+                hash_start: start,
+                hash_end: end,
+                state: SegmentState::ACTIVE,
+                parent_ids: legacy.clone(),
+                ..Default::default()
+            };
+            state.segments.insert(id, Segment::new(info, segment_name(&path, start, end, id), ledger));
+        }
+        for id in &legacy {
+            let info = &mut state.segments.get_mut(id).unwrap().info;
+            info.state = SegmentState::SEALED;
+            info.sealed_at_epoch = Some(0);
+            info.child_ids = children.clone();
+        }
+        state.next_segment = 2 * count;
+        self.push_layout(topic);
+        for id in legacy {
+            self.terminate(topic, id);
+        }
+        children
     }
 
     /// Terminates a segment's topic without changing the layout, as `POST …/segments/…/terminate` does.
@@ -624,11 +674,24 @@ impl World {
     }
 
     fn push_layout(&mut self, topic: &str) {
-        let dag = self.dag(topic);
+        let (dag, name) = (self.dag(topic), self.resolved(topic));
         for (conn, session_id) in self.watchers(topic) {
-            self.push(conn, layout_update(session_id, topic, dag.clone()));
+            self.push(conn, layout_update(session_id, &name, dag.clone()));
         }
         self.rebalance(topic);
+    }
+
+    /// The name a topic's layouts give: the scalable topic a regular one migrated to, or the one it was made with.
+    fn resolved(&self, topic: &str) -> String {
+        self.topic(topic).migrated.clone().unwrap_or_else(|| topic.to_string())
+    }
+
+    /// The topic a lookup or a registration names: one the world made, or the scalable topic one migrated to.
+    pub(crate) fn find_topic(&self, name: &str) -> Option<String> {
+        if self.topics.contains_key(name) {
+            return Some(name.to_string());
+        }
+        self.topics.iter().find(|(_, t)| t.migrated.as_deref() == Some(name)).map(|(topic, _)| topic.clone())
     }
 
     /// The sessions watching `topic`, on the open connections.
@@ -778,7 +841,7 @@ impl World {
 
     fn scalable_lookup(&mut self, conn: ConnId, command: &BaseCommand) {
         let lookup = &command.scalableTopicLookup;
-        let topic = lookup.topic.clone();
+        let topic = self.find_topic(&lookup.topic).unwrap_or_else(|| lookup.topic.clone());
         if !self.topics.contains_key(&topic) {
             if self.auto_create && lookup.create_if_missing() && topic.starts_with("topic://") {
                 self.create_topic(&topic, 1);
@@ -801,7 +864,7 @@ impl World {
             }
         }
         self.conn(conn).sessions.insert(lookup.session_id, topic.clone());
-        let update = layout_update(lookup.session_id, &topic, self.dag(&topic));
+        let update = layout_update(lookup.session_id, &self.resolved(&topic), self.dag(&topic));
         self.push(conn, update);
     }
 
