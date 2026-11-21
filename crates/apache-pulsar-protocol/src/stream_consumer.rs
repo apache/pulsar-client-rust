@@ -30,7 +30,7 @@
 //! - **Attaching** (*key-shared* §4). A segment the consumer owns whole is subscribed Exclusive; one the controller
 //!   shares between members, `Key_Shared` by entry bucket with the segment's boundaries. Its consumer is named
 //!   `<name>-seg-<id>`. One on a legacy segment, whose topic is a `persistent://` one, carries the V5-managed
-//!   property (PIP-475), as the Queue consumer's do; Java's Stream consumer doesn't mark them.
+//!   property (PIP-475), as the Queue consumer's do, and as in Java.
 //! - **The initial position** applies to the segments of the layout the consumer subscribed on. A segment created
 //!   after that is subscribed at the earliest position, as the Queue consumer's are. That matters only when the
 //!   consumer's registration lapsed while the segment was created: while a member is registered, the broker creates
