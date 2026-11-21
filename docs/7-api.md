@@ -54,7 +54,19 @@ producer.flush().await?;
 producer.close().await?;
 ```
 
-Batching and compression policies come with multi-message batches ([Plan](../PLAN.md), M6).
+**Batching** is on by default, with the defaults of Java V5's `BatchingPolicy`: a message waits up to 1 ms for others
+to join its batch, which holds up to 1000 messages or 128 KiB. Each segment's producer keeps one batch per entry
+bucket, so that consumers sharing a segment by bucket get whole keys ([5](5-segment-engine.md) §2).
+`BatchingPolicy::disabled()` sends each message in an entry of its own:
+
+```rust
+let producer = client.new_producer(Schema::string())
+    .topic("topic://acme/orders/events")
+    .batching_policy(BatchingPolicy { max_publish_delay: Duration::from_millis(5), ..Default::default() })
+    .create().await?;
+```
+
+The compression policy comes with M6's compression ([Plan](../PLAN.md)).
 
 ### 3.1 Send ordering and pipelining
 
@@ -63,8 +75,9 @@ the future completes with the message id once the broker has stored it. Send ord
 which send futures are first polled, which for normal code is the order of the calls. This meets the spec's
 ordering rule (*client-api* §3.2) without an unusual API.
 
-A sequential `send().await` loop keeps one message in flight at a time. To pipeline, drive many send futures
-from one task with a combinator that polls them in order. `buffered(n)` keeps up to `n` sends in flight and
+A sequential `send().await` loop keeps one message in flight at a time, and with batching on, waits out the
+batching delay for each. The blocking API's `send` sends its batch at once, as Java's blocking send does. To
+pipeline, drive many send futures from one task with a combinator that polls them in order. `buffered(n)` keeps up to `n` sends in flight and
 yields results in send order, while it keeps taking new messages from the source:
 
 ```rust

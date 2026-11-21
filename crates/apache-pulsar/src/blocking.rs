@@ -124,9 +124,10 @@ impl<T: 'static> Producer<T> {
         MessageBuilder { inner: self.inner.new_message() }
     }
 
-    /// Sends a message with only a value, and returns its id once it is stored.
+    /// Sends a message with only a value, and returns its id once it is stored. Its batch goes out at once, as with
+    /// Java's blocking send: a loop of blocking sends doesn't wait out the batching delay for each.
     pub fn send(&self, value: T) -> Result<MessageId> {
-        block_on(self.inner.send(value))
+        block_on(self.inner.new_message().value(value).send_and_flush())
     }
 
     /// Waits for every message sent before the call to be stored.
@@ -185,9 +186,10 @@ impl<T: 'static> MessageBuilder<'_, T> {
         Self { inner: self.inner.replication_clusters(clusters) }
     }
 
-    /// Sends the message, and returns its id once it is stored.
+    /// Sends the message, and returns its id once it is stored. Its batch goes out at once, as with
+    /// [`Producer::send`].
     pub fn send(self) -> Result<MessageId> {
-        block_on(self.inner.send())
+        block_on(self.inner.send_and_flush())
     }
 }
 

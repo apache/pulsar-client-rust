@@ -30,7 +30,8 @@ controller assigns them, each key in order, share segments by entry bucket when 
 cumulatively. Checkpoint consumers read every segment, parents before their children, or as members of a group the
 segments the controller assigns them, and resume from checkpoints the application keeps, in the Java client's bytes.
 All work in the thread-safe, local and blocking APIs, with token and mTLS authentication, directly or through a proxy.
-Batching and compression come next. The design is in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
+Producers batch messages by entry bucket, as Java's do; compression comes next. The design is in
+[DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
 
 ```rust
 let client = PulsarClient::builder().service_url("pulsar://localhost:6650").build().await?;
