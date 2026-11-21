@@ -28,7 +28,8 @@ merges, and to regular `persistent://` topics through the migration bridge. Queu
 a topic, following its splits and merges, and acknowledge each message. Stream consumers read the segments the
 topic's controller assigns them, each key in order, share segments by entry bucket when they outnumber them, and
 acknowledge cumulatively. All work in the thread-safe, local and blocking APIs, with token and mTLS authentication,
-directly or through a proxy. The Checkpoint consumer comes next. The design is in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
+directly or through a proxy. The Checkpoint consumer comes next. The design is in [DESIGN.md](DESIGN.md), the
+milestones in [PLAN.md](PLAN.md).
 
 ```rust
 let client = PulsarClient::builder().service_url("pulsar://localhost:6650").build().await?;
