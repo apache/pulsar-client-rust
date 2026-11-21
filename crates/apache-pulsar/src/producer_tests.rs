@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use apache_pulsar_protocol::hash::KeyHash;
 use apache_pulsar_protocol::lookup::HostPort;
+use apache_pulsar_protocol::proto;
 use apache_pulsar_protocol::proto::FeatureFlags;
 use apache_pulsar_protocol::proto::base_command::Type;
 use apache_pulsar_testkit::LookupAnswer;
@@ -44,7 +45,7 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{FuturesOrdered, StreamExt};
 
 use crate::error::ErrorKind;
-use crate::{BatchingPolicy, ProducerAccessMode, PulsarClient, Schema, local};
+use crate::{BatchingPolicy, CompressionPolicy, CompressionType, ProducerAccessMode, PulsarClient, Schema, local};
 
 pub(crate) const TOPIC: &str = "topic://acme/orders/events";
 
@@ -630,6 +631,33 @@ fn a_flush_sends_the_open_batches() {
             result.unwrap();
         }
         assert_eq!(server.world.borrow().stored(TOPIC).len(), 1);
+        client.close().await.unwrap();
+    });
+}
+
+/// A producer compresses its entries with its policy's codec, and they read back as sent.
+#[test]
+fn entries_are_compressed_with_the_policys_codec() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let codecs = [
+            (CompressionPolicy::disabled(), None),
+            (CompressionPolicy::of(CompressionType::Lz4), Some(proto::CompressionType::LZ4)),
+            (CompressionPolicy::of(CompressionType::Zlib), Some(proto::CompressionType::ZLIB)),
+            (CompressionPolicy::of(CompressionType::Zstd), Some(proto::CompressionType::ZSTD)),
+            (CompressionPolicy::of(CompressionType::Snappy), Some(proto::CompressionType::SNAPPY)),
+        ];
+        let value = "compress me ".repeat(100);
+        for (i, (policy, codec)) in codecs.into_iter().enumerate() {
+            let producer =
+                client.new_producer(Schema::string()).topic(TOPIC).compression_policy(policy).create().await.unwrap();
+            producer.send(value.clone()).await.unwrap();
+            producer.close().await.unwrap();
+            let stored = server.world.borrow().stored(TOPIC);
+            assert_eq!(stored[i].metadata.compression, codec, "{policy:?}");
+        }
+        assert_eq!(stored_values(&server), vec![value; 5]);
         client.close().await.unwrap();
     });
 }

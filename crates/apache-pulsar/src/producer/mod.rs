@@ -116,6 +116,61 @@ impl BatchingPolicy {
     }
 }
 
+/// A codec for a producer's entries (Java's `CompressionType`). Each is behind a feature of this crate, all on by
+/// default: `lz4`, `zlib`, `zstd` and `snappy`. ZSTD binds the C `libzstd`, so building it needs a C compiler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CompressionType {
+    /// No compression.
+    #[default]
+    None,
+    /// LZ4: fast, with a moderate ratio.
+    Lz4,
+    /// ZLIB: a better ratio than LZ4's, and much slower; ZSTD does better on both.
+    Zlib,
+    /// Zstandard: the best ratio, and it decompresses almost as fast as LZ4.
+    Zstd,
+    /// Snappy: fast, much like LZ4.
+    Snappy,
+}
+
+impl CompressionType {
+    fn to_proto(self) -> proto::CompressionType {
+        match self {
+            Self::None => proto::CompressionType::NONE,
+            Self::Lz4 => proto::CompressionType::LZ4,
+            Self::Zlib => proto::CompressionType::ZLIB,
+            Self::Zstd => proto::CompressionType::ZSTD,
+            Self::Snappy => proto::CompressionType::SNAPPY,
+        }
+    }
+}
+
+/// How a producer compresses its entries (Java's `CompressionPolicy`): not at all, by default. An entry's payload,
+/// all of a batch, is compressed whatever its size; Java leaves payloads of 4 KiB or less as they are.
+///
+/// ```
+/// # use apache_pulsar::{CompressionPolicy, CompressionType};
+/// assert_eq!(CompressionPolicy::of(CompressionType::Zstd).codec, CompressionType::Zstd);
+/// assert_eq!(CompressionPolicy::default(), CompressionPolicy::disabled());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompressionPolicy {
+    pub codec: CompressionType,
+}
+
+impl CompressionPolicy {
+    /// Compression with `codec`.
+    pub fn of(codec: CompressionType) -> Self {
+        Self { codec }
+    }
+
+    /// No compression, the default.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+}
+
 /// Builds a producer: `client.new_producer(schema)`. `Api` is [`ThreadSafe`] or [`Local`], as for the client.
 #[must_use = "a builder does nothing until `create` is awaited"]
 pub struct ProducerBuilder<T, Api = ThreadSafe> {
@@ -141,6 +196,7 @@ struct Settings {
     initial_sequence_id: Option<i64>,
     properties: Vec<(String, String)>,
     batching: BatchingPolicy,
+    compression: CompressionPolicy,
 }
 
 impl Default for Settings {
@@ -156,6 +212,7 @@ impl Default for Settings {
             initial_sequence_id: None,
             properties: Vec::new(),
             batching: BatchingPolicy::default(),
+            compression: CompressionPolicy::default(),
         }
     }
 }
@@ -218,8 +275,22 @@ impl<T: 'static, Api> ProducerBuilder<T, Api> {
         self
     }
 
-    fn options(&self, operation_timeout: Duration) -> ProducerOptions {
-        ProducerOptions {
+    /// How entries are compressed: [`CompressionPolicy::disabled`] unless set. A codec this build leaves out fails
+    /// `create` with [`ErrorKind::InvalidConfiguration`].
+    pub fn compression_policy(mut self, policy: CompressionPolicy) -> Self {
+        self.settings.compression = policy;
+        self
+    }
+
+    fn options(&self, operation_timeout: Duration) -> Result<ProducerOptions> {
+        let compression = self.settings.compression.codec.to_proto();
+        #[cfg(not(all(feature = "lz4", feature = "zlib", feature = "zstd", feature = "snappy")))]
+        if !apache_pulsar_protocol::compression::supports(compression) {
+            let message = format!("this build leaves out the {:?} codec", self.settings.compression.codec);
+            return Err(Error::new(ErrorKind::InvalidConfiguration, message));
+        }
+        Ok(ProducerOptions {
+            compression,
             batching: self.settings.batching.to_options(),
             name: self.settings.name.clone(),
             access_mode: self.settings.access_mode.to_proto(),
@@ -228,7 +299,7 @@ impl<T: 'static, Api> ProducerBuilder<T, Api> {
             properties: self.settings.properties.clone(),
             schema: self.schema.info().to_proto(),
             operation_timeout,
-        }
+        })
     }
 }
 
@@ -242,7 +313,7 @@ impl<T: 'static> ProducerBuilder<T, ThreadSafe> {
         let ApiClient::ThreadSafe(client) = &self.client else { unreachable!() };
         let topic = normalize_topic(self.settings.topic.as_deref())?;
         let (slot, index) = client.place();
-        let options = self.options(client.operation_timeout());
+        let options = self.options(client.operation_timeout())?;
         let link =
             client.run_on(index, move |local| Box::pin(async move { create_on(local, topic, options).await })).await?;
         Ok(Producer::from_link(link, self.schema, client.memory().clone(), self.settings, Some(slot)))
@@ -275,7 +346,7 @@ impl<T: 'static> ProducerBuilder<T, Local> {
     pub async fn create(self) -> Result<Producer<T, Local>> {
         let ApiClient::Local(client) = &self.client else { unreachable!() };
         let topic = normalize_topic(self.settings.topic.as_deref())?;
-        let options = self.options(client.operation_timeout());
+        let options = self.options(client.operation_timeout())?;
         let link = create_on(client.clone(), topic, options).await?;
         Ok(Producer::from_link(link, self.schema, client.memory().clone(), self.settings, None))
     }

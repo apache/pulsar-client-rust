@@ -27,8 +27,10 @@ A **layout watch** holds a topic's current `ScalableTopicDAG` and pushes changes
   error in a later update is logged and the session kept: a new one opens when the connection closes. Java
   drops the session instead ([spec gap 16](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - **Updates:** a layout is applied only if its epoch is greater than the last applied (*client-behavior* §1,
-  [spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)). Each applied layout reaches every user of the watch
-  as a new immutable snapshot.
+  [spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)), or if it is a migrated topic's first layout, which the
+  5.0.1 broker gives the epoch of the synthetic layout it replaces, 0 (§8,
+  [spec gap 29](../DESIGN.md#spec-gaps-to-raise-upstream)). Each applied layout reaches every user of the watch as
+  a new immutable snapshot.
 - **Reconnecting:** after a connection loss the watch re-sends the lookup with backoff, and keeps serving
   the last layout until a new one arrives.
 
@@ -334,8 +336,14 @@ one segment for a non-partitioned topic, one per partition for a partitioned one
 - The per-segment producers and consumers attach to the wrapped `persistent://` names directly.
 - While every active segment is legacy, keyed messages route mod-N (§3.1). So each key keeps its v4 partition,
   and v4 and v5 clients can run side by side during a migration.
+- Each per-segment producer and consumer on a legacy segment carries `__pulsar.v5.managed=true`. The broker's
+  migration refuses a topic while a client without it, a v4 one, is attached, unless forced.
+- The 5.0.1 controller serves only migrated topics, so the Stream consumer and the members of a Checkpoint consumer
+  group can't use a topic that isn't migrated yet: their create fails
+  ([spec gap 28](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - A cutover to managed segments shows up as an ordinary layout change: legacy segments seal and managed
-  successors appear. §3.3 and §6.1 handle it like any split.
+  successors appear, each a child of every legacy segment. §3.3 and §6.1 handle it like any split. The 5.0.1 broker
+  gives the new layout the synthetic one's epoch, which the watch allows for (§2).
 
 ## 9. Transactions (later)
 

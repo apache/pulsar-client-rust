@@ -149,6 +149,11 @@ Stream members sharing a one-segment topic by bucket each get whole keys, in ord
 Java's `V5EntryBucketDispatchTest` sends one message at a time, so its entries hold one; these pipeline the sends. A
 Java consumer reads Rust's batches, and with deduplication on, a 5.0.1 broker takes the entries of every bucket.
 
+Compression, with Java V5's `CompressionPolicy`: the scenarios of `V5ProducerCompressionTest` (a payload with each
+codec, none, and no policy set) on the simulated cluster (`producer_compression.rs`) and against a 5.0.1 broker, a
+batch compressed whole, and the broker's limit on the compressed entry. A Java consumer reads Rust's batches compressed
+with each codec, the ZLIB ones finished streams.
+
 ## M7: Conformance and a first release
 
 - The rest of the schemas, generic records included (C11, [7](docs/7-api.md) §8).
@@ -170,6 +175,19 @@ a 5.0.1 broker: a schema of another type than the topic's fails with `Incompatib
 sends, an exclusive producer's create, and each kind of consumer's subscribe; the first consumer of a new topic
 registers its schema; and a topic with messages but no schema refuses a schema. Java reads the values of each
 primitive type that Rust sends, and Rust those Java sends.
+
+The migration bridge's end-to-end tests run against 5.0.1, on partitioned and non-partitioned topics, with Java v4
+clients running alongside (`tests/integration/bridge.rs`):
+- **Before a migration:** v4 and Rust clients side by side, and on one Shared subscription. Every Rust producer and
+  consumer is marked as managed by a V5 client, and a v4 client holds a migration off until it is forced.
+- **During one:** a producer keeps each key's order with sends in flight, and the Queue and Checkpoint consumers
+  follow. v4 and Rust clients run through a forced migration.
+- **After one:** a Stream consumer reads the legacy segments first, every key in order, and a member of a Checkpoint
+  consumer group reads them and the new ones.
+
+The 5.0.1 broker gives a migrated topic's first layout the synthetic layout's epoch, which the client allows for
+(spec gap 29). Left to the broker: a Stream consumer or a Checkpoint consumer group can't use a topic before it
+migrates (spec gap 28, J18). An ignored test keeps what a Stream consumer should get there.
 
 ## After the first release
 

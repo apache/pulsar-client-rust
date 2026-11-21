@@ -66,7 +66,9 @@ let producer = client.new_producer(Schema::string())
     .create().await?;
 ```
 
-The compression policy comes with M6's compression ([Plan](../PLAN.md)).
+**Compression** is off by default, as in Java. `CompressionPolicy::of(CompressionType::Zstd)` compresses each entry's
+payload with ZSTD; LZ4, ZLIB and Snappy are the others ([3](3-protocol.md) §6). Each codec is a feature of the crate,
+all on by default, and a codec the build leaves out fails `create` with `InvalidConfiguration`.
 
 ### 3.1 Send ordering and pipelining
 

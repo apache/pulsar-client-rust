@@ -128,6 +128,17 @@ impl Layout {
         self.epoch
     }
 
+    /// Whether this layout replaces `current`: its epoch is greater (*client-behavior* §1), or it is a migrated topic's
+    /// first layout, which the 5.0.1 broker gives the epoch of the synthetic layout it replaces, 0 (spec gap 29).
+    pub fn supersedes(&self, current: &Layout) -> bool {
+        self.epoch > current.epoch || (self.epoch == current.epoch && current.is_synthetic() && !self.is_synthetic())
+    }
+
+    /// Whether every segment is legacy: the layout the broker gives a `persistent://` topic that isn't migrated.
+    fn is_synthetic(&self) -> bool {
+        self.segments.values().all(Segment::is_legacy)
+    }
+
     /// The resolved `topic://` name.
     pub fn topic(&self) -> &str {
         &self.topic

@@ -89,7 +89,9 @@ confirmed, over its segments' producers ([spec gap 14](../DESIGN.md#spec-gaps-to
 - **An entry is stored whole or not at all.** Its messages time out together, at its first message's deadline, and
   a close fails what the open batches hold, never written, as Java fails its batch container.
 - End-to-end encryption publishes one message per entry, as in Java.
-- **Compression** applies to each entry's payload. The metadata records the codec and the uncompressed size.
+- **Compression** applies to each entry's payload, a whole batch, whatever its size: Java leaves payloads of 4 KiB
+  or less as they are, a v4 setting V5 doesn't expose. The metadata records the codec and the uncompressed size, and
+  the broker's limit applies to the entry as compressed ([3](3-protocol.md) §6).
 - **Chunking** is a later capability ([1](1-scope.md) §2).
 
 **Segment gone.** When a send fails because the topic was terminated, or the producer is closed because its

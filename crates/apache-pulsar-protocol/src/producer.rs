@@ -32,6 +32,7 @@
 //! - **Every entry is a batch**, stamped with the range of its messages' entry-bucket hashes (*key-shared* §3). A
 //!   segment has one open batch per entry bucket; they close together, on the maximum messages, bytes or delay of
 //!   [`Batching`], as Java's `EntryBucketBatchContainer` does. Without batching, each message is an entry of its own.
+//!   An entry's payload is compressed whole with the producer's codec ([`compression`]).
 //! - **A segment that is gone** (its topic terminated by a split, a merge or a migration) retires: its messages
 //!   that the broker didn't store are parked, and new messages whose keys it owned are held. Once the layout no
 //!   longer has the segment and none of its messages is in flight, the parked messages are routed again in call
@@ -49,13 +50,14 @@ use buffa::{Message, SizeCache};
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::backoff::{Backoff, Jitter};
+use crate::compression;
 use crate::hash::KeyHash;
 use crate::layout::{Layout, LayoutError};
 use crate::message_id::{EntryId, MessageId};
 use crate::proto::base_command::Type;
 use crate::proto::{
-    BaseCommand, CommandProducer, CommandProducerSuccess, CommandSend, CommandSendError, CommandSendReceipt, KeyValue,
-    MessageMetadata, ProducerAccessMode, Schema, ServerError, SingleMessageMetadata,
+    BaseCommand, CommandProducer, CommandProducerSuccess, CommandSend, CommandSendError, CommandSendReceipt,
+    CompressionType, KeyValue, MessageMetadata, ProducerAccessMode, Schema, ServerError, SingleMessageMetadata,
 };
 
 /// How many times a message is parked because its segment is gone before its send fails (Java's
@@ -86,6 +88,9 @@ pub struct ProducerOptions {
     pub operation_timeout: Duration,
     /// How messages are grouped into entries; `None` puts each message in an entry of its own.
     pub batching: Option<Batching>,
+    /// The codec each entry's payload is compressed with, whatever its size; one this build has
+    /// ([`compression::supports`]).
+    pub compression: CompressionType,
 }
 
 /// How each segment's producer groups messages into entries (docs/5-segment-engine.md §2), as Java's
@@ -447,7 +452,7 @@ impl Producer {
 
     /// Applies a newer layout.
     pub fn on_layout(&mut self, layout: Rc<Layout>, now: Instant) {
-        if layout.epoch() <= self.layout.epoch() || matches!(self.state, State::Closed) {
+        if !layout.supersedes(&self.layout) || matches!(self.state, State::Closed) {
             return;
         }
         let old = std::mem::replace(&mut self.layout, layout);
@@ -978,7 +983,14 @@ impl Producer {
         let s = self.segments.get_mut(&id).unwrap();
         let messages: Vec<(&Batched, &Pending)> = batch.iter().map(|b| (b, &self.sends[&b.send])).collect();
         let name = s.name.as_deref().unwrap_or_default();
-        let (metadata, payload) = encode_entry(name, s.schema_version.as_deref(), &messages);
+        let (mut metadata, payload) = encode_entry(name, s.schema_version.as_deref(), &messages);
+        let codec = self.options.compression;
+        if codec != CompressionType::NONE {
+            metadata.compression = Some(codec);
+            metadata.uncompressed_size = Some(payload.len() as u32);
+        }
+        // The broker's limit is on what it stores: the payload as compressed.
+        let payload = compression::compress(codec, payload);
         let size = payload.len() + metadata.encoded_len() as usize;
         if size > s.max_message_size {
             let limit = s.max_message_size;
