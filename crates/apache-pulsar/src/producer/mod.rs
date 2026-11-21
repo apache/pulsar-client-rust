@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use apache_pulsar_protocol::producer::{OutgoingMessage, Producer as Machine, ProducerOptions};
+use apache_pulsar_protocol::producer::{Batching, OutgoingMessage, Producer as Machine, ProducerOptions};
 use apache_pulsar_protocol::proto;
 use futures_channel::{mpsc, oneshot};
 
@@ -65,6 +65,57 @@ impl ProducerAccessMode {
     }
 }
 
+/// How a producer groups messages into entries, which the broker stores and dispatches whole (Java's
+/// `BatchingPolicy`). On by default, as in Java: a message waits up to `max_publish_delay` for others to join it.
+///
+/// Each segment's producer has one open batch per entry bucket of the segment, so that an entry holds keys of one
+/// bucket only, as consumers sharing a segment by bucket need. The batches of a segment close together, as Java's
+/// do, once they hold `max_messages` messages or `max_size` bytes of payload between them, or `max_publish_delay`
+/// after their first message: no message waits longer for its batch. (Java's timer counts from the last batch sent,
+/// so a batch can wait a little longer there.) A message with a delivery time or replication clusters goes in an
+/// entry of its own.
+///
+/// ```
+/// # use std::time::Duration;
+/// # use apache_pulsar::BatchingPolicy;
+/// let policy = BatchingPolicy { max_publish_delay: Duration::from_millis(5), ..Default::default() };
+/// assert_eq!(policy.max_messages, 1000);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchingPolicy {
+    /// Whether messages are batched; without, each message is an entry of its own.
+    pub enabled: bool,
+    /// How long the first message of a batch waits for others: 1 ms by default.
+    pub max_publish_delay: Duration,
+    /// The most messages in a segment's batches; 1000 by default, 0 for no limit.
+    pub max_messages: usize,
+    /// The most payload bytes in a segment's batches: 128 KiB by default, and at most the broker's largest message,
+    /// which 0 stands for.
+    pub max_size: usize,
+}
+
+impl Default for BatchingPolicy {
+    /// Java's defaults: on, 1 ms, 1000 messages, 128 KiB.
+    fn default() -> Self {
+        Self { enabled: true, max_publish_delay: Duration::from_millis(1), max_messages: 1000, max_size: 128 << 10 }
+    }
+}
+
+impl BatchingPolicy {
+    /// No batching: each message is an entry of its own.
+    pub fn disabled() -> Self {
+        Self { enabled: false, ..Self::default() }
+    }
+
+    fn to_options(&self) -> Option<Batching> {
+        self.enabled.then_some(Batching {
+            max_messages: self.max_messages,
+            max_bytes: self.max_size,
+            max_delay: self.max_publish_delay,
+        })
+    }
+}
+
 /// Builds a producer: `client.new_producer(schema)`. `Api` is [`ThreadSafe`] or [`Local`], as for the client.
 #[must_use = "a builder does nothing until `create` is awaited"]
 pub struct ProducerBuilder<T, Api = ThreadSafe> {
@@ -89,6 +140,7 @@ struct Settings {
     block_if_queue_full: bool,
     initial_sequence_id: Option<i64>,
     properties: Vec<(String, String)>,
+    batching: BatchingPolicy,
 }
 
 impl Default for Settings {
@@ -103,6 +155,7 @@ impl Default for Settings {
             block_if_queue_full: true,
             initial_sequence_id: None,
             properties: Vec::new(),
+            batching: BatchingPolicy::default(),
         }
     }
 }
@@ -159,8 +212,15 @@ impl<T: 'static, Api> ProducerBuilder<T, Api> {
         self
     }
 
+    /// How messages are grouped into entries: [`BatchingPolicy::default`], Java's, unless set.
+    pub fn batching_policy(mut self, policy: BatchingPolicy) -> Self {
+        self.settings.batching = policy;
+        self
+    }
+
     fn options(&self, operation_timeout: Duration) -> ProducerOptions {
         ProducerOptions {
+            batching: self.settings.batching.to_options(),
             name: self.settings.name.clone(),
             access_mode: self.settings.access_mode.to_proto(),
             send_timeout: self.settings.send_timeout,
@@ -279,13 +339,13 @@ impl Drop for Shared {
 
 impl Shared {
     /// Queues a message on the producer's task, once it has room under the memory limit, and waits for it to be
-    /// stored.
-    async fn send(&self, message: OutgoingMessage) -> Result<MessageId> {
+    /// stored. With `flush`, its batch goes out at once.
+    async fn send(&self, message: OutgoingMessage, flush: bool) -> Result<MessageId> {
         let room = message.payload.len() as u64 + PER_MESSAGE_OVERHEAD;
         let room = self.memory.reserve(room, self.block_if_queue_full).await?;
         let (reply, done) = oneshot::channel();
         // A request the task never takes gives its room back as it drops.
-        let request = Request::Send { message, publish_time: now_millis(), room, reply };
+        let request = Request::Send { message, publish_time: now_millis(), room, flush, reply };
         self.link.requests.unbounded_send(request).map_err(producer_closed)?;
         done.await.map_err(producer_closed)?
     }
@@ -354,16 +414,18 @@ impl<T: 'static, Api> Producer<T, Api> {
         self.new_message().value(value).send().await
     }
 
-    /// Waits for every message sent before the call to be stored, and fails if one of them failed.
+    /// Waits for every message sent before the call to be stored, and fails if one of them failed. The open batches
+    /// go out at once, without waiting out the batching delay.
     pub async fn flush(&self) -> Result<()> {
         let (reply, done) = oneshot::channel();
         self.shared.link.requests.unbounded_send(Request::Flush { reply }).map_err(producer_closed)?;
         done.await.map_err(producer_closed)?
     }
 
-    /// Closes the producer: waits for the messages the brokers already have, fails those still waiting with
-    /// [`ErrorKind::AlreadyClosed`], and closes every segment's producer. Later sends fail. Can be called again.
-    /// Call [`Producer::flush`] first to publish everything.
+    /// Closes the producer: waits for the messages the brokers already have, fails those still waiting, in an open
+    /// batch or for a layout, a connection or a segment's producer, with [`ErrorKind::AlreadyClosed`], and closes every
+    /// segment's producer. Later sends fail. Can be called again. Call [`Producer::flush`] first to publish
+    /// everything.
     pub async fn close(&self) -> Result<()> {
         let (reply, done) = oneshot::channel();
         if self.shared.link.requests.unbounded_send(Request::Close { reply: Some(reply) }).is_err() {
@@ -373,10 +435,10 @@ impl<T: 'static, Api> Producer<T, Api> {
         done.await.unwrap_or(Ok(()))
     }
 
-    async fn dispatch(&self, value: Option<T>, mut message: OutgoingMessage) -> Result<MessageId> {
+    async fn dispatch(&self, value: Option<T>, mut message: OutgoingMessage, flush: bool) -> Result<MessageId> {
         let value = value.ok_or_else(|| Error::new(ErrorKind::InvalidConfiguration, "a message needs a value"))?;
         message.payload = self.schema.encode(&value)?;
-        self.shared.send(message).await
+        self.shared.send(message, flush).await
     }
 }
 
@@ -448,8 +510,17 @@ impl<T: 'static, Api> MessageBuilder<'_, T, Api> {
     /// `FuturesOrdered` or `join_all`. Spawning each send as a task of its own gives no order. Dropping the future
     /// after its first poll doesn't recall the message: it may still be published. The producer's send timeout
     /// bounds how long a message waits.
+    ///
+    /// With batching, on by default, the message waits up to the batching delay (1 ms by default) for others to
+    /// join its batch. A loop that awaits each send pays that delay for every message: pipeline the sends, as above,
+    /// or call [`Producer::flush`], or turn batching off ([`ProducerBuilder::batching_policy`]).
     pub async fn send(self) -> Result<MessageId> {
-        self.producer.dispatch(self.value, self.message).await
+        self.producer.dispatch(self.value, self.message, false).await
+    }
+
+    /// Sends the message with its batch at once, as Java's blocking send does.
+    pub(crate) async fn send_and_flush(self) -> Result<MessageId> {
+        self.producer.dispatch(self.value, self.message, true).await
     }
 }
 

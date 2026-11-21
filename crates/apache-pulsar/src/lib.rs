@@ -49,7 +49,7 @@ pub use consumer::{
 };
 pub use error::{Error, ErrorKind, Result};
 pub use message_id::MessageId;
-pub use producer::{MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder};
+pub use producer::{BatchingPolicy, MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder};
 pub use schema::Schema;
 
 #[cfg(test)]

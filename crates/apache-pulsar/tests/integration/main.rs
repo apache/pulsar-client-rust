@@ -45,6 +45,7 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("tls_with_client_certificate", tls_with_client_certificate),
     ("missing_credentials_are_refused", missing_credentials_are_refused),
     ("a_java_consumer_reads_what_was_produced", a_java_consumer_reads_what_was_produced),
+    ("a_java_consumer_reads_rust_batches", a_java_consumer_reads_rust_batches),
     ("keys_keep_their_order_across_a_split", keys_keep_their_order_across_a_split),
     ("a_partitioned_topic_routes_like_v4", a_partitioned_topic_routes_like_v4),
     ("a_short_name_is_a_regular_topic", a_short_name_is_a_regular_topic),
@@ -68,6 +69,8 @@ const TESTS: &[(&str, fn(&Env))] = &[
         a_stream_consumer_reads_sealed_backlog_first_in_key_order,
     ),
     ("stream_consumers_share_a_segment_by_bucket", stream_consumers_share_a_segment_by_bucket),
+    ("stream_consumers_share_batched_entries_by_bucket", stream_consumers_share_batched_entries_by_bucket),
+    ("batches_pass_the_brokers_deduplication", batches_pass_the_brokers_deduplication),
     ("a_rewound_stream_subscription_takes_the_same_ack_again", a_rewound_stream_subscription_takes_the_same_ack_again),
     (
         "a_closed_stream_consumer_hands_its_segments_over_at_once",
@@ -204,6 +207,37 @@ fn a_java_consumer_reads_what_was_produced(env: &Env) {
     let mut expected = sent;
     expected.sort_by(|a, b| a.1.cmp(&b.1));
     assert_eq!(received, expected);
+}
+
+/// A Java consumer reads what a Rust producer stored in batches: entries of several messages, keyed and not.
+fn a_java_consumer_reads_rust_batches(env: &Env) {
+    let topic = format!("topic://public/default/{}", unique("batches"));
+    let sent: Vec<(Option<String>, String)> =
+        (0..200).map(|i| ((i % 3 != 0).then(|| format!("key-{}", i % 7)), format!("value-{i:03}"))).collect();
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let sends = sent.iter().map(|(key, value)| {
+            let message = producer.new_message().value(value.clone());
+            match key {
+                Some(key) => message.key(key.clone()).send(),
+                None => message.send(),
+            }
+        });
+        for result in futures_util::future::join_all(sends).await {
+            result.unwrap();
+        }
+        client.close().await.unwrap();
+    });
+    let received = env.consume(&topic, sent.len());
+    let mut per_entry: BTreeMap<(u64, i64, i64), usize> = BTreeMap::new();
+    for message in &received {
+        *per_entry.entry(message.position.expect("a position")).or_default() += 1;
+    }
+    assert!(per_entry.values().any(|&n| n > 1), "no entry of several messages: {per_entry:?}");
+    let mut received: Vec<(Option<String>, String)> = received.into_iter().map(|m| (m.key, m.value)).collect();
+    received.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(received, sent);
 }
 
 /// Java's `V5ProducerLayoutChangeOrderingTest`, against the real broker: a split while sends are in flight, and
@@ -809,6 +843,89 @@ fn stream_consumers_share_a_segment_by_bucket(env: &Env) {
         client.close().await.unwrap();
     });
     assert_eq!(stream_backlog(env, &name), 0);
+}
+
+/// Key affinity with batched producers and shared segments, as Java's `V5EntryBucketDispatchTest` checks it, with
+/// sends pipelined so that entries hold several messages: two members share a one-segment topic by entry bucket, and
+/// each key comes whole to one of them, in order. Java's test sends one message at a time, so its entries hold one.
+fn stream_consumers_share_batched_entries_by_bucket(env: &Env) {
+    let name = unique("batch-share");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &format!("public/default/{name}")]);
+    // Two members on one segment: without this, the controller may split it rather than share it.
+    env.disable_auto_scale(&format!("public/default/{name}"));
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let alice = stream_consumer(&client, &topic, "alice").await;
+        let bob = stream_consumer(&client, &topic, "bob").await;
+        // A member alone on the segment owns every bucket: send once both are on it.
+        wait_for_shared_segment(env, &name, 2).await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let sends =
+            (0..320).map(|i| producer.new_message().key(format!("k{}", i % 16)).value(format!("v-{i:03}")).send());
+        let ids: Vec<String> =
+            futures_util::future::join_all(sends).await.into_iter().map(|id| id.unwrap().to_string()).collect();
+        // `segment:ledger:entry:index`: one segment, and messages after the first of an entry.
+        assert!(ids.iter().all(|id| id.starts_with("0:")), "the segment split: {ids:?}");
+        assert!(ids.iter().any(|id| !id.ends_with(":0")), "no entry of several messages");
+        let (from_alice, from_bob) = futures_util::join!(stream_all(&alice, 320), stream_all(&bob, 320));
+        assert!(!from_alice.is_empty() && !from_bob.is_empty(), "alice {}, bob {}", from_alice.len(), from_bob.len());
+        assert_eq!(from_alice.len() + from_bob.len(), 320);
+        let keys = |messages: &[Message<String>]| -> BTreeMap<String, Vec<String>> {
+            let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for m in messages {
+                keys.entry(m.key().unwrap().to_string()).or_default().push(m.value().unwrap());
+            }
+            keys
+        };
+        let (keys_alice, keys_bob) = (keys(&from_alice), keys(&from_bob));
+        assert!(keys_alice.keys().all(|key| !keys_bob.contains_key(key)), "a key goes to one consumer");
+        for values in keys_alice.values().chain(keys_bob.values()) {
+            let mut sorted = values.clone();
+            sorted.sort();
+            assert_eq!(values, &sorted, "in order");
+        }
+        client.close().await.unwrap();
+    });
+    assert_eq!(stream_backlog(env, &name), 0);
+}
+
+/// Waits until `members` consumers share the one segment of scalable topic `public/default/<name>`, `Key_Shared`.
+async fn wait_for_shared_segment(env: &Env, name: &str, members: usize) {
+    let topic = stats(env, &["scalable-topics", "stats", &format!("public/default/{name}")]);
+    let segments = topic["layout"]["segments"].as_object().expect("the layout's segments");
+    let segment = segments.values().next().and_then(|s| s["name"].as_str()).expect("a segment").to_string();
+    let shared = || {
+        let subscription = &stats(env, &["scalable-topics", "segment-stats", &segment])["subscriptions"][SUB];
+        subscription["type"] == "Key_Shared" && subscription["consumers"].as_array().map_or(0, Vec::len) == members
+    };
+    wait_for(shared, "the members share the segment").await;
+}
+
+/// The batches of a segment's buckets close together and go out in sequence order: with deduplication on, the
+/// broker takes them all, where it would drop, as duplicates, the entries of a bucket that closed after a later one.
+fn batches_pass_the_brokers_deduplication(env: &Env) {
+    let namespace = format!("public/{}", unique("dedup"));
+    env.admin(&["namespaces", "create", &namespace]);
+    env.admin(&["namespaces", "set-deduplication", "--enable", &namespace]);
+    // One segment, with the default four entry buckets.
+    env.admin(&["scalable-topics", "create", "-s", "1", &format!("{namespace}/orders")]);
+    let topic = format!("topic://{namespace}/orders");
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let producer =
+            client.new_producer(Schema::string()).topic(&topic).producer_name("dedup").create().await.unwrap();
+        let sends =
+            (0..400).map(|i| producer.new_message().key(format!("k{}", i % 16)).value(format!("v-{i:03}")).send());
+        let ids: Vec<String> =
+            futures_util::future::join_all(sends).await.into_iter().map(|id| id.unwrap().to_string()).collect();
+        // `segment:ledger:entry:index`; a duplicate's is `-1:-1`.
+        let ledger = |id: &String| id.split(':').nth(1).unwrap().parse::<i64>().unwrap();
+        assert!(ids.iter().all(|id| ledger(id) >= 0), "dropped as duplicates: {ids:?}");
+        assert!(ids.iter().any(|id| !id.ends_with(":0")), "no entry of several messages");
+        client.close().await.unwrap();
+    });
+    assert_eq!(env.consume(&topic, 400).len(), 400);
 }
 
 /// Java's `V5StreamConsumerAckWatermarkTest`: after the subscription is rewound and everything comes again, the

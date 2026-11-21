@@ -58,6 +58,8 @@ pub(crate) enum Request {
         /// The message's room under the memory limit. It goes back when the message completes, or when the
         /// request drops untaken.
         room: Reservation,
+        /// Whether its batch goes out at once, as for a blocking send.
+        flush: bool,
         reply: oneshot::Sender<Result<MessageId>>,
     },
     Flush {
@@ -198,11 +200,14 @@ impl Task {
             progressed = true;
             let now = Instant::now();
             match request {
-                Request::Send { message, publish_time, room, reply } => {
+                Request::Send { message, publish_time, room, flush, reply } => {
                     match self.producer.send(message, publish_time, now) {
                         Ok(send) => {
                             self.last_send = Some(send);
                             self.replies.insert(send, (reply, room));
+                            if flush {
+                                self.producer.flush();
+                            }
                         }
                         // Its room goes back as it drops.
                         Err(error) => {
@@ -210,14 +215,17 @@ impl Task {
                         }
                     }
                 }
-                Request::Flush { reply } => match self.last_send {
-                    Some(last) if self.producer.oldest_outstanding().is_some_and(|oldest| oldest <= last) => {
-                        self.flushes.push((last, None, reply));
+                Request::Flush { reply } => {
+                    self.producer.flush();
+                    match self.last_send {
+                        Some(last) if self.producer.oldest_outstanding().is_some_and(|oldest| oldest <= last) => {
+                            self.flushes.push((last, None, reply));
+                        }
+                        _ => {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
-                    _ => {
-                        let _ = reply.send(Ok(()));
-                    }
-                },
+                }
                 // The task ends once closed, so a close comes before that; closing again is a no-op.
                 Request::Close { reply } => {
                     self.close_replies.extend(reply);
