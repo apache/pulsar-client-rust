@@ -44,7 +44,8 @@ meanwhile.
 configured initial id, or, without one, after the broker's last id for the name. A message gets its id when it is
 first written, keeps it, with its bytes, when it is written again after a reconnect, and takes a new one when it
 is routed to another segment. An id set by the application is used as is and doesn't move the counter. The
-producer's last sequence id is the highest the brokers confirmed, over its segments' producers.
+producer's last sequence id is the highest the brokers confirmed, over its segments' producers
+([spec gap 14](../DESIGN.md#spec-gaps-to-raise-upstream)).
 
 **Sending.** Messages flow through:
 
@@ -55,9 +56,12 @@ producer's last sequence id is the highest the brokers confirmed, over its segme
 - The **pending queue** keeps sent, unacknowledged entries in send order. Receipts (`CommandSendReceipt`)
   complete them in order, matched against the head of the queue, as in Java: a receipt for an earlier sequence id
   is late and ignored, one for a later id means the two sides disagree, and the connection is closed so that the
-  producer registers again. After a reconnect the whole queue is resent, in order, before anything new.
+  producer registers again. After a reconnect the whole queue is resent, in order, before anything new. A
+  receipt at -1:-1, for a duplicate the broker discarded, completes its message with that position, as in Java
+  ([spec gap 17](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - The **send timeout** fails each message whose deadline passes, without invalidating the producer
-  (*client-api* §2). A message's clock starts once its segment's producer is registered.
+  (*client-api* §2). A message's clock starts once its segment's producer is registered, and starts again on
+  another segment, as in Java ([spec gap 15](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - A message larger than the broker's `max_message_size` fails alone.
 - **Batch format, always.** Every entry is a batch: `num_messages_in_batch` in the metadata, and a
   `SingleMessageMetadata` before each message. There is one encoding path, whatever the batch size.
@@ -142,12 +146,14 @@ durable cursor. The acks made meanwhile go out before the new permits, as in Jav
 
 ## 4. Reader
 
-A reader is a consumer on a non-durable subscription that starts at a message id (`start_message_id`), with
-no acks. It tracks the last position it delivered, which the Checkpoint consumer snapshots, and it can seek to
-a saved position on restore (*client-behavior* §7). A non-durable subscription has no cursor, so after a
-reconnect the reader resubscribes from the position after the last message it delivered, not from where it
-started. Earliest and latest map to the protocol's sentinel
-message ids.
+A reader is a consumer on an Exclusive subscription that isn't durable, which starts after a message id
+(`start_message_id`), and acknowledges nothing. It keeps its position: where it starts, then the last message taken
+from it. A subscription that isn't durable has no cursor, so each subscribe, a reconnect's too, starts there. The
+broker sends the entry of that position again, and the reader leaves out what it read, as Java's v4 consumer does:
+a message of a batch by its index, one not in a batch as its whole entry. Earliest and latest map to the protocol's
+sentinel message ids. A reader at latest gets no permits until it is told where that is, the segment's last
+message id, so that a checkpoint can name it. There is no seek: a restore creates the readers at the saved positions
+([6](6-scalable-topics.md) §6.1).
 
 ## 5. Dead-letter (later)
 

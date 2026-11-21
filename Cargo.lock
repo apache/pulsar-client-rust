@@ -88,6 +88,7 @@ version = "0.1.0"
 dependencies = [
  "apache-pulsar-protocol",
  "apache-pulsar-testkit",
+ "base64 0.22.1",
  "buffa",
  "bytes",
  "compio",

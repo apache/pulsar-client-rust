@@ -272,12 +272,19 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn put_vector(out: &mut Vec<u8>, vector: &SegmentVector) {
+/// Writes a segment vector: an `i32` count, then per segment its `i64` id and its length-prefixed position. A
+/// checkpoint's positions are one too.
+pub(crate) fn put_vector(out: &mut Vec<u8>, vector: &SegmentVector) {
     out.extend_from_slice(&(vector.len() as i32).to_be_bytes());
     for (segment_id, entry) in vector {
         out.extend_from_slice(&segment_id.to_be_bytes());
         put_bytes(out, &entry.to_bytes());
     }
+}
+
+/// Reads a segment vector, ignoring what follows it.
+pub(crate) fn read_vector(bytes: &[u8]) -> Result<SegmentVector, MessageIdError> {
+    Reader(bytes).vector()
 }
 
 struct Reader<'a>(&'a [u8]);

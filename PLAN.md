@@ -118,6 +118,17 @@ broker's controller orders a key's segments itself: it hands out a segment once 
 `ScalableCheckpointConsumerReconcileTest` and the `V5CheckpointConsumer*Test` classes. Checkpoints round-trip with
 Java across a layout change.
 
+It lands in three pull requests: checkpoint encoding with the ungrouped consumer's state machine and its scenarios
+on the simulated cluster, then the driver and the API, then the grouped mode, on the Stream consumer's assignment
+session from M4.
+
+Done so far: the ungrouped consumer. Checkpoints match Java's golden bytes. The scenarios of the Java tests above
+that don't need a consumer group pass on the simulated cluster
+(`crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`). On the real broker: a resume across a split, a latest
+start across a split, a deleted segment, and a checkpoint round trip with the Java client across a split and a
+merge. The grouped scenarios of `V5CheckpointConsumerGroupTest`, `V5CheckpointConsumerDagReplayTest` and
+`V5CheckpointConsumerUntouchedSegmentTest` wait for the grouped mode.
+
 ## M6: Batching and compression
 
 - Multi-message batches: one open batch per entry bucket, with the stamp ([5](docs/5-segment-engine.md) §2).

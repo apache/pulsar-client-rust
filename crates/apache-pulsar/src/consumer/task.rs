@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The task that runs one Queue consumer on its loop.
+//! The task that runs one consumer on its loop: a Queue consumer, or a Checkpoint consumer.
 //!
-//! It owns the sans-IO [`QueueConsumer`] and its layout watch, and does what the consumer asks: it looks up and
+//! It owns the sans-IO consumer ([`Machine`]) and its layout watch, and does what the consumer asks: it looks up and
 //! connects each segment, subscribes the segment's consumer there, sends its flows, acks and redelivery requests,
-//! and closes it. It feeds back the outcome, the commands the brokers push for each segment's consumer, the layouts
-//! and the passing of time. It hands the application its messages as receives ask for them, in the order they
-//! asked, and takes its acks and its close. Everything is polled from one future.
+//! asks for a segment's last message id, and closes it. It feeds back the outcome, the commands the brokers push for
+//! each segment's consumer, the layouts and the passing of time. It hands the application its messages as receives ask
+//! for them, in the order they asked, and takes its acks, its checkpoints and its close. Everything is polled from
+//! one future.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -31,14 +32,17 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use apache_pulsar_protocol::checkpoint::Checkpoint;
+use apache_pulsar_protocol::checkpoint_consumer::{self, CheckpointConsumer};
 use apache_pulsar_protocol::connection::IdKind;
 use apache_pulsar_protocol::entry::ReceivedMessage;
-use apache_pulsar_protocol::frame::Frame;
-use apache_pulsar_protocol::message_id::MessageId;
+use apache_pulsar_protocol::frame::{Frame, PayloadSection};
+use apache_pulsar_protocol::layout::Layout;
+use apache_pulsar_protocol::message_id::{EntryId, MessageId};
 use apache_pulsar_protocol::producer::RegisterError;
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{BaseCommand, CommandCloseConsumer};
-use apache_pulsar_protocol::queue_consumer::{Action, QueueConsumer};
+use apache_pulsar_protocol::proto::{BaseCommand, CommandCloseConsumer, CommandGetLastMessageId, CommandMessage};
+use apache_pulsar_protocol::queue_consumer::{self, QueueConsumer};
 use buffa::{EnumValue, MessageView};
 use futures_channel::{mpsc, oneshot};
 use futures_util::stream::{FuturesUnordered, SelectAll};
@@ -55,10 +59,10 @@ pub(crate) enum Request {
     Receive {
         max: usize,
         deadline: Option<Instant>,
-        reply: oneshot::Sender<Vec<ReceivedMessage>>,
+        reply: oneshot::Sender<Delivery>,
     },
     /// Messages a receive was answered with, and went away without taking: the next receives get them first.
-    Return(Vec<ReceivedMessage>),
+    Return(Delivery),
     Ack {
         id: MessageId,
         reply: oneshot::Sender<Result<()>>,
@@ -66,15 +70,183 @@ pub(crate) enum Request {
     Nack {
         id: MessageId,
     },
+    /// A Checkpoint consumer's position.
+    Checkpoint {
+        reply: oneshot::Sender<Checkpoint>,
+    },
     /// `None` when the last handle dropped, or the client is closing: close in the background.
     Close {
         reply: Option<oneshot::Sender<Result<()>>>,
     },
 }
 
+/// The answer to a receive: its messages, and where a Checkpoint consumer's checkpoint was for their segments before
+/// them, to go back to if they come back.
+pub(crate) struct Delivery {
+    pub(crate) messages: Vec<ReceivedMessage>,
+    undo: Vec<(i64, EntryId)>,
+}
+
+/// The consumer a task runs.
+pub(crate) enum Machine {
+    Queue(QueueConsumer),
+    Checkpoint(CheckpointConsumer),
+}
+
+/// What a consumer asks of its task, whichever it is.
+enum Action {
+    Connect { segment: u64, generation: u64, topic: String },
+    Send { segment: u64, command: Box<BaseCommand> },
+    CloseConsumer { segment: u64, generation: u64 },
+    GetLastMessageId { segment: u64, generation: u64 },
+    Subscribed(std::result::Result<(), RegisterError>),
+    Closed,
+}
+
+impl Machine {
+    pub(crate) fn topic(&self) -> &str {
+        match self {
+            Machine::Queue(queue) => queue.topic(),
+            Machine::Checkpoint(reader) => reader.topic(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Machine::Queue(queue) => queue.is_closed(),
+            Machine::Checkpoint(reader) => reader.is_closed(),
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Machine::Queue(queue) => queue.close(),
+            Machine::Checkpoint(reader) => reader.close(),
+        }
+    }
+
+    fn subscribe_command(&self, segment: u64) -> Option<BaseCommand> {
+        match self {
+            Machine::Queue(queue) => queue.subscribe_command(segment, 0),
+            Machine::Checkpoint(reader) => reader.subscribe_command(segment, 0),
+        }
+    }
+
+    fn on_layout(&mut self, layout: Rc<Layout>, now: Instant) {
+        match self {
+            Machine::Queue(queue) => queue.on_layout(layout, now),
+            Machine::Checkpoint(reader) => reader.on_layout(layout, now),
+        }
+    }
+
+    fn on_subscribed(&mut self, segment: u64, generation: u64, consumer_id: u64) {
+        match self {
+            Machine::Queue(queue) => queue.on_subscribed(segment, generation, consumer_id),
+            Machine::Checkpoint(reader) => reader.on_subscribed(segment, generation, consumer_id),
+        }
+    }
+
+    fn on_subscribe_failed(&mut self, segment: u64, generation: u64, error: RegisterError, now: Instant) {
+        match self {
+            Machine::Queue(queue) => queue.on_subscribe_failed(segment, generation, error, now),
+            Machine::Checkpoint(reader) => reader.on_subscribe_failed(segment, generation, error, now),
+        }
+    }
+
+    fn on_message(&mut self, segment: u64, generation: u64, message: &CommandMessage, section: &PayloadSection) {
+        match self {
+            Machine::Queue(queue) => queue.on_message(segment, generation, message, section),
+            Machine::Checkpoint(reader) => reader.on_message(segment, generation, message, section),
+        }
+    }
+
+    fn on_reached_end_of_topic(&mut self, segment: u64, generation: u64) {
+        match self {
+            Machine::Queue(queue) => queue.on_reached_end_of_topic(segment, generation),
+            Machine::Checkpoint(reader) => reader.on_reached_end_of_topic(segment, generation),
+        }
+    }
+
+    fn on_disconnected(&mut self, segment: u64, generation: u64, now: Instant) {
+        match self {
+            Machine::Queue(queue) => queue.on_disconnected(segment, generation, now),
+            Machine::Checkpoint(reader) => reader.on_disconnected(segment, generation, now),
+        }
+    }
+
+    fn on_closed(&mut self, segment: u64, generation: u64) {
+        match self {
+            Machine::Queue(queue) => queue.on_closed(segment, generation),
+            Machine::Checkpoint(reader) => reader.on_closed(segment, generation),
+        }
+    }
+
+    fn next_message(&mut self) -> Option<ReceivedMessage> {
+        match self {
+            Machine::Queue(queue) => queue.next_message(),
+            Machine::Checkpoint(reader) => reader.next_message(),
+        }
+    }
+
+    /// A message reached the application. Returns where a Checkpoint consumer's checkpoint was for its segment.
+    fn deliver(&mut self, id: &MessageId) -> Option<EntryId> {
+        match self {
+            Machine::Queue(_) => None,
+            Machine::Checkpoint(reader) => reader.deliver(id),
+        }
+    }
+
+    fn poll_timeout(&self) -> Option<Instant> {
+        match self {
+            Machine::Queue(queue) => queue.poll_timeout(),
+            Machine::Checkpoint(reader) => reader.poll_timeout(),
+        }
+    }
+
+    fn handle_timeout(&mut self, now: Instant) {
+        match self {
+            Machine::Queue(queue) => queue.handle_timeout(now),
+            Machine::Checkpoint(reader) => reader.handle_timeout(now),
+        }
+    }
+
+    fn poll_action(&mut self) -> Option<Action> {
+        match self {
+            Machine::Queue(queue) => queue.poll_action().map(|action| match action {
+                queue_consumer::Action::Connect { segment, generation, topic } => {
+                    Action::Connect { segment, generation, topic }
+                }
+                queue_consumer::Action::Send { segment, command } => Action::Send { segment, command },
+                queue_consumer::Action::CloseConsumer { segment, generation } => {
+                    Action::CloseConsumer { segment, generation }
+                }
+                queue_consumer::Action::Subscribed(result) => Action::Subscribed(result),
+                queue_consumer::Action::Closed => Action::Closed,
+            }),
+            Machine::Checkpoint(reader) => reader.poll_action().map(|action| match action {
+                checkpoint_consumer::Action::Connect { segment, generation, topic } => {
+                    Action::Connect { segment, generation, topic }
+                }
+                checkpoint_consumer::Action::Send { segment, command } => Action::Send { segment, command },
+                checkpoint_consumer::Action::CloseConsumer { segment, generation } => {
+                    Action::CloseConsumer { segment, generation }
+                }
+                checkpoint_consumer::Action::GetLastMessageId { segment, generation } => {
+                    Action::GetLastMessageId { segment, generation }
+                }
+                checkpoint_consumer::Action::Subscribed(result) => Action::Subscribed(result),
+                checkpoint_consumer::Action::Closed => Action::Closed,
+            }),
+        }
+    }
+}
+
 type Sleep = Pin<Box<dyn Future<Output = ()>>>;
 type Subscription = Pin<Box<dyn Future<Output = Subscribed>>>;
 type Closing = Pin<Box<dyn Future<Output = (u64, u64)>>>;
+/// A last message id asked for a segment's subscription of a generation: the id, or `None` if the broker didn't give
+/// it.
+type Asking = Pin<Box<dyn Future<Output = (u64, u64, Option<EntryId>)>>>;
 type Pushes = Pin<Box<dyn Stream<Item = (u64, u64, Push)>>>;
 /// Where a subscribe in flight registered its consumer id, once it did.
 type Registering = Rc<RefCell<Option<(ConnHandle, u64)>>>;
@@ -106,11 +278,11 @@ struct Waiter {
     max: usize,
     deadline: Option<Instant>,
     got: Vec<ReceivedMessage>,
-    reply: oneshot::Sender<Vec<ReceivedMessage>>,
+    reply: oneshot::Sender<Delivery>,
 }
 
 pub(crate) struct Task {
-    queue: QueueConsumer,
+    machine: Machine,
     client: local::PulsarClient,
     watch: LayoutWatch,
     /// The client keeps a sender of its own, to close the consumer: the channel doesn't end while the task runs.
@@ -121,6 +293,7 @@ pub(crate) struct Task {
     /// they complete.
     registering: HashMap<(u64, u64), Registering>,
     closes: FuturesUnordered<Closing>,
+    asks: FuturesUnordered<Asking>,
     pushes: SelectAll<Pushes>,
     /// Receives, in the order they came.
     waiters: VecDeque<Waiter>,
@@ -134,14 +307,14 @@ pub(crate) struct Task {
 
 impl Task {
     pub(crate) fn new(
-        queue: QueueConsumer,
+        machine: Machine,
         client: local::PulsarClient,
         watch: LayoutWatch,
         requests: mpsc::UnboundedReceiver<Request>,
         subscribed: oneshot::Sender<Result<()>>,
     ) -> Self {
         Self {
-            queue,
+            machine,
             client,
             watch,
             requests,
@@ -149,6 +322,7 @@ impl Task {
             subscriptions: FuturesUnordered::new(),
             registering: HashMap::new(),
             closes: FuturesUnordered::new(),
+            asks: FuturesUnordered::new(),
             pushes: SelectAll::new(),
             waiters: VecDeque::new(),
             returned: VecDeque::new(),
@@ -182,6 +356,7 @@ impl Task {
             progressed |= self.poll_subscriptions(cx);
             progressed |= self.poll_pushes(cx);
             progressed |= self.poll_closes(cx);
+            progressed |= self.poll_asks(cx);
             // Before the timer: a receive whose time is up takes the messages in first.
             progressed |= self.serve();
             progressed |= self.poll_timer(cx);
@@ -199,7 +374,7 @@ impl Task {
     fn poll_requests(&mut self, cx: &mut Context<'_>) -> bool {
         let mut progressed = false;
         // Once closing, requests wait for the end of the task, which fails them.
-        while !self.queue.is_closed()
+        while !self.machine.is_closed()
             && let Poll::Ready(Some(request)) = self.requests.poll_next_unpin(cx)
         {
             progressed = true;
@@ -208,15 +383,23 @@ impl Task {
                 Request::Receive { max, deadline, reply } => {
                     self.waiters.push_back(Waiter { max, deadline, got: Vec::new(), reply });
                 }
-                Request::Return(messages) => self.give_back(messages),
+                Request::Return(delivery) => self.take_back(delivery),
                 Request::Ack { id, reply } => {
-                    self.queue.acknowledge(&id, now);
+                    let Machine::Queue(queue) = &mut self.machine else { continue };
+                    queue.acknowledge(&id, now);
                     let _ = reply.send(Ok(()));
                 }
-                Request::Nack { id } => self.queue.negative_acknowledge(&id, now),
+                Request::Nack { id } => {
+                    let Machine::Queue(queue) = &mut self.machine else { continue };
+                    queue.negative_acknowledge(&id, now);
+                }
+                Request::Checkpoint { reply } => {
+                    let Machine::Checkpoint(reader) = &self.machine else { continue };
+                    let _ = reply.send(reader.checkpoint());
+                }
                 Request::Close { reply } => {
                     self.close_replies.extend(reply);
-                    self.queue.close();
+                    self.machine.close();
                 }
             }
         }
@@ -227,7 +410,7 @@ impl Task {
         let mut progressed = false;
         while let Poll::Ready(Some(layout)) = self.watch.updates.poll_next_unpin(cx) {
             progressed = true;
-            self.queue.on_layout(layout, Instant::now());
+            self.machine.on_layout(layout, Instant::now());
         }
         progressed
     }
@@ -243,9 +426,9 @@ impl Task {
                     let consumer_id = link.consumer_id;
                     self.pushes.push(Box::pin(pushes.map(move |push| (segment, generation, push))));
                     self.links.insert(segment, link);
-                    self.queue.on_subscribed(segment, generation, consumer_id);
+                    self.machine.on_subscribed(segment, generation, consumer_id);
                 }
-                Err(error) => self.queue.on_subscribe_failed(segment, generation, error, Instant::now()),
+                Err(error) => self.machine.on_subscribe_failed(segment, generation, error, Instant::now()),
             }
         }
         progressed
@@ -271,11 +454,11 @@ impl Task {
             EnumValue::Known(Type::MESSAGE) => {
                 // A message comes with its payload: the connection decodes it.
                 let Some(section) = &frame.payload else { return };
-                self.queue.on_message(segment, generation, &command.message, section);
+                self.machine.on_message(segment, generation, &command.message, section);
             }
-            EnumValue::Known(Type::REACHED_END_OF_TOPIC) => self.queue.on_reached_end_of_topic(segment, generation),
+            EnumValue::Known(Type::REACHED_END_OF_TOPIC) => self.machine.on_reached_end_of_topic(segment, generation),
             // The broker closed the consumer (an unload, a deleted segment) or moved the topic: the only other
-            // commands it pushes to a Shared consumer.
+            // commands it pushes to a Shared consumer or a reader.
             _ => self.unlink(segment, generation),
         }
     }
@@ -284,21 +467,35 @@ impl Task {
     /// current one, and tell the consumer.
     fn unlink(&mut self, segment: u64, generation: u64) {
         self.links.retain(|&s, link| (s, link.generation) != (segment, generation));
-        self.queue.on_disconnected(segment, generation, Instant::now());
+        self.machine.on_disconnected(segment, generation, Instant::now());
     }
 
     fn poll_closes(&mut self, cx: &mut Context<'_>) -> bool {
         let mut progressed = false;
         while let Poll::Ready(Some((segment, generation))) = self.closes.poll_next_unpin(cx) {
             progressed = true;
-            self.queue.on_closed(segment, generation);
+            self.machine.on_closed(segment, generation);
+        }
+        progressed
+    }
+
+    fn poll_asks(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut progressed = false;
+        while let Poll::Ready(Some((segment, generation, id))) = self.asks.poll_next_unpin(cx) {
+            progressed = true;
+            // Only a Checkpoint consumer asks.
+            let Machine::Checkpoint(reader) = &mut self.machine else { continue };
+            match id {
+                Some(id) => reader.on_last_message_id(segment, generation, id),
+                None => reader.on_last_message_id_failed(segment, generation, Instant::now()),
+            }
         }
         progressed
     }
 
     fn poll_timer(&mut self, cx: &mut Context<'_>) -> bool {
         let receive = self.waiters.iter().filter_map(|waiter| waiter.deadline).min();
-        let Some(deadline) = self.queue.poll_timeout().into_iter().chain(receive).min() else {
+        let Some(deadline) = self.machine.poll_timeout().into_iter().chain(receive).min() else {
             self.timer = None;
             return false;
         };
@@ -308,7 +505,7 @@ impl Task {
         }
         self.timer = None;
         let now = Instant::now();
-        self.queue.handle_timeout(now);
+        self.machine.handle_timeout(now);
         // The receives whose time is up get what they have.
         let (due, waiting): (VecDeque<Waiter>, VecDeque<Waiter>) = std::mem::take(&mut self.waiters)
             .into_iter()
@@ -333,7 +530,7 @@ impl Task {
     /// gets any. A message is taken from the consumer only for a receive, so that the broker's permits follow what
     /// the application takes.
     fn serve(&mut self) -> bool {
-        if self.queue.is_closed() {
+        if self.machine.is_closed() {
             // The receives fail: their answer never comes. The broker delivers again the messages they had, and those
             // given back.
             self.waiters.clear();
@@ -345,7 +542,7 @@ impl Task {
             // A receive that went away is answered at once: its answer comes back, with whatever it had.
             let gone = waiter.reply.is_canceled();
             while !gone && waiter.got.len() < waiter.max {
-                let Some(message) = self.returned.pop_front().or_else(|| self.queue.next_message()) else { break };
+                let Some(message) = self.returned.pop_front().or_else(|| self.machine.next_message()) else { break };
                 waiter.got.push(message);
                 progressed = true;
             }
@@ -359,33 +556,50 @@ impl Task {
         progressed
     }
 
-    /// Answers a receive. One that went away gives its messages back, for the next ones.
+    /// Answers a receive: its messages reach the application. One that went away gives its messages back, for the
+    /// next ones.
     fn answer(&mut self, waiter: Waiter) {
-        if let Err(messages) = waiter.reply.send(waiter.got) {
-            self.give_back(messages);
+        let mut undo: Vec<(i64, EntryId)> = Vec::new();
+        for message in &waiter.got {
+            let segment = message.id.segment_id;
+            if let Some(before) = self.machine.deliver(&message.id)
+                && !undo.iter().any(|(s, _)| *s == segment)
+            {
+                undo.push((segment, before));
+            }
+        }
+        if let Err(delivery) = waiter.reply.send(Delivery { messages: waiter.got, undo }) {
+            self.take_back(delivery);
         }
     }
 
-    fn give_back(&mut self, messages: Vec<ReceivedMessage>) {
-        for message in messages.into_iter().rev() {
+    /// Takes back messages that didn't reach the application, for the next receives. A Checkpoint consumer's
+    /// checkpoint names what it named before them again.
+    fn take_back(&mut self, delivery: Delivery) {
+        for (segment, position) in delivery.undo {
+            let Machine::Checkpoint(reader) = &mut self.machine else { break };
+            reader.rewind(segment, position);
+        }
+        for message in delivery.messages.into_iter().rev() {
             self.returned.push_front(message);
         }
     }
 
     fn drain_actions(&mut self) -> bool {
         let mut progressed = false;
-        while let Some(action) = self.queue.poll_action() {
+        while let Some(action) = self.machine.poll_action() {
             progressed = true;
             match action {
                 Action::Connect { segment, generation, topic } => self.connect(segment, generation, topic),
                 Action::Send { segment, command } => self.send(segment, *command),
                 Action::CloseConsumer { segment, generation } => self.close_consumer(segment, generation),
+                Action::GetLastMessageId { segment, generation } => self.ask(segment, generation),
                 Action::Subscribed(result) => {
                     let subscribed = self.subscribed.take().expect("a consumer subscribes once");
                     // Nobody waits for it any more, as the subscribe was dropped: close it, before the broker
                     // gives it messages that nobody takes.
                     if subscribed.send(result.map_err(subscribe_error)).is_err() {
-                        self.queue.close();
+                        self.machine.close();
                     }
                 }
                 Action::Closed => {
@@ -400,7 +614,7 @@ impl Task {
     }
 
     fn connect(&mut self, segment: u64, generation: u64, topic: String) {
-        let Some(command) = self.queue.subscribe_command(segment, 0) else { return };
+        let Some(command) = self.machine.subscribe_command(segment) else { return };
         let client = self.client.clone();
         let registered = Rc::new(RefCell::new(None));
         self.registering.insert((segment, generation), registered.clone());
@@ -416,6 +630,17 @@ impl Task {
     fn send(&self, segment: u64, command: BaseCommand) {
         let Some(link) = self.links.get(&segment) else { return };
         let _ = link.connection.send(command);
+    }
+
+    /// Asks for the segment's last message id on its reader's connection. Without a link, the connection just went:
+    /// the consumer heard it from the pushes, and forgot what it asked.
+    fn ask(&mut self, segment: u64, generation: u64) {
+        let Some(link) = self.links.get(&segment) else { return };
+        let (connection, consumer_id) = (link.connection.clone(), link.consumer_id);
+        self.asks.push(Box::pin(async move {
+            let response = connection.request(move |request_id| last_message_id_command(consumer_id, request_id)).await;
+            (segment, generation, response.ok().and_then(|frame| last_message_id(&frame)))
+        }));
     }
 
     /// Closes the segment's consumer on the broker. Without a link, the connection just went: the consumer heard it
@@ -462,6 +687,20 @@ pub(super) fn close_command(consumer_id: u64, request_id: u64) -> BaseCommand {
         close_consumer: CommandCloseConsumer { consumer_id, request_id, ..Default::default() }.into(),
         ..Default::default()
     }
+}
+
+fn last_message_id_command(consumer_id: u64, request_id: u64) -> BaseCommand {
+    BaseCommand {
+        r#type: Type::GET_LAST_MESSAGE_ID.into(),
+        getLastMessageId: CommandGetLastMessageId { consumer_id, request_id, ..Default::default() }.into(),
+        ..Default::default()
+    }
+}
+
+/// The last message id of a `CommandGetLastMessageIdResponse`.
+fn last_message_id(frame: &Frame) -> Option<EntryId> {
+    let command = frame.command_view().ok()?.to_owned_message().ok()?;
+    Some(EntryId::from_proto(&command.getLastMessageIdResponse.last_message_id))
 }
 
 /// The public error for a subscribe that failed.

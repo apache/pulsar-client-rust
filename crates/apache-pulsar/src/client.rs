@@ -32,7 +32,7 @@ use futures_util::future::LocalBoxFuture;
 use futures_util::stream::FuturesUnordered;
 
 use crate::config::{ClientBuilder, ClientConfig, ThreadSafe};
-use crate::consumer::{QueueConsumerBuilder, StreamConsumerBuilder};
+use crate::consumer::{CheckpointConsumerBuilder, QueueConsumerBuilder, StreamConsumerBuilder};
 use crate::error::{Error, ErrorKind, Result};
 use crate::local;
 use crate::memory::MemoryLimit;
@@ -128,6 +128,12 @@ impl PulsarClient {
     /// [`StreamConsumerBuilder`].
     pub fn new_stream_consumer<T: 'static>(&self, schema: Schema<T>) -> StreamConsumerBuilder<T> {
         StreamConsumerBuilder::new(self.clone(), schema)
+    }
+
+    /// A Checkpoint consumer, with a reader on every segment of the topic's layout, that reads values with `schema`.
+    /// See [`CheckpointConsumerBuilder`].
+    pub fn new_checkpoint_consumer<T: 'static>(&self, schema: Schema<T>) -> CheckpointConsumerBuilder<T> {
+        CheckpointConsumerBuilder::new(self.clone(), schema)
     }
 
     /// The loop for a new producer or consumer: the least loaded, by count. The slot counts it there until dropped.

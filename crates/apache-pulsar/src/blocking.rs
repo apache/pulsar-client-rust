@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 
 use futures_executor::block_on;
 
+use crate::checkpoint::Checkpoint;
 use crate::config::{Blocking, ClientBuilder};
 use crate::consumer::Message;
 use crate::error::Result;
@@ -55,6 +56,14 @@ impl PulsarClient {
     /// A Stream consumer that reads values with `schema`. See [`crate::StreamConsumerBuilder`].
     pub fn new_stream_consumer<T: 'static>(&self, schema: Schema<T>) -> crate::StreamConsumerBuilder<T, Blocking> {
         crate::StreamConsumerBuilder::new_blocking(self.inner.clone(), schema)
+    }
+
+    /// A Checkpoint consumer that reads values with `schema`. See [`crate::CheckpointConsumerBuilder`].
+    pub fn new_checkpoint_consumer<T: 'static>(
+        &self,
+        schema: Schema<T>,
+    ) -> crate::CheckpointConsumerBuilder<T, Blocking> {
+        crate::CheckpointConsumerBuilder::new_blocking(self.inner.clone(), schema)
     }
 
     /// Closes the client, its producers and consumers first. Can be called again.
@@ -300,6 +309,62 @@ impl<T: 'static> StreamConsumer<T> {
     }
 
     /// See [`crate::StreamConsumer::close`].
+    pub fn close(&self) -> Result<()> {
+        block_on(self.inner.close())
+    }
+}
+
+/// A blocking Checkpoint consumer. `Send + Sync`, and cheap to clone. See [`crate::CheckpointConsumer`].
+pub struct CheckpointConsumer<T> {
+    inner: crate::CheckpointConsumer<T>,
+}
+
+impl<T> Clone for CheckpointConsumer<T> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
+impl<T> std::fmt::Debug for CheckpointConsumer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<T: 'static> CheckpointConsumer<T> {
+    pub(crate) fn new(inner: crate::CheckpointConsumer<T>) -> Self {
+        Self { inner }
+    }
+
+    pub fn topic(&self) -> &str {
+        self.inner.topic()
+    }
+
+    pub fn consumer_name(&self) -> Option<&str> {
+        self.inner.consumer_name()
+    }
+
+    /// Blocks until the next message.
+    pub fn receive(&self) -> Result<Message<T>> {
+        block_on(self.inner.receive())
+    }
+
+    /// Blocks until the next message, for up to `timeout`.
+    pub fn receive_timeout(&self, timeout: Duration) -> Result<Option<Message<T>>> {
+        block_on(self.inner.receive_timeout(timeout))
+    }
+
+    /// Blocks until there are `max` messages, or `timeout` passes. See [`crate::CheckpointConsumer::receive_batch`].
+    pub fn receive_batch(&self, max: usize, timeout: Duration) -> Result<Vec<Message<T>>> {
+        block_on(self.inner.receive_batch(max, timeout))
+    }
+
+    /// See [`crate::CheckpointConsumer::checkpoint`].
+    pub fn checkpoint(&self) -> Result<Checkpoint> {
+        block_on(self.inner.checkpoint())
+    }
+
+    /// See [`crate::CheckpointConsumer::close`].
     pub fn close(&self) -> Result<()> {
         block_on(self.inner.close())
     }
