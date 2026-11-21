@@ -23,11 +23,12 @@ A Rust client for [Apache Pulsar](https://pulsar.apache.org) scalable topics, bu
 [Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) on the
 [compio](https://github.com/compio-rs/compio) runtime.
 
-**Status:** milestone 3. Producers publish to scalable topics, keeping per-key order across segment splits and
+**Status:** milestone 4. Producers publish to scalable topics, keeping per-key order across segment splits and
 merges, and to regular `persistent://` topics through the migration bridge. Queue consumers read every segment of
-a topic, following its splits and merges, and acknowledge each message. Both work in the thread-safe, local and
-blocking APIs, with token and mTLS authentication, directly or through a proxy. The Stream and Checkpoint
-consumers come next. The design is in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
+a topic, following its splits and merges, and acknowledge each message. Stream consumers read the segments the
+topic's controller assigns them, each key in order, share segments by entry bucket when they outnumber them, and
+acknowledge cumulatively. All work in the thread-safe, local and blocking APIs, with token and mTLS authentication,
+directly or through a proxy. The Checkpoint consumer comes next. The design is in [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
 
 ```rust
 let client = PulsarClient::builder().service_url("pulsar://localhost:6650").build().await?;
@@ -48,7 +49,7 @@ client.close().await?;
 
 | Path | What it is |
 |---|---|
-| `crates/apache-pulsar` | The client: producers, Queue consumers, layout watches, connections, the pool, lookup, authentication, TLS, the memory limit, and the thread-safe, local and blocking APIs. |
+| `crates/apache-pulsar` | The client: producers, Queue and Stream consumers, layout watches, connections, the pool, lookup, authentication, TLS, the memory limit, and the thread-safe, local and blocking APIs. |
 | `crates/apache-pulsar-protocol` | The sans-IO protocol core: generated protobuf code, framing, the connection, producer and consumer state machines, entry decoding, layouts and routing, message ids. Internal; not a stable API. |
 | `crates/apache-pulsar-testkit` | The simulated broker and cluster, and the deterministic tests of the protocol state machines. Not published. |
 | `checks/` | Milestone 0 checks: compio behavior, and the handshake against a real broker. |

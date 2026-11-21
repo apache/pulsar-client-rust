@@ -40,7 +40,9 @@ mod watch;
 pub use auth::{Authentication, TlsAuthentication, Token};
 pub use client::PulsarClient;
 pub use config::{Blocking, ClientBuilder, Local, ThreadSafe};
-pub use consumer::{Message, QueueConsumer, QueueConsumerBuilder, SubscriptionInitialPosition};
+pub use consumer::{
+    Message, QueueConsumer, QueueConsumerBuilder, StreamConsumer, StreamConsumerBuilder, SubscriptionInitialPosition,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use message_id::MessageId;
 pub use producer::{MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder};
@@ -50,5 +52,7 @@ pub use schema::Schema;
 mod consumer_tests;
 #[cfg(test)]
 mod producer_tests;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod tests;

@@ -79,6 +79,8 @@ pub struct Layout {
     segments: BTreeMap<u64, Segment>,
     /// Ids of the active segments, by hash-range start.
     active: Vec<u64>,
+    /// The controller leader's `pulsar://` and `pulsar+ssl://` URLs, when the broker gives them.
+    controller: (Option<String>, Option<String>),
 }
 
 impl Layout {
@@ -117,7 +119,9 @@ impl Layout {
         }
         let mut active: Vec<u64> = segments.values().filter(|s| s.active).map(|s| s.id).collect();
         active.sort_by_key(|id| segments[id].hash_start);
-        Ok(Layout { epoch: dag.epoch, topic: topic.to_string(), segments, active })
+        let url = |url: &Option<String>| url.clone().filter(|url| !url.is_empty());
+        let controller = (url(&dag.controller_broker_url), url(&dag.controller_broker_url_tls));
+        Ok(Layout { epoch: dag.epoch, topic: topic.to_string(), segments, active, controller })
     }
 
     pub fn epoch(&self) -> u64 {
@@ -127,6 +131,11 @@ impl Layout {
     /// The resolved `topic://` name.
     pub fn topic(&self) -> &str {
         &self.topic
+    }
+
+    /// The URL of the topic's controller leader, for a client using TLS or not, if the broker gives it.
+    pub fn controller(&self, tls: bool) -> Option<&str> {
+        if tls { self.controller.1.as_deref() } else { self.controller.0.as_deref() }
     }
 
     pub fn segment(&self, id: u64) -> Option<&Segment> {

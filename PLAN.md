@@ -100,6 +100,14 @@ It lands in three pull requests: the segment consumer's cumulative acks, `Key_Sh
 simulated broker's Exclusive and `Key_Shared` subscriptions; then the assignment session, the Stream consumer and the
 simulated controller; then the driver and the API.
 
+Ported: the reconcile scenarios against hand-made assignments (`crates/apache-pulsar-protocol/tests/stream_consumer.rs`);
+on the simulated cluster, `V5StreamConsumerBasicTest`, `V5StreamConsumerDagReplayTest`, `V5StreamConsumerOrderingTest`,
+`V5StreamConsumerAutoReconnectTest` and `V5StreamConsumerAckWatermarkTest`, members that share a segment by bucket,
+a crashed member's messages handed to another, and members beyond the buckets
+(`crates/apache-pulsar-testkit/tests/stream_consumer.rs`); against a 5.0.1 broker, the
+basic, DAG replay and ordering, sharing, ack watermark and clean leave cases, with a Java producer. The broker's
+controller orders a key's segments itself: it hands out a segment once its ancestors are drained.
+
 ## M5: Checkpoint consumer
 
 - Readers on every segment, parents first, checkpoint capture and restore, the grouped mode

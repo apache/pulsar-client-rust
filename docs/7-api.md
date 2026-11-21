@@ -133,6 +133,11 @@ let position: Checkpoint = reader.checkpoint().await?;
   the broker confirms it. Grouped acks go out on the ack group timer ([5](5-segment-engine.md) §3). A
   failure can only be local: the consumer is closed. A Queue consumer ignores the id of a segment it no longer
   has, drained or gone from the layout, as Java does: it can't tell it from an id of another consumer.
+- **Stream consumer:** `acknowledge_cumulative` covers, through the message's position vector, everything the
+  consumer gave before it on every segment it still holds ([6](6-scalable-topics.md) §5.2). Its builder takes what
+  *client-api* §4.1 lists, but `read_compacted`, `replicate_subscription_state` and encryption, which come later.
+  The topic's controller knows the consumer by its name: one without a name gets a random one, which
+  `consumer_name()` returns.
 
 ## 5. Messages
 

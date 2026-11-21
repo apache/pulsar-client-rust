@@ -79,7 +79,7 @@ type Pushes = Pin<Box<dyn Stream<Item = (u64, u64, Push)>>>;
 /// Where a subscribe in flight registered its consumer id, once it did.
 type Registering = Rc<RefCell<Option<(ConnHandle, u64)>>>;
 /// A subscribed consumer: its link, and the commands pushed for it.
-type Linked = (Link, mpsc::UnboundedReceiver<Push>);
+pub(super) type Linked = (Link, mpsc::UnboundedReceiver<Push>);
 
 /// The outcome of subscribing a segment's consumer.
 struct Subscribed {
@@ -89,10 +89,10 @@ struct Subscribed {
 }
 
 /// A segment's consumer as registered on a connection. Dropping it unregisters the consumer id there.
-struct Link {
-    generation: u64,
-    connection: ConnHandle,
-    consumer_id: u64,
+pub(super) struct Link {
+    pub(super) generation: u64,
+    pub(super) connection: ConnHandle,
+    pub(super) consumer_id: u64,
 }
 
 impl Drop for Link {
@@ -432,7 +432,7 @@ impl Task {
 }
 
 /// Looks up a segment's topic, connects, and subscribes a consumer there.
-async fn subscribe(
+pub(super) async fn subscribe(
     client: &local::PulsarClient,
     topic: &str,
     generation: u64,
@@ -456,7 +456,7 @@ async fn subscribe(
     Ok((link, pushes))
 }
 
-fn close_command(consumer_id: u64, request_id: u64) -> BaseCommand {
+pub(super) fn close_command(consumer_id: u64, request_id: u64) -> BaseCommand {
     BaseCommand {
         r#type: Type::CLOSE_CONSUMER.into(),
         close_consumer: CommandCloseConsumer { consumer_id, request_id, ..Default::default() }.into(),

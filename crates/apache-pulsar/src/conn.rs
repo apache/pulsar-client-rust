@@ -197,7 +197,7 @@ pub(crate) async fn open(address: BrokerAddress, config: &ClientConfig) -> Resul
     let options = ConnectOptions {
         auth_method,
         auth_data,
-        proxy_to_broker_url: address.through_proxy().then(|| address.logical.to_string()),
+        proxy_to_broker_url: address.through_proxy().then(|| address.proxy_target()),
         handshake_timeout: timeout.saturating_sub(started.elapsed()),
         operation_timeout: config.operation_timeout,
         keepalive_interval: config.keepalive_interval,
