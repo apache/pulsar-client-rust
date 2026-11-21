@@ -23,8 +23,10 @@
 //! host at a time.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -35,6 +37,10 @@ use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
 const IMAGE: (&str, &str) = ("apachepulsar/pulsar", "5.0.1");
+/// A JDK, to compile the Java test tool: the broker image has a Java runtime only.
+const JDK_IMAGE: (&str, &str) = ("eclipse-temurin", "21-jdk-alpine");
+/// What the Java test tool compiles against: the broker's V5 API.
+const V5_API_JAR: &str = "/pulsar/lib/org.apache.pulsar-pulsar-client-api-v5-5.0.1.jar";
 const NETWORK: &str = "apr-it-net";
 const BROKER: &str = "apr-it-broker";
 const PROXY: &str = "apr-it-proxy";
@@ -54,6 +60,8 @@ pub struct Env {
     dir: PathBuf,
     broker: Container<GenericImage>,
     proxy: Container<GenericImage>,
+    /// Set once the Java test tool is in the broker container.
+    java_tool: OnceLock<()>,
 }
 
 impl Env {
@@ -101,7 +109,7 @@ impl Env {
         // The web server starts after the binary protocol's listeners.
         let proxy = start(proxy, "Server started at end point");
 
-        Env { token: secrets.token(TOKEN_ROLE), dir, broker, proxy }
+        Env { token: secrets.token(TOKEN_ROLE), dir, broker, proxy, java_tool: OnceLock::new() }
     }
 
     pub fn ca(&self) -> PathBuf {
@@ -157,6 +165,55 @@ impl Env {
         // Half a second of messages per batch window.
         command.extend(["-z", compression, "-m", &count, "-s", &size, "-r", "200", "-b", "500", topic]);
         self.exec(&command);
+    }
+
+    /// Deletes a segment's topic, as the controller's garbage collection does once the segment is past retention:
+    /// `DELETE /admin/v2/segments/…`, which `pulsar-admin` 5.0.1 has no command for. The layout still has the segment.
+    pub fn delete_segment(&self, segment_topic: &str) {
+        let path = segment_topic.strip_prefix("segment://").expect("a segment topic");
+        let url = format!("http://localhost:8080/admin/v2/segments/{path}?force=true");
+        let delete = format!("curl -sSf -X DELETE -H \"Authorization: Bearer $(cat /it/admin.token)\" '{url}'");
+        self.exec(&["bash", "-c", &delete]);
+    }
+
+    /// Reads `count` messages of `topic` with the Java client's Checkpoint consumer in the broker container, as the
+    /// admin, from `start`: `earliest`, `latest`, or a checkpoint's bytes in hex. Returns the messages as
+    /// `(key, value)`, and the consumer's checkpoint after them, in hex.
+    pub fn java_checkpoint_read(&self, topic: &str, start: &str, count: usize) -> (Vec<(String, String)>, String) {
+        self.java_tool.get_or_init(|| self.install_java_tool());
+        let count = count.to_string();
+        let output = self.exec(&["java", "-cp", "/pulsar/lib/*:/tmp/tool", "CheckpointTool", topic, start, &count]);
+        let mut messages = Vec::new();
+        let mut checkpoint = None;
+        for line in output.lines() {
+            if let Some(message) = line.strip_prefix("message ") {
+                let (key, value) = message.split_once(' ').expect("a key and a value");
+                messages.push((key.to_string(), value.to_string()));
+            } else if let Some(hex) = line.strip_prefix("checkpoint ") {
+                checkpoint = Some(hex.to_string());
+            }
+        }
+        (messages, checkpoint.unwrap_or_else(|| panic!("the Java tool printed no checkpoint:\n{output}")))
+    }
+
+    /// Compiles `CheckpointTool.java` against the broker's V5 API in a JDK container, and copies the class into the
+    /// broker container.
+    fn install_java_tool(&self) {
+        let api = self.broker.copy_file_from(V5_API_JAR, Vec::new()).unwrap();
+        let jdk = GenericImage::new(JDK_IMAGE.0, JDK_IMAGE.1)
+            .with_copy_to("/work/api.jar", api)
+            .with_copy_to("/work/CheckpointTool.java", include_bytes!("CheckpointTool.java").to_vec())
+            .with_cmd(["sleep", "600"])
+            .start()
+            .unwrap_or_else(|error| panic!("starting {JDK_IMAGE:?} failed: {error}"));
+        let javac = ["javac", "--release", "21", "-cp", "/work/api.jar", "-d", "/work", "/work/CheckpointTool.java"];
+        let mut result = jdk.exec(ExecCommand::new(javac).with_cmd_ready_condition(CmdWaitFor::exit())).unwrap();
+        let errors = String::from_utf8_lossy(&result.stderr_to_vec().unwrap()).into_owned();
+        assert_eq!(result.exit_code().unwrap(), Some(0), "javac failed:\n{errors}");
+        let class = jdk.copy_file_from("/work/CheckpointTool.class", Vec::new()).unwrap();
+        let class = base64::engine::general_purpose::STANDARD.encode(class);
+        let install = format!("mkdir -p /tmp/tool && echo {class} | base64 -d > /tmp/tool/CheckpointTool.class");
+        self.exec(&["bash", "-c", &install]);
     }
 
     fn exec(&self, command: &[&str]) -> String {

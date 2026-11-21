@@ -222,7 +222,9 @@ reference to its version. Serializing a message id writes its vector in full (Ja
 
 These rules follow the Java client (`ScalableCheckpointConsumer`, `CheckpointV5.latestOf`). Ported scenarios from
 `ScalableCheckpointConsumerTest`, `ScalableCheckpointConsumerReconcileTest` and the `V5CheckpointConsumer*Test`
-classes check them on the simulated cluster (`crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`).
+classes check them on the simulated cluster (`crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`), and
+integration tests on the real broker, a checkpoint round trip with the Java client across a split and a merge
+among them.
 
 ### 6.2 Grouped
 
