@@ -126,9 +126,10 @@ let position: Checkpoint = reader.checkpoint().await?;
 
 - **Receive:** `receive()`, `receive_timeout(d)` (returns `Ok(None)` when the time is up), and
   `receive_batch(max, timeout)`, which waits until it has `max` messages or the time is up, as Java's
-  `receiveMulti` does. Receives are answered in the order they are first polled, and one dropped before it
-  completes loses no message: the next receive gets it. Each consumer also offers a `futures::Stream` view, which
-  ends when the consumer closes.
+  `receiveMulti` does. Java's Queue consumer has no `receiveMulti`
+  ([J12](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). Receives are answered in the order they
+  are first polled, and one dropped before it completes loses no message: the next receive gets it. Each consumer
+  also offers a `futures::Stream` view, which ends when the consumer closes.
 - **Acknowledge:** the future completes when the ack has been accepted by the consumer's ack tracker, not when
   the broker confirms it. Grouped acks go out on the ack group timer ([5](5-segment-engine.md) §3). A
   failure can only be local: the consumer is closed. A Queue consumer ignores the id of a segment it no longer
@@ -144,7 +145,8 @@ let position: Checkpoint = reader.checkpoint().await?;
 
 `Message<T>` exposes every field of *data-model* §3: `value()`, `data()`, `id()`, `key()`, `properties()`,
 `publish_time()`, `event_time()`, `sequence_id()`, `producer_name()`, `topic()`, `redelivery_count()`, `size()`
-and `replicated_from()`.
+and `replicated_from()`. `topic()` is the scalable topic, not the segment, where Java's Queue consumer gives the
+segment ([J7](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)).
 
 `value()` decodes the payload with the consumer's schema each time it is called and returns `Result<T>`.
 `data()` borrows the raw payload, which shares the receive buffer and is not copied. Messages are immutable.
@@ -165,7 +167,8 @@ pub enum ErrorKind {
 ```
 
 - The kinds are the spec's categories (*error-model* §2), and `NotFound` is distinct from generic failures.
-  The spec groups ProducerBusy and Fenced; they are separate kinds here.
+  The spec groups ProducerBusy and Fenced; they are separate kinds here, as the broker sends them
+  ([spec gap 13](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - `UnsupportedBroker` is the failure when a broker doesn't advertise scalable topics (C15). The spec has no
   category for it, and Java uses `FeatureNotSupportedException` ([spec gap 8](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - `MessageTooLarge` is the failure of a message larger than the broker's `max_message_size`. It fails alone,
@@ -199,7 +202,8 @@ be restored by the other ([spec gap 2](../DESIGN.md#spec-gaps-to-raise-upstream)
   hash-map order, so equal ids from Java can have different bytes, but each side decodes the other.
 
 `MessageId` implements `Ord` with the order of Java's `compareTo`, so ids from one topic compare in a
-consistent way.
+consistent way. As in Java, the two sentinels have no segment, so both sort before every message's id
+([spec gap 18](../DESIGN.md#spec-gaps-to-raise-upstream)).
 
 ## 8. Schemas
 
