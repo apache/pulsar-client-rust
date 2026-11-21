@@ -133,8 +133,8 @@ waiting for exclusive access doesn't hold it up. An application that wants every
 
 ### 5.1 Assignment session
 
-The consumer registers with the topic's controller (*wire-protocol* §6.2, *client-behavior* §8). The session is a state
-machine of its own (`assignment`), which the grouped Checkpoint consumer shares (§6.2).
+The consumer registers with the topic's controller (*wire-protocol* §6.2, *client-behavior* §8). The session is a
+state machine of its own (`assignment`), which the grouped Checkpoint consumer shares (§6.2).
 
 1. Find the controller ([4](4-connections.md) §3): behind a Pulsar proxy, pair with any broker through it; otherwise
    connect to the layout's `controller_broker_url`, or, while the layout names none, to the service URL. A topic's
@@ -144,8 +144,9 @@ machine of its own (`assignment`), which the grouped Checkpoint consumer shares 
    name, across reconnects. A consumer without a name gets a random one, `v5-stream-` and 8 letters and digits, as in
    Java. The response carries the first assignment, or an error that fails `subscribe()`; so does a connection lost
    before it, as in Java.
-3. Apply each assignment whose `layout_epoch` is at least the last applied ([spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)).
-   An assignment that repeats a segment unchanged leaves it alone.
+3. Apply each assignment whose `layout_epoch` is at least the last applied
+   ([spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)). An assignment that repeats a segment unchanged leaves it
+   alone.
 4. On connection loss, register again with a backoff from 100 ms doubling to 30 s. The segments' consumers go on
    meanwhile. Within the controller's grace period (60 s) the same assignment comes back; after it, a rebalanced one.
 5. On close, send `CommandScalableTopicUnsubscribe`, once a registration in flight settles, so that the controller
@@ -156,7 +157,7 @@ Applying an assignment, segment by segment:
 | Change | Action |
 |---|---|
 | Added, `bucket_ranges` empty | Subscribe Exclusive. |
-| Added, `bucket_ranges` set | Subscribe `Key_Shared` STICKY with entry-bucket dispatch, declaring that boundary list (*key-shared* §4). |
+| Added, `bucket_ranges` set | Subscribe `Key_Shared` by entry bucket, declaring those boundaries (*key-shared* §4). |
 | Removed | Drain, then close. |
 | Mode flip (empty ⇄ set) | Drain, close, then subscribe in the new mode. |
 
@@ -164,7 +165,7 @@ Applying an assignment, segment by segment:
 given from it ([5](5-segment-engine.md) §3); the messages still in go to the next owner, in order. The client never
 acknowledges on the application's behalf. A segment comes back only once its old consumer is closed. Each segment's
 consumer is named `<name>-seg-<id>`, and one on a legacy segment carries the V5-managed property, as the Queue
-consumer's do; Java's Stream consumer doesn't mark it.
+consumer's do, and as in Java.
 
 While another member still holds a segment the controller moved, the broker refuses the subscribe with `ConsumerBusy`
 or `ConsumerAssignError`. `subscribe()` waits those out, up to the operation timeout, as Java's does, and fails on any
