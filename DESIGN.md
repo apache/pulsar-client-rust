@@ -71,6 +71,7 @@ here.
 | 10 | *client-api* §3.1 and *error-model* §2 have a pending-send queue that can be full (`ProducerQueueFull`). Java V5 bounds producers by the client memory limit only, and never raises it. | Java's: the memory limit only; the kind exists, unused. | To raise |
 | 11 | *client-behavior* §1 says to apply a layout only if its epoch is greater than the last applied. Java's `DagWatchClient` applies every update it receives. | The spec's: `>`, as in gap 5. | To raise |
 | 12 | A message larger than the broker's `max_message_size` can't be sent, but *error-model* §2 has no category for that failure. Java v4 raises `InvalidMessageException`, which Java V5 doesn't map: its send fails with a plain `PulsarClientException`. | `ErrorKind::MessageTooLarge`. | To raise |
+| 27 | *key-shared* §4 and *client-behavior* §6 turn a Stream consumer's cumulative ack on a shared segment into individual acks of every delivered message "at or before" the recorded position. A redelivery, such as the messages of a member that crashed, can come after messages further on in the segment. By position, an ack of the redelivered message leaves the messages given before it unacknowledged, and a drain that waits for them never ends; an ack of one of those covers a redelivered message the application took after it. Java acks by position. | Acks every message given up to the one at the recorded position, in the order given. | To raise |
 
 ## Reference material
 

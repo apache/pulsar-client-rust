@@ -29,6 +29,12 @@
 //! - **Acknowledgments** are grouped: those made within the ack group time go out in one `CommandAck`, or at once
 //!   when the group reaches its maximum size. An ack of a message in a batch acknowledges its index, and the broker
 //!   drops the entry once every index is acknowledged. Acks are fire and forget: nothing waits for the broker.
+//! - **Cumulative acks** acknowledge every message up to a position. On an Exclusive subscription one `CommandAck`
+//!   carries it. A `Key_Shared` subscription forbids them: the consumer acknowledges one by one every message it gave
+//!   the application up to the one at the position, in the order it gave them (*key-shared* §4).
+//! - **Draining.** Once paused, the consumer gives the application nothing more, and [`SegmentConsumer::is_settled`]
+//!   tells when the application has acknowledged everything it was given. It never acknowledges anything itself. The
+//!   Stream consumer drains a segment before it lets go of it (*key-shared* §4).
 //! - **Negative acks** wait out the negative ack delay, then go out together as one
 //!   `CommandRedeliverUnacknowledgedMessages` per thousand entries. A batch comes back whole, as in Java.
 //! - **Reconnecting.** After a connection loss it drops the messages the application hasn't taken, since the broker
@@ -50,7 +56,7 @@ use crate::proto::command_ack::{AckType, ValidationError};
 use crate::proto::command_subscribe::{InitialPosition, SubType};
 use crate::proto::{
     BaseCommand, CommandAck, CommandFlow, CommandMessage, CommandRedeliverUnacknowledgedMessages, CommandSubscribe,
-    KeyValue, MessageIdData, Schema,
+    IntRange, KeySharedMeta, KeySharedMode, KeyValue, MessageIdData, Schema,
 };
 
 /// How many entries one `CommandRedeliverUnacknowledgedMessages` names at most, as in Java.
@@ -84,6 +90,9 @@ pub struct ConsumerOptions {
     pub schema: Option<Schema>,
     /// How long the first subscribe may keep failing with errors worth retrying.
     pub operation_timeout: Duration,
+    /// For a `Key_Shared` subscription, the segment's entry-bucket boundaries: it subscribes STICKY with entry-bucket
+    /// dispatch, declaring them as its hash ranges (*key-shared* §4).
+    pub bucket_ranges: Vec<IntRange>,
 }
 
 impl Default for ConsumerOptions {
@@ -102,6 +111,7 @@ impl Default for ConsumerOptions {
             properties: Vec::new(),
             schema: None,
             operation_timeout: Duration::from_secs(30),
+            bucket_ranges: Vec::new(),
         }
     }
 }
@@ -170,9 +180,25 @@ pub struct SegmentConsumer {
     /// their indexes still unacknowledged.
     acks: BTreeSet<EntryKey>,
     batch_acks: BTreeMap<EntryKey, Vec<u64>>,
+    /// The cumulative ack waiting to go out.
+    cumulative: Option<EntryId>,
+    /// The last cumulative ack that went out on this registration: one at or before it adds nothing. The next
+    /// registration forgets it, since the broker may deliver again what it covered.
+    cumulative_sent: Option<EntryId>,
     ack_deadline: Option<Instant>,
     /// Negatively acknowledged entries, and when to ask for them again.
     nacks: BTreeMap<EntryKey, Instant>,
+    /// On a `Key_Shared` subscription, the messages given to the application and not acknowledged yet, in the order
+    /// given, which a redelivery takes out of the segment's order. A message given again keeps its place.
+    given: VecDeque<EntryId>,
+    /// The same messages, to look them up.
+    given_ids: BTreeSet<EntryId>,
+    /// On the others, the last message given to the application, and the highest position it acknowledged
+    /// cumulatively.
+    last_given: Option<EntryId>,
+    acked_up_to: Option<EntryId>,
+    /// Draining: the application gets nothing more.
+    paused: bool,
     end_of_topic: bool,
     closed: bool,
     actions: VecDeque<Action>,
@@ -196,8 +222,15 @@ impl SegmentConsumer {
             taken: 0,
             acks: BTreeSet::new(),
             batch_acks: BTreeMap::new(),
+            cumulative: None,
+            cumulative_sent: None,
             ack_deadline: None,
             nacks: BTreeMap::new(),
+            given: VecDeque::new(),
+            given_ids: BTreeSet::new(),
+            last_given: None,
+            acked_up_to: None,
+            paused: false,
             end_of_topic: false,
             closed: false,
             actions: VecDeque::new(),
@@ -229,6 +262,14 @@ impl SegmentConsumer {
             schema: self.options.schema.clone().into(),
             initialPosition: Some(self.options.initial_position),
             subscription_properties: key_values(&self.options.subscription_properties),
+            keySharedMeta: (self.options.sub_type == SubType::Key_Shared)
+                .then(|| KeySharedMeta {
+                    keySharedMode: KeySharedMode::STICKY,
+                    hashRanges: self.options.bucket_ranges.clone(),
+                    entryBucketDispatch: Some(true),
+                    ..Default::default()
+                })
+                .into(),
             ..Default::default()
         };
         BaseCommand { r#type: Type::SUBSCRIBE.into(), subscribe: subscribe.into(), ..Default::default() }
@@ -247,6 +288,7 @@ impl SegmentConsumer {
         }
         self.link = Link::Ready { generation, consumer_id };
         self.backoff.reset();
+        self.cumulative_sent = None;
         if !std::mem::replace(&mut self.subscribed_once, true) {
             self.actions.push_back(Action::Subscribed(Ok(())));
         }
@@ -336,42 +378,66 @@ impl SegmentConsumer {
         }
     }
 
-    /// The next message for the application, if one is in.
+    /// The next message for the application, if one is in and the consumer isn't paused.
     pub fn next_message(&mut self) -> Option<ReceivedMessage> {
+        if self.paused {
+            return None;
+        }
         let message = self.incoming.pop_front()?;
         self.taken += 1;
         self.grant_permits();
+        if self.options.sub_type == SubType::Key_Shared {
+            if self.given_ids.insert(message.id.entry) {
+                self.given.push_back(message.id.entry);
+            }
+        } else {
+            self.last_given = Some(message.id.entry);
+        }
         Some(message)
     }
 
-    /// How many messages are in, waiting for the application.
+    /// How many messages are in, waiting for the application: none while paused.
     pub fn available(&self) -> usize {
-        self.incoming.len()
+        if self.paused { 0 } else { self.incoming.len() }
     }
 
     /// Acknowledges a message this consumer delivered.
     pub fn acknowledge(&mut self, id: &EntryId, now: Instant) {
-        let key = (id.ledger_id as u64, id.entry_id as u64);
-        self.nacks.remove(&key);
-        if id.batch_index < 0 || id.batch_size <= 1 {
-            self.batch_acks.remove(&key);
-            self.acks.insert(key);
-        } else {
-            let unacked = self.batch_acks.entry(key).or_insert_with(|| all_set(id.batch_size as usize));
-            let index = id.batch_index as usize;
-            unacked[index / 64] &= !(1 << (index % 64));
-            if unacked.iter().all(|word| *word == 0) {
-                self.batch_acks.remove(&key);
-                self.acks.insert(key);
+        if self.given_ids.remove(id) {
+            self.given.retain(|given| given != id);
+        }
+        self.record_ack(id);
+        self.group_acks(now);
+    }
+
+    /// Acknowledges every message up to and including `position` (*client-behavior* §6). On an Exclusive
+    /// subscription, one cumulative ack carries it, unless one at or after it went out already on this registration.
+    /// A `Key_Shared` subscription forbids cumulative acks: every message given to the application up to the one at
+    /// `position`, in the order given, is acknowledged on its own (*key-shared* §4). Not by position, as the spec
+    /// says: a redelivery, such as the messages of a member that crashed, can come after messages further on in the
+    /// segment. By position, an ack of the redelivered message would leave those given before it, which a drain then
+    /// waits for in vain, and an ack of one of those would cover a redelivered message the application took later.
+    /// Not for a Shared subscription, where nobody acknowledges cumulatively.
+    pub fn acknowledge_cumulative(&mut self, position: &EntryId, now: Instant) {
+        if self.options.sub_type == SubType::Key_Shared {
+            if self.given_ids.contains(position) {
+                while let Some(id) = self.given.pop_front() {
+                    self.given_ids.remove(&id);
+                    self.record_ack(&id);
+                    if id == *position {
+                        break;
+                    }
+                }
+                self.group_acks(now);
             }
+            return;
         }
-        if self.options.ack_group_time.is_zero()
-            || self.acks.len() + self.batch_acks.len() >= self.options.max_ack_group_size
-        {
-            self.flush_acks();
-        } else {
-            self.ack_deadline.get_or_insert(now + self.options.ack_group_time);
+        self.acked_up_to = self.acked_up_to.max(Some(*position));
+        if Some(*position) <= self.cumulative.max(self.cumulative_sent) {
+            return;
         }
+        self.cumulative = Some(*position);
+        self.group_acks(now);
     }
 
     /// Asks for a message again after the negative ack delay. The broker delivers its whole entry again.
@@ -382,7 +448,23 @@ impl SegmentConsumer {
     /// Whether the segment is done for this consumer: its topic is terminated, the subscription acknowledged
     /// everything there, and this consumer has nothing left to deliver or to acknowledge.
     pub fn is_drained(&self) -> bool {
-        self.end_of_topic && self.incoming.is_empty() && self.acks.is_empty() && self.batch_acks.is_empty()
+        self.end_of_topic
+            && self.incoming.is_empty()
+            && self.acks.is_empty()
+            && self.batch_acks.is_empty()
+            && self.cumulative.is_none()
+    }
+
+    /// Stops giving the application messages, to drain the consumer before it closes: the messages in stay for the
+    /// broker to deliver again once it does. For good.
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Whether the application acknowledged every message it was given: each one on a `Key_Shared` subscription, the
+    /// last one, cumulatively, on the others.
+    pub fn is_settled(&self) -> bool {
+        self.given.is_empty() && self.last_given <= self.acked_up_to
     }
 
     /// Whether the consumer is closed and nothing of it is left on a connection: no subscribe or close in flight.
@@ -473,10 +555,43 @@ impl SegmentConsumer {
         }
     }
 
+    /// Takes note of an individual ack: a whole entry, or one index of a batch.
+    fn record_ack(&mut self, id: &EntryId) {
+        let key = (id.ledger_id as u64, id.entry_id as u64);
+        self.nacks.remove(&key);
+        if id.batch_index < 0 || id.batch_size <= 1 {
+            self.batch_acks.remove(&key);
+            self.acks.insert(key);
+        } else {
+            let unacked = self.batch_acks.entry(key).or_insert_with(|| all_set(id.batch_size as usize));
+            let index = id.batch_index as usize;
+            unacked[index / 64] &= !(1 << (index % 64));
+            if unacked.iter().all(|word| *word == 0) {
+                self.batch_acks.remove(&key);
+                self.acks.insert(key);
+            }
+        }
+    }
+
+    /// Sends the acks waiting at once if the group is full or there is no grouping, else at the ack group time.
+    fn group_acks(&mut self, now: Instant) {
+        if self.options.ack_group_time.is_zero()
+            || self.acks.len() + self.batch_acks.len() >= self.options.max_ack_group_size
+        {
+            self.flush_acks();
+        } else {
+            self.ack_deadline.get_or_insert(now + self.options.ack_group_time);
+        }
+    }
+
     /// Sends the acks waiting, when subscribed; otherwise they wait for the subscription.
     fn flush_acks(&mut self) {
         self.ack_deadline = None;
         let Link::Ready { consumer_id, .. } = self.link else { return };
+        if let Some(position) = self.cumulative.take() {
+            self.cumulative_sent = Some(position);
+            self.send(cumulative_ack(consumer_id, &position));
+        }
         if self.acks.is_empty() && self.batch_acks.is_empty() {
             return;
         }
@@ -522,6 +637,22 @@ fn ack(consumer_id: u64, ids: Vec<MessageIdData>, validation_error: Option<Valid
         validation_error,
         ..Default::default()
     };
+    BaseCommand { r#type: Type::ACK.into(), ack: ack.into(), ..Default::default() }
+}
+
+/// A cumulative ack up to `position`. Inside a batch, the indexes after it stay unacknowledged: they are the bits its
+/// ack set keeps, as Java writes them.
+fn cumulative_ack(consumer_id: u64, position: &EntryId) -> BaseCommand {
+    let mut id = entry_id(position.ledger_id as u64, position.entry_id as u64);
+    let index = position.batch_index;
+    if index >= 0 && index < position.batch_size - 1 {
+        let mut unacked = all_set(position.batch_size as usize);
+        for acked in 0..=index as usize {
+            unacked[acked / 64] &= !(1 << (acked % 64));
+        }
+        id.ack_set = unacked.into_iter().map(|word| word as i64).collect();
+    }
+    let ack = CommandAck { consumer_id, ack_type: AckType::Cumulative, message_id: vec![id], ..Default::default() };
     BaseCommand { r#type: Type::ACK.into(), ack: ack.into(), ..Default::default() }
 }
 

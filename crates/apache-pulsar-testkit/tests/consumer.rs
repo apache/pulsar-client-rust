@@ -22,9 +22,9 @@ use std::time::Duration;
 
 use apache_pulsar_protocol::consumer::ConsumerOptions;
 use apache_pulsar_protocol::producer::RegisterError;
-use apache_pulsar_protocol::proto::command_subscribe::InitialPosition;
+use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
 use apache_pulsar_protocol::proto::{
-    CompressionType, EncryptionKeys, MessageMetadata, ServerError, SingleMessageMetadata,
+    CompressionType, EncryptionKeys, IntRange, MessageMetadata, ServerError, SingleMessageMetadata,
 };
 use apache_pulsar_testkit::consumer::ConsumerHarness;
 use apache_pulsar_testkit::producer::{Harness, options as producer_options};
@@ -289,4 +289,54 @@ fn a_close_sends_its_acks_first() {
     h.close();
     assert!(h.closed);
     assert_eq!((h.world.consumer_count(TOPIC, 0, SUB), h.world.backlog(TOPIC, 0, SUB)), (0, 1));
+}
+
+/// On an Exclusive subscription a cumulative ack covers everything before it. After the broker rewinds the
+/// subscription, the application's ack of a position it acknowledged before goes out again.
+#[test]
+fn an_exclusive_consumer_acknowledges_cumulatively() {
+    let mut world = world();
+    for value in ["a", "b", "c"] {
+        publish(&mut world, value);
+    }
+    let options = ConsumerOptions { sub_type: SubType::Exclusive, ack_group_time: Duration::ZERO, ..options() };
+    let mut h = ConsumerHarness::new(world, SEGMENT, 0, options);
+    let taken = h.take();
+    h.ack_cumulative(&taken[1].id);
+    assert_eq!(h.world.backlog(TOPIC, 0, SUB), 1);
+    h.ack_cumulative(&taken[2].id);
+    assert_eq!(h.world.backlog(TOPIC, 0, SUB), 0);
+    // Rewound: the broker closes the consumer, which subscribes again and gets everything again.
+    h.world.rewind(TOPIC, 0, SUB);
+    h.pump();
+    assert_eq!((h.world.backlog(TOPIC, 0, SUB), h.world.consumer_count(TOPIC, 0, SUB)), (3, 0));
+    h.advance(Duration::from_millis(200));
+    assert_eq!(h.take_values(), ["a", "b", "c"]);
+    h.ack_cumulative(&taken[2].id);
+    assert_eq!(h.world.backlog(TOPIC, 0, SUB), 0);
+}
+
+/// On a Key_Shared subscription by entry bucket, a cumulative ack acknowledges one by one what the consumer was given.
+#[test]
+fn a_key_shared_consumer_acknowledges_what_it_was_given() {
+    let mut world = world();
+    for value in ["a", "b", "c"] {
+        publish(&mut world, value);
+    }
+    let options = ConsumerOptions {
+        sub_type: SubType::Key_Shared,
+        bucket_ranges: vec![IntRange { start: 0, end: 0xffff, ..Default::default() }],
+        consumer_name: Some("solo".into()),
+        ..options()
+    };
+    let mut h = ConsumerHarness::new(world, SEGMENT, 0, options);
+    let taken = h.take();
+    assert_eq!(taken.len(), 3);
+    h.ack_cumulative(&taken[1].id);
+    h.advance(Duration::from_millis(100));
+    assert_eq!(h.world.backlog(TOPIC, 0, SUB), 1);
+    h.consumer.pause();
+    assert!(!h.consumer.is_settled());
+    h.ack_cumulative(&taken[2].id);
+    assert!(h.consumer.is_settled());
 }
