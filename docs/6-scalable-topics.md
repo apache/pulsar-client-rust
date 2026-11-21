@@ -144,45 +144,90 @@ application that wants everything published flushes first.
 
 ### 5.1 Assignment session
 
-The consumer registers with the controller (*wire-protocol* §6.2, *client-behavior* §8):
+The consumer registers with the topic's controller (*wire-protocol* §6.2, *client-behavior* §8). The session is a
+state machine of its own (`assignment`), which the grouped Checkpoint consumer shares (§6.2).
 
-1. Open a layout watch to learn `controller_broker_url`, then close it. Connect to the controller, or use one
-   of the fallbacks ([4](4-connections.md) §3).
-2. Send `CommandScalableTopicSubscribe` with a client-chosen `consumer_id` and type `STREAM`. The response
-   carries the first assignment, or an error that fails `subscribe()`.
-3. Apply each `CommandScalableTopicAssignmentUpdate` only if its `layout_epoch` is ≥ the last applied. An
-   update that repeats a segment unchanged leaves it alone (idempotence).
-4. On connection loss, re-run 1–2 with backoff. Within the controller's grace period the same assignment comes
-   back; after it, the client applies whatever changed.
-5. On close, send `CommandScalableTopicUnsubscribe`, best effort: a failure never fails the close.
+1. Find the controller ([4](4-connections.md) §3): behind a Pulsar proxy, pair with any broker through it; otherwise
+   connect to the layout's `controller_broker_url`, or, while the layout names none, to the service URL. A topic's
+   first layout names none until its controller is elected. The 5.0.1 broker never sets `controller_broker_url_tls`,
+   so a client on TLS uses the service URL.
+2. Send `CommandScalableTopicSubscribe`, type `STREAM`, under the consumer's name: the controller knows a member by its
+   name, across reconnects. A consumer without a name gets a random one, `v5-stream-` and 8 letters and digits, as in
+   Java. The response carries the first assignment, or an error that fails `subscribe()`; so does a connection lost
+   before it, as in Java.
+3. Apply each assignment whose `layout_epoch` is at least the last applied
+   ([spec gap 5](../DESIGN.md#spec-gaps-to-raise-upstream)). An assignment that repeats a segment unchanged leaves it
+   alone.
+4. On connection loss, register again with a backoff from 100 ms doubling to 30 s. The segments' consumers go on
+   meanwhile. Within the controller's grace period (60 s) the same assignment comes back; after it, a rebalanced one.
+5. On close, send `CommandScalableTopicUnsubscribe`, once a registration in flight settles, so that the controller
+   rebalances at once. Its outcome never fails the close.
 
 Applying an assignment, segment by segment:
 
 | Change | Action |
 |---|---|
 | Added, `bucket_ranges` empty | Subscribe Exclusive. |
-| Added, `bucket_ranges` set | Subscribe `Key_Shared` with bucket dispatch and that boundary list (*key-shared* §4). |
+| Added, `bucket_ranges` set | Subscribe `Key_Shared` by entry bucket, declaring those boundaries (*key-shared* §4). |
 | Removed | Drain, then close. |
-| Mode flip (empty ⇄ set) | Drain, close, resubscribe in the new mode. |
+| Mode flip (empty ⇄ set) | Drain, close, then subscribe in the new mode. |
 
-*Drain* means stop delivering from the segment, and wait until the application has acknowledged everything it
-was given from that segment ([5](5-segment-engine.md) §3). The client never acknowledges on the
-application's behalf.
+*Drain* means stop delivering from the segment, and wait until the application has acknowledged everything it was
+given from it ([5](5-segment-engine.md) §3); the messages still in go to the next owner, in order. The client never
+acknowledges on the application's behalf. A segment comes back only once its old consumer is closed. Each segment's
+consumer is named `<name>-seg-<id>`, and one on a legacy segment carries the V5-managed property, as the Queue
+consumer's do, and as in Java.
+
+While another member still holds a segment the controller moved, the broker refuses the subscribe with `ConsumerBusy`
+or `ConsumerAssignError`. `subscribe()` waits those out, up to the operation timeout, as Java's does, and fails on any
+other refusal. Later, a segment whose consumer gives up is subscribed again after a backoff shared by every segment,
+100 ms doubling to 30 s, or at once when an assignment comes.
+
+**What the 5.0.1 controller does.** It hands a segment out only once every ancestor of it is drained for the
+subscription, and takes a drained sealed segment back. That keeps a key's older messages first across splits and
+merges, so the client adds no ordering of its own ([spec gap 7](../DESIGN.md#spec-gaps-to-raise-upstream)). While
+members don't outnumber the segments, each segment goes whole to one member; past that, the members share segments
+by entry bucket, and those beyond the topic's buckets get nothing until one leaves. A new topic's segment has four
+buckets, and each child of a split gets half its parent's.
+
+**The initial position** applies to the segments of the layout the consumer subscribes on. A segment created after
+that is subscribed at the earliest position, as in the Queue consumer (§4). That matters only for a consumer whose
+registration lapsed while the segment was created. While a member of the subscription is registered, the broker
+creates a split's or a merge's children with the subscription, at their start. Once none is, it creates them without
+it: observed on a 5.0.1 broker after the last member's unsubscribe, and the same from the controller's code past a
+grace period. Java subscribes every segment at the initial position.
+
+Two cases stay lossy at `Latest`, and only the broker can close them, by creating the subscription on every segment
+when a member registers:
+
+- A consumer that subscribes after such a split has the children in its first layout, so it subscribes them at
+  `Latest`: it skips what they stored before.
+- A new subscription on a topic split before it: the controller hands out the children only once the parent is
+  drained, which it sees from a poll every 2 s or more, and the children are then subscribed at their end. Against a
+  5.0.1 broker, none of 10 messages sent to the children right after `subscribe()` returned arrived.
 
 ### 5.2 Position vector and cumulative ack
 
-When a message is put on the receive queue, it records the position vector: the latest message id delivered
-from every assigned segment at that moment (*client-behavior* §6). A cumulative ack of that message then:
+When the application takes a message, the message records the position vector: the last message given to the
+application from every segment the consumer holds, its own included (*client-behavior* §6). Taking it at delivery, not
+at arrival, keeps prefetched messages out of it. A cumulative ack of that message then:
 
-- on an **Exclusive** segment, acks cumulatively up to the recorded position;
-- on a **shared** segment, where the broker forbids cumulative acks, acks individually every message delivered
-  from that segment up to the recorded position and not yet acknowledged (*key-shared* §4). That needs a set of
-  unacknowledged ids per shared segment.
+- on an **Exclusive** segment, acks cumulatively up to the recorded position, unless an ack at or after it went out
+  already on that consumer's registration;
+- on a **shared** segment, where the broker forbids cumulative acks, acks individually every message given from that
+  segment up to the one at the recorded position, in the order given, and not yet acknowledged. *key-shared* §4 says
+  every message at or before the position, and Java does that, but a redelivery can come after messages further on in
+  the segment: the messages of a member that crashed go to another after its own. By position, an ack of the
+  redelivered message would leave those given before it, and the drain that waits for them would never end; an ack of
+  one of those would cover a redelivered message the application took after it
+  ([spec gap 27](../DESIGN.md#spec-gaps-to-raise-upstream)). That needs the messages given and not acknowledged, in
+  order, per shared segment;
+- on a segment the consumer no longer holds, does nothing, as in Java.
 
-A vector per message would cost O(segments) to copy. Vectors are therefore versions of one persistent
-(structurally shared) map: each enqueue derives a new version in O(log n), and a message holds a cheap
-reference to its version. Serializing a message id writes its vector in full (Java's format, [7](7-api.md)
-§7).
+Each message holds its own copy of the vector, a map with an entry per segment the consumer holds. The persistent maps
+this document proposed, to share the copies, come from MPL-licensed crates (`im`, `rpds`), which `deny.toml` doesn't
+allow; a copy costs O(segments held), and §10 keeps the question open. Serializing a message id writes its vector in
+full (Java's format, [7](7-api.md) §7).
 
 ## 6. Checkpoint consumer
 
@@ -268,7 +313,5 @@ transactions that span loops.
 
 ## 10. Open questions
 
-1. **Parents first for managed assignments.** Does the controller assign a child only once its parents are
-   drained, or must a Stream consumer gate it too ([spec gap 7](../DESIGN.md#spec-gaps-to-raise-upstream))?
-2. **Position vector cost** with many segments, and across topics for namespace consumers: measure the
-   persistent map against plain copies at realistic segment counts.
+1. **Position vector cost** with many segments, and across topics for namespace consumers: measure the plain copies
+   (§5.2) at realistic segment counts, against a structurally shared map under an allowed license.

@@ -20,6 +20,7 @@
 //! This crate is an implementation detail of `apache-pulsar`. Its API is not stable: `apache-pulsar` depends
 //! on an exact version of it.
 
+pub mod assignment;
 pub mod backoff;
 pub mod checkpoint;
 pub mod checkpoint_consumer;
@@ -34,6 +35,7 @@ pub mod lookup;
 pub mod message_id;
 pub mod producer;
 pub mod queue_consumer;
+pub mod stream_consumer;
 
 /// Generated from the vendored `PulsarApi.proto` by `cargo run -p xtask -- codegen`.
 ///
