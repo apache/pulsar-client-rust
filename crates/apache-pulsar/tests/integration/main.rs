@@ -22,6 +22,7 @@
 //! last lines of their logs are printed. What the Rust producer stored is read back with the Java client, and what
 //! the Java client stored is read with the Rust consumer, both Java clients run in the broker container.
 
+mod bridge;
 mod env;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,14 +89,19 @@ fn main() {
     let args = Arguments::from_args();
     // Listing the tests needs no environment.
     let env = (!args.list).then(|| Arc::new(Env::start()));
+    let ignored = bridge::IGNORED.iter().map(|test| (test, true));
     let trials = TESTS
         .iter()
-        .map(|&(name, test)| {
+        .chain(bridge::TESTS)
+        .map(|test| (test, false))
+        .chain(ignored)
+        .map(|(&(name, test), ignored)| {
             let env = env.clone();
-            Trial::test(name, move || {
+            let trial = Trial::test(name, move || {
                 test(env.as_deref().expect("the environment is started unless listing"));
                 Ok(())
-            })
+            });
+            trial.with_ignored_flag(ignored)
         })
         .collect();
     let conclusion = libtest_mimic::run(&args, trials);

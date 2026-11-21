@@ -334,6 +334,11 @@ one segment for a non-partitioned topic, one per partition for a partitioned one
 - The per-segment producers and consumers attach to the wrapped `persistent://` names directly.
 - While every active segment is legacy, keyed messages route mod-N (§3.1). So each key keeps its v4 partition,
   and v4 and v5 clients can run side by side during a migration.
+- Each per-segment producer and consumer on a legacy segment carries `__pulsar.v5.managed=true`. The broker's
+  migration refuses a topic while a client without it, a v4 one, is attached, unless forced.
+- The 5.0.1 controller serves only migrated topics, so the Stream consumer and the members of a Checkpoint consumer
+  group can't use a topic that isn't migrated yet: their create fails
+  ([spec gap 28](../DESIGN.md#spec-gaps-to-raise-upstream)).
 - A cutover to managed segments shows up as an ordinary layout change: legacy segments seal and managed
   successors appear. §3.3 and §6.1 handle it like any split.
 
