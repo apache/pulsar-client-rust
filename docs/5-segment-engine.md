@@ -138,12 +138,14 @@ durable cursor. The acks made meanwhile go out before the new permits, as in Jav
 
 ## 4. Reader
 
-A reader is a consumer on a non-durable subscription that starts at a message id (`start_message_id`), with
-no acks. It tracks the last position it delivered, which the Checkpoint consumer snapshots, and it can seek to
-a saved position on restore (*client-behavior* §7). A non-durable subscription has no cursor, so after a
-reconnect the reader resubscribes from the position after the last message it delivered, not from where it
-started. Earliest and latest map to the protocol's sentinel
-message ids.
+A reader is a consumer on an Exclusive subscription that isn't durable, which starts after a message id
+(`start_message_id`), and acknowledges nothing. It keeps its position: where it starts, then the last message taken
+from it. A subscription that isn't durable has no cursor, so each subscribe, a reconnect's too, starts there. The
+broker sends the entry of that position again, and the reader leaves out what it read, as Java's v4 consumer does:
+a message of a batch by its index, one not in a batch as its whole entry. Earliest and latest map to the protocol's
+sentinel message ids. A reader at latest gets no permits until it is told where that is, the segment's last
+message id, so that a checkpoint can name it. There is no seek: a restore creates the readers at the saved positions
+([6](6-scalable-topics.md) §6.1).
 
 ## 5. Dead-letter (later)
 

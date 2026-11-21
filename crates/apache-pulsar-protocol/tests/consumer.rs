@@ -502,3 +502,47 @@ fn news_from_another_subscription_is_ignored() {
     t.deliver(2, single(0));
     assert_eq!(t.consumer.available(), 0);
 }
+
+/// A reader's subscription isn't durable and starts after its position. The broker sends the start's entry again:
+/// the reader leaves out what it read, as Java's v4 consumer does, and anything earlier.
+#[test]
+fn a_reader_starts_after_its_position() {
+    let start = id(2, 1, 3);
+    let mut reader = SegmentConsumer::reader(options(), 3, TOPIC.into(), start, Instant::now());
+    assert_eq!(reader.position(), Some(start));
+    let subscribe = reader.subscribe_command(7).subscribe;
+    assert_eq!((subscribe.durable, EntryId::from_proto(&subscribe.start_message_id)), (Some(false), start));
+    reader.on_subscribed(1, 7);
+    reader.on_message(1, &single(1).0, &single(1).1);
+    let (message, section) = batch(2, 3, Vec::new());
+    reader.on_message(1, &message, &section);
+    reader.on_message(1, &single(3).0, &single(3).1);
+    assert_eq!(reader.available(), 2);
+    assert_eq!(reader.next_message().unwrap().id.entry, id(2, 2, 3));
+    assert_eq!(reader.position(), Some(id(2, 2, 3)));
+    reader.next_message();
+    assert_eq!(reader.position(), Some(id(3, -1, 0)));
+    // A subscription that is durable has no position, and says nothing of one.
+    let t = Test::subscribed(options());
+    let subscribe = t.consumer.subscribe_command(7).subscribe;
+    assert_eq!((t.consumer.position(), subscribe.durable, subscribe.start_message_id.as_option()), (None, None, None));
+}
+
+/// At the latest position, a reader subscribes without permits until it is told where that is.
+#[test]
+fn a_reader_at_the_latest_position_waits_for_where_that_is() {
+    let mut reader = SegmentConsumer::reader(options(), 3, TOPIC.into(), EntryId::LATEST, Instant::now());
+    assert_eq!((reader.subscription(), reader.poll_action()), (None, Some(Action::Connect { generation: 1 })));
+    reader.on_subscribed(1, 7);
+    assert_eq!((reader.subscription(), reader.poll_action()), (Some(1), None));
+    // An answer on another subscription is no news.
+    reader.resolve(2, id(5, -1, 0));
+    assert_eq!(reader.poll_action(), None);
+    reader.resolve(1, id(5, -1, 0));
+    let actions: Vec<Action> = std::iter::from_fn(|| reader.poll_action()).collect();
+    assert_eq!(actions, [Action::Subscribed(Ok(())), Action::Send(Box::new(permits(7, 4)))]);
+    assert_eq!(reader.position(), Some(id(5, -1, 0)));
+    // Once known, it stays.
+    reader.resolve(1, id(9, -1, 0));
+    assert_eq!((reader.position(), reader.poll_action()), (Some(id(5, -1, 0)), None));
+}

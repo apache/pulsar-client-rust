@@ -36,6 +36,12 @@
 //! - **The end of the topic.** The broker sends `CommandReachedEndOfTopic` to the consumers of a terminated segment
 //!   once their subscription has acknowledged everything there. [`SegmentConsumer::is_drained`] then tells the layer
 //!   above that it can let the segment go.
+//! - **Readers.** A reader ([`SegmentConsumer::reader`]) has a subscription that isn't durable, so it keeps its own
+//!   position: where it starts, then the last message the application took. Each subscribe starts after it, as Java's
+//!   v4 reader does. The broker sends the entry of the start position again, and the reader leaves out what it read
+//!   already ([`reached`]). A reader that starts at the latest position waits, without permits, until the layer above
+//!   tells it the segment's last message id ([`SegmentConsumer::resolve`]): a checkpoint taken before its first
+//!   message then names that message, not the moving latest.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -174,6 +180,10 @@ pub struct SegmentConsumer {
     /// Negatively acknowledged entries, and when to ask for them again.
     nacks: BTreeMap<EntryKey, Instant>,
     end_of_topic: bool,
+    /// A reader's position: the last message taken, or where it starts. `None` for a durable subscription.
+    position: Option<EntryId>,
+    /// Why it gave up: a subscribe that failed for good.
+    failure: Option<RegisterError>,
     closed: bool,
     actions: VecDeque<Action>,
 }
@@ -199,6 +209,8 @@ impl SegmentConsumer {
             ack_deadline: None,
             nacks: BTreeMap::new(),
             end_of_topic: false,
+            position: None,
+            failure: None,
             closed: false,
             actions: VecDeque::new(),
         };
@@ -206,8 +218,35 @@ impl SegmentConsumer {
         consumer
     }
 
+    /// A reader of segment `segment_id`, subscribing now, that starts after `start`: [`EntryId::EARLIEST`],
+    /// [`EntryId::LATEST`] (see [`SegmentConsumer::resolve`]), or a message's id. Its subscription is not durable,
+    /// and its name is the options' subscription.
+    pub fn reader(options: ConsumerOptions, segment_id: i64, topic: String, start: EntryId, now: Instant) -> Self {
+        let mut reader = Self::new(options, segment_id, topic, now);
+        reader.position = Some(start);
+        reader
+    }
+
     pub fn topic(&self) -> &str {
         &self.topic
+    }
+
+    /// A reader's position: the last message taken, or where it starts.
+    pub fn position(&self) -> Option<EntryId> {
+        self.position
+    }
+
+    /// The generation of its subscription, while it is subscribed.
+    pub fn subscription(&self) -> Option<u64> {
+        match self.link {
+            Link::Ready { generation, .. } => Some(generation),
+            _ => None,
+        }
+    }
+
+    /// Why it gave up, if it did: the error of a subscribe that failed for good.
+    pub fn failure(&self) -> Option<&RegisterError> {
+        self.failure.as_ref()
     }
 
     /// The `CommandSubscribe` to register the consumer with, as `consumer_id`. The driver sets its request id.
@@ -229,6 +268,9 @@ impl SegmentConsumer {
             schema: self.options.schema.clone().into(),
             initialPosition: Some(self.options.initial_position),
             subscription_properties: key_values(&self.options.subscription_properties),
+            // A reader's subscription lasts as long as its consumer, and starts after its position.
+            durable: self.position.map(|_| false),
+            start_message_id: self.position.map(|position| position.to_proto()).into(),
             ..Default::default()
         };
         BaseCommand { r#type: Type::SUBSCRIBE.into(), subscribe: subscribe.into(), ..Default::default() }
@@ -247,6 +289,25 @@ impl SegmentConsumer {
         }
         self.link = Link::Ready { generation, consumer_id };
         self.backoff.reset();
+        // A reader at the latest position waits for where that is.
+        if self.position != Some(EntryId::LATEST) {
+            self.start(consumer_id);
+        }
+    }
+
+    /// A reader at the latest position learns where that is, from the segment's last message id asked on its
+    /// subscription of `generation`, and starts reading after it. The messages the broker sends from before that
+    /// position, published while the reader subscribed, are left out.
+    pub fn resolve(&mut self, generation: u64, position: EntryId) {
+        let Link::Ready { generation: current, consumer_id } = self.link else { return };
+        if current == generation && self.position == Some(EntryId::LATEST) {
+            self.position = Some(position);
+            self.start(consumer_id);
+        }
+    }
+
+    /// Completes the first subscribe, and grants the broker its permits.
+    fn start(&mut self, consumer_id: u64) {
         if !std::mem::replace(&mut self.subscribed_once, true) {
             self.actions.push_back(Action::Subscribed(Ok(())));
         }
@@ -274,6 +335,7 @@ impl SegmentConsumer {
             return self.retry_later(now);
         }
         self.link = Link::Closed;
+        self.failure = Some(error.clone());
         if !self.subscribed_once {
             self.actions.push_back(Action::Subscribed(Err(error)));
         }
@@ -288,8 +350,15 @@ impl SegmentConsumer {
         }
         match entry::decode(self.segment_id, message, section) {
             Ok(decoded) => {
-                self.incoming.extend(decoded.messages);
                 self.taken += decoded.skipped;
+                for message in decoded.messages {
+                    // A reader leaves out what it read before it subscribed.
+                    if self.position.is_some_and(|position| reached(&position, &message.id.entry)) {
+                        self.taken += 1;
+                    } else {
+                        self.incoming.push_back(message);
+                    }
+                }
             }
             Err(error) => {
                 // A corrupt entry is dropped with the reason; one this client can't read stays unacknowledged.
@@ -339,6 +408,9 @@ impl SegmentConsumer {
     /// The next message for the application, if one is in.
     pub fn next_message(&mut self) -> Option<ReceivedMessage> {
         let message = self.incoming.pop_front()?;
+        if let Some(position) = &mut self.position {
+            *position = message.id.entry;
+        }
         self.taken += 1;
         self.grant_permits();
         Some(message)
@@ -493,6 +565,17 @@ impl SegmentConsumer {
 
     fn send(&mut self, command: BaseCommand) {
         self.actions.push_back(Action::Send(Box::new(command)));
+    }
+}
+
+/// Whether a reader at `position` read `id` already: `id` is in an earlier entry, or in the same entry and not after
+/// `position`. As in Java's v4 consumer, a message of a batch compares by its index, and a message that isn't in a
+/// batch is its whole entry.
+pub fn reached(position: &EntryId, id: &EntryId) -> bool {
+    match (id.ledger_id, id.entry_id).cmp(&(position.ledger_id, position.entry_id)) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => id.batch_index < 0 || id.batch_index <= position.batch_index,
+        std::cmp::Ordering::Greater => false,
     }
 }
 

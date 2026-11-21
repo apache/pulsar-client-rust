@@ -17,19 +17,23 @@
 
 //! Consumers (docs/7-api.md §4) and the messages they receive (§5).
 
+mod checkpoint;
 mod task;
 
+pub use checkpoint::{CheckpointConsumer, CheckpointConsumerBuilder};
 pub(crate) use task::Request;
 
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apache_pulsar_protocol::consumer::ConsumerOptions;
 use apache_pulsar_protocol::entry::ReceivedMessage;
+use apache_pulsar_protocol::layout::Layout;
 use apache_pulsar_protocol::proto;
 use apache_pulsar_protocol::proto::command_subscribe::InitialPosition;
-use apache_pulsar_protocol::queue_consumer::QueueConsumer as Machine;
+use apache_pulsar_protocol::queue_consumer::QueueConsumer as QueueMachine;
 use futures_channel::{mpsc, oneshot};
 use futures_util::Stream;
 
@@ -40,7 +44,7 @@ use crate::local;
 use crate::message_id::MessageId;
 use crate::producer::{ApiClient, normalize_topic};
 use crate::schema::{Schema, SchemaInfo};
-use task::Task;
+use task::{Machine, Task};
 
 /// Where a new subscription starts on each segment (*client-api* §4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -209,16 +213,21 @@ fn consumer_options(
         priority_level: settings.priority_level,
         subscription_properties: settings.subscription_properties.clone(),
         properties: settings.properties.clone(),
-        schema: schema.map(|info| proto::Schema {
-            name: info.name.clone(),
-            schema_data: info.data.clone(),
-            r#type: info.kind,
-            ..Default::default()
-        }),
+        schema: proto_schema(schema),
         operation_timeout,
         ..ConsumerOptions::default()
     };
     Ok((topic, options))
+}
+
+/// The schema a consumer declares on subscribing; `None` for raw bytes.
+fn proto_schema(schema: Option<&SchemaInfo>) -> Option<proto::Schema> {
+    schema.map(|info| proto::Schema {
+        name: info.name.clone(),
+        schema_data: info.data.clone(),
+        r#type: info.kind,
+        ..Default::default()
+    })
 }
 
 fn invalid(message: &str) -> Error {
@@ -286,11 +295,21 @@ impl Drop for Link {
     }
 }
 
-/// Subscribes a Queue consumer on `client`'s loop: opens the layout watch, starts the consumer's task, and waits for
-/// every segment to be subscribed.
+/// Subscribes a Queue consumer on `client`'s loop, and waits for every segment to be subscribed.
 async fn subscribe_on(client: local::PulsarClient, topic: String, options: ConsumerOptions) -> Result<Link> {
+    let machine = move |layout| Machine::Queue(QueueMachine::new(options, layout, Instant::now()));
+    start(client, topic, Box::new(machine)).await
+}
+
+/// Opens the topic's layout watch on `client`'s loop, starts the task of the consumer `machine` makes on the first
+/// layout, and waits until it is subscribed.
+async fn start(
+    client: local::PulsarClient,
+    topic: String,
+    machine: Box<dyn FnOnce(Rc<Layout>) -> Machine>,
+) -> Result<Link> {
     let watch = client.watches().open(&client, &topic).await?;
-    let machine = Machine::new(options, watch.current(), Instant::now());
+    let machine = machine(watch.current());
     let resolved = Arc::from(machine.topic());
     let (requests, receiver) = mpsc::unbounded();
     let (subscribed, is_subscribed) = oneshot::channel();
@@ -323,29 +342,45 @@ struct Shared {
     _slot: Option<LoopSlot>,
 }
 
-impl Shared {
+impl Link {
     /// Up to `max` messages: once there are, or at the deadline with what there is.
     async fn receive(&self, max: usize, deadline: Option<Instant>) -> Result<Vec<ReceivedMessage>> {
         let (reply, answer) = oneshot::channel();
         let request = Request::Receive { max, deadline, reply };
-        self.link.requests.unbounded_send(request).map_err(consumer_closed)?;
-        let mut pending = Pending { answer, requests: self.link.requests.clone() };
-        (&mut pending.answer).await.map_err(consumer_closed)
+        self.requests.unbounded_send(request).map_err(consumer_closed)?;
+        let mut pending = Pending { answer, requests: self.requests.clone() };
+        let delivery = (&mut pending.answer).await.map_err(consumer_closed)?;
+        Ok(delivery.messages)
+    }
+
+    /// Closes the consumer, and waits for the close.
+    async fn close(&self) -> Result<()> {
+        let (reply, done) = oneshot::channel();
+        if self.requests.unbounded_send(Request::Close { reply: Some(reply) }).is_err() {
+            // The task is gone: closed already.
+            return Ok(());
+        }
+        done.await.unwrap_or(Ok(()))
+    }
+
+    /// A message, as the application gets it.
+    fn message<T>(&self, message: ReceivedMessage, schema: &Schema<T>) -> Message<T> {
+        Message { id: MessageId(message.id.clone()), message, topic: self.topic.clone(), schema: schema.clone() }
     }
 }
 
 /// A receive's answer on its way. Dropped with the answer in, it gives the messages back, for the next receives: a
 /// receive dropped before it completes loses no message.
 struct Pending {
-    answer: oneshot::Receiver<Vec<ReceivedMessage>>,
+    answer: oneshot::Receiver<task::Delivery>,
     requests: mpsc::UnboundedSender<Request>,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
         self.answer.close();
-        if let Ok(Some(messages)) = self.answer.try_recv() {
-            let _ = self.requests.unbounded_send(Request::Return(messages));
+        if let Ok(Some(delivery)) = self.answer.try_recv() {
+            let _ = self.requests.unbounded_send(Request::Return(delivery));
         }
     }
 }
@@ -396,13 +431,13 @@ impl<T: 'static, Api> QueueConsumer<T, Api> {
     /// Receives are answered in the order they are first polled. A receive dropped before it completes loses no
     /// message: the next receive gets it.
     pub async fn receive(&self) -> Result<Message<T>> {
-        let mut messages = self.shared.receive(1, None).await?;
+        let mut messages = self.shared.link.receive(1, None).await?;
         Ok(self.message(messages.pop().expect("a receive without a deadline gets its message")))
     }
 
     /// The next message, or `None` if none comes within `timeout`.
     pub async fn receive_timeout(&self, timeout: Duration) -> Result<Option<Message<T>>> {
-        let messages = self.shared.receive(1, Some(Instant::now() + timeout)).await?;
+        let messages = self.shared.link.receive(1, Some(Instant::now() + timeout)).await?;
         Ok(messages.into_iter().next().map(|message| self.message(message)))
     }
 
@@ -412,7 +447,7 @@ impl<T: 'static, Api> QueueConsumer<T, Api> {
         if max == 0 {
             return Err(invalid("a batch receive takes at least one message"));
         }
-        let messages = self.shared.receive(max, Some(Instant::now() + timeout)).await?;
+        let messages = self.shared.link.receive(max, Some(Instant::now() + timeout)).await?;
         Ok(messages.into_iter().map(|message| self.message(message)).collect())
     }
 
@@ -442,21 +477,11 @@ impl<T: 'static, Api> QueueConsumer<T, Api> {
     /// with [`ErrorKind::AlreadyClosed`], and the messages not received yet go to the subscription's other
     /// consumers. Can be called again.
     pub async fn close(&self) -> Result<()> {
-        let (reply, done) = oneshot::channel();
-        if self.shared.link.requests.unbounded_send(Request::Close { reply: Some(reply) }).is_err() {
-            // The task is gone: closed already.
-            return Ok(());
-        }
-        done.await.unwrap_or(Ok(()))
+        self.shared.link.close().await
     }
 
     fn message(&self, message: ReceivedMessage) -> Message<T> {
-        Message {
-            id: MessageId(message.id.clone()),
-            message,
-            topic: self.shared.link.topic.clone(),
-            schema: self.schema.clone(),
-        }
+        self.shared.link.message(message, &self.schema)
     }
 }
 

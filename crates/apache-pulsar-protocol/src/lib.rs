@@ -21,6 +21,8 @@
 //! on an exact version of it.
 
 pub mod backoff;
+pub mod checkpoint;
+pub mod checkpoint_consumer;
 pub mod connection;
 pub mod consumer;
 pub mod defaults;
