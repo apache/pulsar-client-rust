@@ -333,6 +333,101 @@ fn thread_safe_consumers_read_on_any_thread() {
     assert_eq!(format!("{checkpoint:?}"), "Checkpoint{0: 101:1, 1: 102:1}");
 }
 
+const GROUP: &str = "audit";
+
+/// A member of [`GROUP`] named `name`, from the earliest position.
+async fn member(client: &local::PulsarClient, name: &str) -> local::CheckpointConsumer<String> {
+    let builder = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).consumer_group(GROUP);
+    builder.consumer_name(name).start_position(Checkpoint::earliest()).create().await.unwrap()
+}
+
+fn assigned(server: &WorldServer, name: &str) -> Vec<u64> {
+    server.world.borrow().assigned(TOPIC, GROUP, name).into_iter().map(|(segment, _)| segment).collect()
+}
+
+/// The members of a group share the segments: each reads those the controller assigns it, which move as members come
+/// and go, and a member leaves the group as it closes.
+#[test]
+fn members_of_a_group_share_the_segments() {
+    run(async {
+        let server = WorldServer::start(world(2)).await;
+        let client = local_client(&server).await;
+        let first = member(&client, "member-0").await;
+        assert_eq!((first.consumer_name(), assigned(&server, "member-0")), (Some("member-0"), vec![0, 1]));
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_SUBSCRIBE), 1);
+        let second = member(&client, "member-1").await;
+        // Segment 1 moved: the first member's reader of it is closed.
+        wait_until("the moved segment's reader is closed", || server.received(Type::CLOSE_CONSUMER) == 1).await;
+        assert_eq!((assigned(&server, "member-0"), assigned(&server, "member-1")), (vec![0], vec![1]));
+        publish(&server, 0, "zero");
+        publish(&server, 1, "one");
+        assert_eq!(first.receive().await.unwrap().value().unwrap(), "zero");
+        assert_eq!(second.receive().await.unwrap().value().unwrap(), "one");
+        assert_eq!(format!("{:?}", second.checkpoint().await.unwrap()), "Checkpoint{1: 102:0}");
+        second.close().await.unwrap();
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_UNSUBSCRIBE), 1);
+        // Its segment came back: the first member reads it from its own start.
+        assert_eq!(first.receive().await.unwrap().value().unwrap(), "one");
+        client.close().await.unwrap();
+    });
+}
+
+/// A member without a name gets a random one, which it registers under, and names its readers after.
+#[test]
+fn a_member_without_a_name_gets_one() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let builder = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).consumer_group(GROUP);
+        let consumer = builder.consumer_name("").create().await.unwrap();
+        let name = consumer.consumer_name().unwrap().to_string();
+        assert!(name.starts_with("v5-checkpoint-") && name.len() == 22, "{name}");
+        assert_eq!(assigned(&server, &name), [0]);
+        let subscribe = server.world.borrow().received(Type::SUBSCRIBE)[0].subscribe.clone();
+        assert_eq!(subscribe.consumer_name, Some(format!("{name}-seg-0")));
+        // An empty group is none.
+        let alone = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).consumer_group("").create().await;
+        assert_eq!(alone.unwrap().consumer_name(), None);
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_SUBSCRIBE), 1);
+        client.close().await.unwrap();
+    });
+}
+
+/// A registration the controller refuses fails the create with its error.
+#[test]
+fn a_refused_registration_fails_the_create() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        server.with(|w| w.controller.fail_registrations.push_back(ServerError::AuthorizationError));
+        let client = local_client(&server).await;
+        let create = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).consumer_group(GROUP).create();
+        assert_eq!(create.await.unwrap_err().kind(), ErrorKind::Authorization);
+        assert_eq!(server.received(Type::SUBSCRIBE), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// A member that loses its connection registers again, and reads on where it stopped.
+#[test]
+fn a_member_registers_again_after_a_lost_connection() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let consumer = member(&client, "member-0").await;
+        publish(&server, 0, "a");
+        assert_eq!(consumer.receive().await.unwrap().value().unwrap(), "a");
+        server.with(|w| {
+            for conn in w.open_connections() {
+                w.kill(conn);
+            }
+        });
+        wait_until("it registers again", || server.received(Type::SCALABLE_TOPIC_SUBSCRIBE) == 2).await;
+        publish(&server, 0, "b");
+        assert_eq!(consumer.receive().await.unwrap().value().unwrap(), "b");
+        client.close().await.unwrap();
+    });
+}
+
 /// Thread-safe Checkpoint consumers, and their futures, can move across threads.
 #[allow(dead_code)]
 fn thread_safe_types_are_send(consumer: &crate::CheckpointConsumer<String>) {

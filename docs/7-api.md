@@ -143,8 +143,10 @@ let position: Checkpoint = reader.checkpoint().await?;
   default, as in Java, and `consumer_name` names each segment's reader `<name>-seg-<id>`. `checkpoint()` asks
   nothing of the brokers: it names, for each segment, the last message a receive returned, so a receive dropped
   with messages doesn't move it. Restored with `Checkpoint::from_bytes`, a checkpoint resumes the consumer exactly
-  there ([6](6-scalable-topics.md) §6.1). The grouped mode (`.consumer_group`) comes with the Stream consumer's
-  assignment session.
+  there ([6](6-scalable-topics.md) §6.1). With `.consumer_group(group)`, the consumer is a member of a group: it
+  reads the segments the topic's controller assigns it, its checkpoint names only those, and a key keeps its order
+  within a segment only ([6](6-scalable-topics.md) §6.2). A member without a name gets a random one, which
+  `consumer_name()` returns.
 
 ## 5. Messages
 

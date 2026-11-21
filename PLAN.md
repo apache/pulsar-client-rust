@@ -122,12 +122,13 @@ It lands in three pull requests: checkpoint encoding with the ungrouped consumer
 on the simulated cluster, then the driver and the API, then the grouped mode, on the Stream consumer's assignment
 session from M4.
 
-Done so far: the ungrouped consumer. Checkpoints match Java's golden bytes. The scenarios of the Java tests above
-that don't need a consumer group pass on the simulated cluster
-(`crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`). On the real broker: a resume across a split, a latest
-start across a split, a deleted segment, and a checkpoint round trip with the Java client across a split and a
-merge. The grouped scenarios of `V5CheckpointConsumerGroupTest`, `V5CheckpointConsumerDagReplayTest` and
-`V5CheckpointConsumerUntouchedSegmentTest` wait for the grouped mode.
+Done. Checkpoints match Java's golden bytes. The scenarios of the Java tests above pass on the simulated cluster:
+those of a consumer on its own in `crates/apache-pulsar-testkit/tests/checkpoint_consumer.rs`, and those of a group's
+members in `checkpoint_group.rs`. On the real broker: a resume across a split, a latest start across a split, a
+deleted segment, a checkpoint round trip with the Java client across a split and a merge, two members of a group
+sharing a topic's segments and handing them over as one leaves, and a member created after a split reading the
+sealed backlog. The controller orders nothing for a Checkpoint group, so its members keep a key's order within a
+segment only, as Java's do.
 
 ## M6: Batching and compression
 

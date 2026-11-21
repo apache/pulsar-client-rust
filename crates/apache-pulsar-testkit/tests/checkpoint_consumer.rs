@@ -21,7 +21,7 @@
 //! `ScalableCheckpointConsumerReconcileTest`, `V5CheckpointConsumerBasicTest`, `V5CheckpointConsumerDagReplayTest`,
 //! `V5CheckpointConsumerOrderingTest`, `V5CheckpointConsumerSkipDeletedSegmentTest`,
 //! `V5CheckpointConsumerUntouchedSegmentTest`, `V5CheckpointConsumerLatestStartTest`, and the ungrouped ones of
-//! `V5CheckpointConsumerGroupTest`. The grouped ones come with the grouped mode.
+//! `V5CheckpointConsumerGroupTest`. The grouped ones are in `checkpoint_group.rs`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -757,12 +757,12 @@ fn a_checkpoint_rewinds_to_before_the_messages_given_back() {
     }
     let mut h = create(world, Checkpoint::Earliest);
     let first = h.consumer.next_message().unwrap();
-    let previous = h.consumer.deliver(&first.id).unwrap();
+    let previous = h.consumer.deliver(&first).unwrap();
     assert_eq!(previous, EntryId::EARLIEST);
     let second = h.consumer.next_message().unwrap();
-    let before_second = h.consumer.deliver(&second.id).unwrap();
+    let before_second = h.consumer.deliver(&second).unwrap();
     assert_eq!(before_second, first.id.entry);
-    h.consumer.rewind(second.id.segment_id, before_second);
+    h.consumer.rewind(second.id.segment_id, second.attachment, before_second);
     let checkpoint = h.checkpoint();
     assert_eq!(checkpoint, Checkpoint::Positions(SegmentVector::from([(0, first.id.entry)])));
     let mut resumed = restore(h, checkpoint);
@@ -780,8 +780,8 @@ fn messages_of_segments_it_no_longer_reads_change_no_checkpoint() {
     h.world.delete_segment(TOPIC, 0);
     h.world.prune(TOPIC, 0);
     h.pump();
-    assert_eq!(h.consumer.deliver(&message.id), None);
-    h.consumer.rewind(0, EntryId::EARLIEST);
+    assert_eq!(h.consumer.deliver(&message), None);
+    h.consumer.rewind(0, message.attachment, EntryId::EARLIEST);
     assert_eq!(named(&h.checkpoint()), [1, 2]);
 }
 

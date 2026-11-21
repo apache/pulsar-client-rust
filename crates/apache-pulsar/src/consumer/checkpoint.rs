@@ -18,15 +18,18 @@
 //! The Checkpoint consumer (docs/7-api.md §4, docs/6-scalable-topics.md §6).
 
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use apache_pulsar_protocol::checkpoint as wire;
 use apache_pulsar_protocol::checkpoint_consumer::CheckpointConsumer as Reader;
 use apache_pulsar_protocol::consumer::ConsumerOptions;
+use apache_pulsar_protocol::layout::Layout;
 use futures_channel::oneshot;
 use futures_util::Stream;
 
+use super::stream::random_name;
 use super::task::Machine;
 use super::{Link, Message, Request, consumer_closed, invalid, proto_schema};
 use crate::checkpoint::Checkpoint;
@@ -52,14 +55,18 @@ struct Settings {
     topic: Option<String>,
     start: Checkpoint,
     consumer_name: Option<String>,
+    group: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         // Java's default start.
-        Self { topic: None, start: Checkpoint::latest(), consumer_name: None }
+        Self { topic: None, start: Checkpoint::latest(), consumer_name: None, group: None }
     }
 }
+
+/// A member of a group: the group, and the name the member registers under.
+type Member = (String, String);
 
 impl<T, Api> std::fmt::Debug for CheckpointConsumerBuilder<T, Api> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,20 +88,48 @@ impl<T: 'static, Api> CheckpointConsumerBuilder<T, Api> {
     /// At the latest position, the consumer starts at the end of each segment the topic has when it is created. The
     /// segments a split or a merge adds later are read from their start, as are those a restored checkpoint doesn't
     /// name: they hold only messages newer than the start.
+    ///
+    /// A member of a group starts at the end of each segment it gets, whenever it gets it, since the controller doesn't
+    /// tell a new segment from one moved from another member. Restored, it reads the segments its checkpoint doesn't
+    /// name from their start.
     pub fn start_position(mut self, start: Checkpoint) -> Self {
         self.settings.start = start;
         self
     }
 
     /// The consumer's name. Each segment's reader is named `<name>-seg-<id>`; without a name, the brokers pick them.
+    ///
+    /// A member of a group registers under it with the topic's controller, which gives one that comes back under the
+    /// same name within its grace period the same segments. A member without a name gets a random one,
+    /// `v5-checkpoint-` and 8 letters and digits, as in Java.
     pub fn consumer_name(mut self, name: impl Into<String>) -> Self {
         self.settings.consumer_name = Some(name.into());
         self
     }
 
-    fn options(&self, operation_timeout: Duration) -> Result<(String, ConsumerOptions, wire::Checkpoint)> {
+    /// Makes the consumer a member of the group `group` (*client-api* §4.3). The topic's controller spreads the topic's
+    /// segments over the members of the group, each segment whole to one member, and moves them as members come and
+    /// go. The group keeps nothing on the brokers: each member reads from its own start, and keeps its own checkpoint,
+    /// which names only its segments. A key's messages keep their order within a segment, but not across a split or a
+    /// merge: nothing orders a group's segments. An empty name is no group.
+    pub fn consumer_group(mut self, group: impl Into<String>) -> Self {
+        self.settings.group = Some(group.into()).filter(|group| !group.is_empty());
+        self
+    }
+
+    /// The topic, the readers' options, the start and, for a member of a group, the group and the member's name, once
+    /// checked. A member without a name gets one here, which the consumer then reports.
+    fn options(
+        &mut self,
+        operation_timeout: Duration,
+    ) -> Result<(String, ConsumerOptions, wire::Checkpoint, Option<Member>)> {
+        if self.settings.group.is_some() {
+            let name = self.settings.consumer_name.take().filter(|name| !name.is_empty());
+            self.settings.consumer_name = Some(name.unwrap_or_else(|| random_name("checkpoint")));
+        }
         let (topic, options) = reader_options(&self.settings, self.schema.info(), operation_timeout)?;
-        Ok((topic, options, self.settings.start.0.clone()))
+        let member = self.settings.group.clone().zip(self.settings.consumer_name.clone());
+        Ok((topic, options, self.settings.start.0.clone(), member))
     }
 }
 
@@ -128,13 +163,15 @@ impl<T: 'static> CheckpointConsumerBuilder<T, ThreadSafe> {
         Self { client: ApiClient::ThreadSafe(client), schema, settings: Settings::default(), _api: PhantomData }
     }
 
-    /// Creates the consumer, on the client's least loaded event loop, with a reader on every segment of the topic.
-    pub async fn create(self) -> Result<CheckpointConsumer<T>> {
+    /// Creates the consumer, on the client's least loaded event loop, with a reader on every segment of the topic, or,
+    /// in a group, on every segment the topic's controller assigns it.
+    pub async fn create(mut self) -> Result<CheckpointConsumer<T>> {
         let ApiClient::ThreadSafe(client) = &self.client else { unreachable!() };
-        let (topic, options, start) = self.options(client.operation_timeout())?;
+        let client = client.clone();
+        let (topic, options, start, member) = self.options(client.operation_timeout())?;
         let (slot, index) = client.place();
         let link = client
-            .run_on(index, move |local| Box::pin(async move { create_on(local, topic, options, start).await }))
+            .run_on(index, move |local| Box::pin(async move { create_on(local, topic, options, start, member).await }))
             .await?;
         Ok(CheckpointConsumer::from_link(link, self.schema, self.settings.consumer_name, Some(slot)))
     }
@@ -163,31 +200,42 @@ impl<T: 'static> CheckpointConsumerBuilder<T, Local> {
         Self { client: ApiClient::Local(client), schema, settings: Settings::default(), _api: PhantomData }
     }
 
-    /// Creates the consumer, on the local client's loop, with a reader on every segment of the topic.
-    pub async fn create(self) -> Result<CheckpointConsumer<T, Local>> {
+    /// Creates the consumer, on the local client's loop, with a reader on every segment of the topic, or, in a group,
+    /// on every segment the topic's controller assigns it.
+    pub async fn create(mut self) -> Result<CheckpointConsumer<T, Local>> {
         let ApiClient::Local(client) = &self.client else { unreachable!() };
-        let (topic, options, start) = self.options(client.operation_timeout())?;
-        let link = create_on(client.clone(), topic, options, start).await?;
+        let client = client.clone();
+        let (topic, options, start, member) = self.options(client.operation_timeout())?;
+        let link = create_on(client, topic, options, start, member).await?;
         Ok(CheckpointConsumer::from_link(link, self.schema, self.settings.consumer_name, None))
     }
 }
 
-/// Creates a Checkpoint consumer on `client`'s loop, and waits for every segment's reader to be subscribed.
+/// Creates a Checkpoint consumer on `client`'s loop, and waits for every segment's reader to be subscribed: a member
+/// of a group registers first.
 async fn create_on(
     client: local::PulsarClient,
     topic: String,
     options: ConsumerOptions,
     start: wire::Checkpoint,
+    member: Option<Member>,
 ) -> Result<Link> {
-    let machine = move |layout| Machine::Checkpoint(Reader::new(options, start, layout, Instant::now()));
+    let machine = move |layout: Rc<Layout>| {
+        let now = Instant::now();
+        Machine::Checkpoint(match member {
+            Some((group, name)) => Reader::grouped(options, start, layout.topic().to_string(), group, name, now),
+            None => Reader::new(options, start, layout, now),
+        })
+    };
     super::start(client, topic, Box::new(machine)).await
 }
 
 /// A Checkpoint consumer: a reader on every segment of a topic, and no subscription on the brokers (*client-api*
 /// §4.3). The application keeps where it is as a [`Checkpoint`] ([`CheckpointConsumer::checkpoint`]), and restores
 /// the consumer from it. The messages of a key come in the order they were published, across splits and merges.
-/// Cheap to clone: clones are the same consumer. `Api` is [`ThreadSafe`] (the default), whose consumer is
-/// `Send + Sync`, or [`Local`].
+/// A member of a group ([`CheckpointConsumerBuilder::consumer_group`]) reads the segments the topic's controller
+/// assigns it, and keeps a key's order within a segment only. Cheap to clone: clones are the same consumer. `Api` is
+/// [`ThreadSafe`] (the default), whose consumer is `Send + Sync`, or [`Local`].
 ///
 /// Dropping the last clone closes the consumer in the background; [`CheckpointConsumer::close`] waits for the close.
 pub struct CheckpointConsumer<T, Api = ThreadSafe> {
@@ -226,7 +274,8 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
         &self.shared.link.topic
     }
 
-    /// The name the consumer was given, if any.
+    /// The name the consumer was given, if any. A member of a group always has one: the one it was given, or a
+    /// random one, which it registered under.
     pub fn consumer_name(&self) -> Option<&str> {
         self.shared.consumer_name.as_deref()
     }
@@ -272,7 +321,7 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
         checkpoint.await.map(Checkpoint).map_err(consumer_closed)
     }
 
-    /// Closes the consumer: closes every segment's reader. The receives waiting fail with
+    /// Closes the consumer: closes every segment's reader, and leaves the group. The receives waiting fail with
     /// [`ErrorKind::AlreadyClosed`](crate::ErrorKind::AlreadyClosed). Can be called again.
     pub async fn close(&self) -> Result<()> {
         self.shared.link.close().await

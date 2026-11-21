@@ -24,7 +24,7 @@
 
 mod env;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +80,8 @@ const TESTS: &[(&str, fn(&Env))] = &[
         "a_checkpoint_round_trips_with_java_across_layout_changes",
         a_checkpoint_round_trips_with_java_across_layout_changes,
     ),
+    ("checkpoint_group_members_share_the_segments", checkpoint_group_members_share_the_segments),
+    ("a_checkpoint_group_member_reads_the_sealed_backlog", a_checkpoint_group_member_reads_the_sealed_backlog),
 ];
 
 fn main() {
@@ -1036,4 +1038,73 @@ fn a_checkpoint_round_trips_with_java_across_layout_changes(env: &Env) {
     received.extend(rest);
     assert_eq!(by_key(received), sent);
     rt.block_on(client.close()).unwrap();
+}
+
+/// A member of the Checkpoint consumer group `audit` of `topic`, named `name`, from the earliest position. Through the
+/// proxy, as the Stream consumers: the layout names the controller by the broker's internal address.
+async fn checkpoint_member(client: &local::PulsarClient, topic: &str, name: &str) -> local::CheckpointConsumer<String> {
+    let builder = client.new_checkpoint_consumer(Schema::string()).topic(topic).consumer_group("audit");
+    builder.consumer_name(name).start_position(Checkpoint::earliest()).create().await.unwrap()
+}
+
+/// Receives until none comes for a while.
+async fn drain(consumer: &local::CheckpointConsumer<String>) -> BTreeSet<String> {
+    let mut got = BTreeSet::new();
+    while let Some(message) = consumer.receive_timeout(Duration::from_secs(3)).await.unwrap() {
+        assert!(got.insert(message.value().unwrap()), "delivered twice");
+    }
+    got
+}
+
+/// Java's `V5CheckpointConsumerGroupTest`: the members of a group share the segments, each message reaching one of
+/// them, and a member that closes hands its segments over at once, which the other reads from its own start.
+fn checkpoint_group_members_share_the_segments(env: &Env) {
+    let name = unique("checkpoint-group");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "4", &format!("public/default/{name}")]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let alice = checkpoint_member(&client, &topic, "alice").await;
+        let bob = checkpoint_member(&client, &topic, "bob").await;
+        assert_eq!(bob.consumer_name(), Some("bob"));
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut sent = BTreeSet::new();
+        for i in 0..100 {
+            let value = format!("v-{i:02}");
+            producer.new_message().key(format!("k-{i}")).value(value.clone()).send().await.unwrap();
+            sent.insert(value);
+        }
+        // Bob first: alice's reassignment is long applied by the time she receives.
+        let got_bob = drain(&bob).await;
+        let got_alice = drain(&alice).await;
+        assert!(!got_alice.is_empty() && !got_bob.is_empty(), "alice {} bob {}", got_alice.len(), got_bob.len());
+        assert!(got_alice.is_disjoint(&got_bob));
+        assert_eq!(got_alice.union(&got_bob).cloned().collect::<BTreeSet<_>>(), sent);
+        let started = std::time::Instant::now();
+        alice.close().await.unwrap();
+        assert_eq!(drain(&bob).await, got_alice);
+        assert!(started.elapsed() < Duration::from_secs(30), "well within the 60 s grace period");
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `V5CheckpointConsumerDagReplayTest`, grouped: a member created after a split reads the sealed parent's
+/// backlog and the children's. The controller holds no segment of a Checkpoint group back.
+fn a_checkpoint_group_member_reads_the_sealed_backlog(env: &Env) {
+    let name = unique("checkpoint-group-dag");
+    let topic = format!("topic://public/default/{name}");
+    let path = format!("public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "1", &path]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let mut sent = BTreeMap::new();
+        publish_keyed(&producer, "pre", 30, &mut sent).await;
+        env.admin(&["scalable-topics", "split-segment", "-s", "0", &path]);
+        publish_keyed(&producer, "post", 30, &mut sent).await;
+        let member = checkpoint_member(&client, &topic, "solo").await;
+        let got = drain(&member).await;
+        assert_eq!(got, sent.into_values().flatten().collect::<BTreeSet<_>>());
+        client.close().await.unwrap();
+    });
 }

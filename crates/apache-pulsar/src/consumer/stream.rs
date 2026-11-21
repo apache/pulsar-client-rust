@@ -109,13 +109,18 @@ impl<T: 'static, Api> StreamConsumerBuilder<T, Api> {
     /// The topic, the consumer's name and the segment consumers' options, once checked.
     fn options(&self, operation_timeout: Duration) -> Result<(String, String, ConsumerOptions)> {
         let (topic, options) = consumer_options(&self.settings, self.schema.info(), operation_timeout)?;
-        let name = self.settings.consumer_name.clone().filter(|name| !name.is_empty()).unwrap_or_else(random_name);
+        let name = self
+            .settings
+            .consumer_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| random_name("stream"));
         Ok((topic, name, options))
     }
 }
 
-/// A name for a consumer without one, as Java's: `v5-stream-` and 8 random letters and digits.
-fn random_name() -> String {
+/// A name for a consumer of `kind` without one, as Java's: `v5-<kind>-` and 8 random letters and digits.
+pub(super) fn random_name(kind: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut bits = RandomState::new().hash_one(Instant::now());
     let suffix: String = (0..8)
@@ -125,7 +130,7 @@ fn random_name() -> String {
             c as char
         })
         .collect();
-    format!("v5-stream-{suffix}")
+    format!("v5-{kind}-{suffix}")
 }
 
 impl<T: 'static> StreamConsumerBuilder<T, ThreadSafe> {
