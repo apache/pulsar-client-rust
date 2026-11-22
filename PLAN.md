@@ -141,7 +141,7 @@ segments. A performance baseline is recorded.
 
 It lands in three pull requests: batching, then compression, then the benchmarks.
 
-Ported so far: batching, with Java V5's `BatchingPolicy` and its defaults, and `EntryBucketBatchContainer`'s rules,
+Done. Batching, with Java V5's `BatchingPolicy` and its defaults, and `EntryBucketBatchContainer`'s rules,
 on the simulated cluster (`crates/apache-pulsar-testkit/tests/producer_batching.rs`): the three triggers, one bucket
 per entry and its stamp, entries in sequence order, the messages that go alone, and open batches on a flush, a close,
 a reconnect, a split and a timeout. Key affinity holds on the simulated cluster and against a 5.0.1 broker: two
@@ -153,6 +153,12 @@ Compression, with Java V5's `CompressionPolicy`: the scenarios of `V5ProducerCom
 codec, none, and no policy set) on the simulated cluster (`producer_compression.rs`) and against a 5.0.1 broker, a
 batch compressed whole, and the broker's limit on the compressed entry. A Java consumer reads Rust's batches compressed
 with each codec, the ZLIB ones finished streams.
+
+A first round of benchmarks, and a baseline against Java's V5 client on a 5.0.1 broker ([8](docs/8-quality.md) §6):
+micro-benchmarks of the producer's state machine and of the codecs, and `tools/perf`, which measures the producer's and
+the Queue consumer's throughput and latency against a broker as Java's `pulsar-perf` does. The producer is bound by
+its own CPU, most of a send's spent outside the state machine, and the thread-safe consumer's receives and acks each
+cross threads: the next rounds look for where a send's time goes, and measure loops.
 
 ## M7: Conformance and a first release
 

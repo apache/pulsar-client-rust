@@ -38,8 +38,14 @@ thiserror.workspace = true
 zstd = { version = "0.14.4", optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Micro-benchmarks of the producer's and the consumer's work on entries (docs/8-quality.md §6): `cargo bench`.
+[[bench]]
+name = "entries"
+harness = false
 
 # The codecs that consumers decode and producers encode: each behind a feature, all on by default
 # (docs/3-protocol.md §6). The workspace takes this crate without them: apache-pulsar forwards each.
