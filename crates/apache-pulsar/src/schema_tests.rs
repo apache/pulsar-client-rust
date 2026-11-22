@@ -394,3 +394,96 @@ fn generic_schemas_where_they_dont_serve() {
         client.close().await.unwrap();
     });
 }
+
+/// The record of Java's V5 schema tests.
+#[cfg(all(feature = "json", feature = "avro"))]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+struct Pojo {
+    name: Option<String>,
+    age: i32,
+}
+
+/// Java's V5 round-trip test, for JSON and Avro: a record reaches a consumer of its schema, which registered it.
+#[cfg(all(feature = "json", feature = "avro"))]
+#[test]
+fn records_reach_a_consumer() {
+    run(async {
+        round_trip(Schema::<Pojo>::json(), Pojo { name: Some("alice".to_string()), age: 30 }).await;
+        round_trip(Schema::<Pojo>::avro(), Pojo { name: Some("bob".to_string()), age: 42 }).await;
+        round_trip(Schema::<Pojo>::avro(), Pojo { name: None, age: 7 }).await;
+    });
+}
+
+/// A generic consumer reads JSON and Avro records with the schema each was written with: JSON as `serde_json` reads
+/// it, Avro as apache-avro does, the fields in the writer's order.
+#[cfg(all(feature = "json", feature = "avro"))]
+#[test]
+fn generic_records_of_json_and_avro() {
+    use apache_avro::types::Value;
+
+    run(async {
+        let alice = Pojo { name: Some("alice".to_string()), age: 30 };
+        let json = GenericValue::Json(serde_json::json!({"name": "alice", "age": 30}));
+        generic_round_trip(Schema::<Pojo>::json(), alice.clone(), json).await;
+        let name = Value::Union(1, Box::new(Value::String("alice".to_string())));
+        let avro =
+            GenericValue::Avro(Value::Record(vec![("name".to_string(), name), ("age".to_string(), Value::Int(30))]));
+        generic_round_trip(Schema::<Pojo>::avro(), alice, avro).await;
+    });
+}
+
+/// A record's first version, and its second, which adds a nullable field, as Java's V5 evolution test has them.
+#[cfg(feature = "avro")]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+struct V1 {
+    i: i32,
+}
+
+#[cfg(feature = "avro")]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+struct V2 {
+    i: i32,
+    j: Option<i32>,
+}
+
+/// Java's V5 evolution test: the second version registers after a split, on the topic's one history, and a consumer
+/// of it reads the first version's records with the new field null. Each kind of consumer fetches each version's
+/// schema once, its own included. A Stream consumer reads the split's children once the parent's messages are
+/// acknowledged.
+#[cfg(feature = "avro")]
+#[test]
+fn avro_consumers_read_each_version_with_its_schema() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let first = client.new_producer(Schema::<V1>::avro()).topic(TOPIC).create().await.unwrap();
+        first.send(V1 { i: 1 }).await.unwrap();
+        first.send(V1 { i: 2 }).await.unwrap();
+        server.with(|w| w.split(TOPIC, 0));
+        let second = client.new_producer(Schema::<V2>::avro()).topic(TOPIC).create().await.unwrap();
+        second.send(V2 { i: 3, j: Some(30) }).await.unwrap();
+        assert_eq!(schema_types(&server), [Type::Avro, Type::Avro], "two versions of one history");
+
+        let expected = [V2 { i: 1, j: None }, V2 { i: 2, j: None }, V2 { i: 3, j: Some(30) }];
+        let (mut queued, mut streamed, mut read) = (Vec::new(), Vec::new(), Vec::new());
+        let queue = queue(&client, Schema::<V2>::avro(), "queue").await.unwrap();
+        let stream = client.new_stream_consumer(Schema::<V2>::avro()).topic(TOPIC).subscription_name("stream");
+        let stream = stream.subscription_initial_position(SubscriptionInitialPosition::Earliest).subscribe();
+        let stream = stream.await.unwrap();
+        let reader = client.new_checkpoint_consumer(Schema::<V2>::avro()).topic(TOPIC);
+        let reader = reader.start_position(Checkpoint::earliest()).create().await.unwrap();
+        for _ in 0..3 {
+            queued.push(queue.receive().await.unwrap().value().unwrap());
+            let message = stream.receive().await.unwrap();
+            stream.acknowledge_cumulative(message.id()).await.unwrap();
+            streamed.push(message.value().unwrap());
+            read.push(reader.receive().await.unwrap().value().unwrap());
+        }
+        for mut values in [queued, streamed, read] {
+            values.sort_by_key(|value| value.i);
+            assert_eq!(values, expected);
+        }
+        assert_eq!(schema_fetches(&server), 6, "each consumer fetches each version once");
+        client.close().await.unwrap();
+    });
+}

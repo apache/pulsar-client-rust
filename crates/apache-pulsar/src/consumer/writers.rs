@@ -16,8 +16,9 @@
 // under the License.
 
 //! The schemas a consumer's messages were written with, which [`Schema::auto_consume`](crate::Schema::auto_consume)
-//! decodes them with. The consumer fetches the schema of a version before it delivers the first message of it, by the
-//! topic of the message's segment, as the standard schema commands go to a segment (*wire-protocol* §10).
+//! and the Avro schemas decode them with. The consumer fetches the schema of a version before it delivers the first
+//! message of it, by the topic of the message's segment, as the standard schema commands go to a segment
+//! (*wire-protocol* §10).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -61,9 +62,19 @@ pub(crate) struct Writers {
 }
 
 /// Whether a consumer of `options` decodes with the schemas its messages were written with: one that declares
-/// [`Schema::auto_consume`](crate::Schema::auto_consume)'s type, the one schema that does.
+/// [`Schema::auto_consume`](crate::Schema::auto_consume)'s type, or Avro's, alone or in a key/value schema, as Java's
+/// Avro schema reads each message with its version's. A key/value schema nested in another counts: it may hold Avro.
 pub(crate) fn wanted(options: &ConsumerOptions) -> bool {
-    options.schema.as_ref().is_some_and(|schema| schema.r#type == Type::AutoConsume)
+    let fetching = |schema: &proto::Schema, part: &str| {
+        let key = format!("{part}.schema.type");
+        let fetching = |kind: &str| matches!(kind, "AVRO" | "KEY_VALUE");
+        schema.properties.iter().any(|property| property.key == key && fetching(&property.value))
+    };
+    options.schema.as_ref().is_some_and(|schema| match schema.r#type {
+        Type::AutoConsume | Type::Avro => true,
+        Type::KeyValue => fetching(schema, "key") || fetching(schema, "value"),
+        _ => false,
+    })
 }
 
 impl Writers {
@@ -113,5 +124,36 @@ impl Writers {
             Err(error) => self.failed = Some((version, error)),
         }
         true
+    }
+}
+
+#[cfg(all(test, feature = "json", feature = "avro"))]
+mod tests {
+    use super::*;
+    use crate::schema::Schema;
+
+    #[derive(serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+    struct Pojo {
+        name: Option<String>,
+    }
+
+    fn fetches<T>(schema: Schema<T>) -> bool {
+        wanted(&ConsumerOptions { schema: schema.info().to_proto(), ..ConsumerOptions::default() })
+    }
+
+    /// The consumers that fetch their messages' schemas: generic records', and Avro's, alone or in a key/value
+    /// schema, nested ones included, as Java's Avro schema reads each message with its version's.
+    #[test]
+    fn the_consumers_that_fetch_their_messages_schemas() {
+        assert!(fetches(Schema::auto_consume()));
+        assert!(fetches(Schema::<Pojo>::avro()));
+        assert!(fetches(Schema::key_value(Schema::string(), Schema::<Pojo>::avro())));
+        assert!(fetches(Schema::key_value(Schema::<Pojo>::avro(), Schema::string())));
+        let nested = Schema::key_value(Schema::string(), Schema::<Pojo>::avro());
+        assert!(fetches(Schema::key_value(nested, Schema::bool())));
+        assert!(!fetches(Schema::key_value(Schema::string(), Schema::<Pojo>::json())));
+        assert!(!fetches(Schema::<Pojo>::json()));
+        assert!(!fetches(Schema::string()));
+        assert!(!fetches(Schema::bytes()));
     }
 }

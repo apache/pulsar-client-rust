@@ -22,6 +22,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::time::Duration;
 
+use apache_avro::types::Value;
 use apache_pulsar::{
     ErrorKind, GenericValue, KeyValue, ProducerAccessMode, Schema, SchemaType, SubscriptionInitialPosition, local,
 };
@@ -38,6 +39,8 @@ pub const TESTS: &[(&str, fn(&Env))] = &[
     ),
     ("primitive_values_cross_between_java_and_rust", primitive_values_cross_between_java_and_rust),
     ("key_values_cross_between_java_and_rust", key_values_cross_between_java_and_rust),
+    ("records_cross_between_java_and_rust", records_cross_between_java_and_rust),
+    ("avro_records_evolve_across_a_split", avro_records_evolve_across_a_split),
     ("generic_records_cross_between_java_and_rust", generic_records_cross_between_java_and_rust),
     ("a_generic_consumer_decodes_each_message_by_its_version", a_generic_consumer_decodes_each_message_by_its_version),
 ];
@@ -158,6 +161,80 @@ fn key_values_cross_between_java_and_rust(env: &Env) {
     both_ways(env, "kv", schema, &["a=1", "b=-2", "=0"], pair);
 }
 
+/// A record of the JSON and Avro schemas, as the Java tool's `Pojo`: Java's nullable `String` is an `Option`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+struct Pojo {
+    name: Option<String>,
+    age: i32,
+}
+
+/// A `Pojo` as the Java tool takes and prints it: `name:age`, `null` for no name.
+fn pojo(text: &str) -> Pojo {
+    let (name, age) = text.split_once(':').unwrap();
+    Pojo { name: (name != "null").then(|| name.to_string()), age: age.parse().unwrap() }
+}
+
+/// Records of the JSON and the Avro schemas, both ways, Java's described by its reflection and Rust's by its derive:
+/// the broker checks each against the other, and the fields come in another order.
+fn records_cross_between_java_and_rust(env: &Env) {
+    let records = ["alice:30", "bob:42", "null:7"];
+    both_ways(env, "json", Schema::<Pojo>::json(), &records, pojo);
+    both_ways(env, "avro", Schema::<Pojo>::avro(), &records, pojo);
+}
+
+/// The second version of Java's V5 evolution test's record, which adds a nullable field.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+struct V2 {
+    i: i32,
+    j: Option<i32>,
+}
+
+/// A second version that requires its new field, which a record of the first can't fill.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+struct Bad {
+    i: i32,
+    j: i32,
+}
+
+/// Java's `V5SchemaEvolutionTest`, across the two clients: under BACKWARD, Java writes the first version, the segment
+/// splits, and Rust registers the second on the topic's one history and writes it to the children; a consumer of the
+/// second version, Rust's and Java's, reads each record with its version's schema, the first version's with the new
+/// field null. A version that requires its new field is refused, and isn't registered.
+fn avro_records_evolve_across_a_split(env: &Env) {
+    let namespace = format!("public/{}", unique("evolution"));
+    env.admin(&["namespaces", "create", &namespace]);
+    env.admin(&["namespaces", "set-schema-compatibility-strategy", &namespace, "--compatibility", "BACKWARD"]);
+    let path = format!("{namespace}/{}", unique("records"));
+    env.admin(&["scalable-topics", "create", "-s", "1", &path]);
+    let topic = format!("topic://{path}");
+    env.java_produce("avro-v1", &topic, &["1", "2"]);
+    env.admin(&["scalable-topics", "split-segment", "-s", "0", &path]);
+    let expected = [V2 { i: 1, j: None }, V2 { i: 2, j: None }, V2 { i: 3, j: Some(30) }, V2 { i: 4, j: Some(40) }];
+    run(async {
+        let client = client(env).await;
+        let producer = client.new_producer(Schema::<V2>::avro()).topic(&topic).create().await.unwrap();
+        for (key, record) in [("a", V2 { i: 3, j: Some(30) }), ("b", V2 { i: 4, j: Some(40) })] {
+            producer.new_message().key(key).value(record).send().await.unwrap();
+        }
+        let bad = client.new_producer(Schema::<Bad>::avro()).topic(&topic).create().await.unwrap();
+        assert_eq!(bad.send(Bad { i: 5, j: 50 }).await.unwrap_err().kind(), ErrorKind::IncompatibleSchema);
+        let consumer = queue(&client, Schema::<V2>::avro(), &topic, "rust").await.unwrap();
+        let mut read = take(&consumer, 4).await;
+        read.sort_by_key(|record| record.i);
+        assert_eq!(read, expected);
+        client.close().await.unwrap();
+    });
+    let mut read = env.java_consume("avro-v2", &topic, 4);
+    read.sort();
+    assert_eq!(read, ["1:null", "2:null", "3:30", "4:40"]);
+    let versions = env.admin(&["schemas", "get", "-a", &topic]);
+    assert_eq!(
+        versions.matches("\"type\" : \"AVRO\"").count(),
+        2,
+        "Java's first version and Rust's second:\n{versions}"
+    );
+}
+
 /// A value as Java prints it, parsed.
 fn parsed<T: FromStr<Err: Debug>>(text: &str) -> T {
     text.parse().unwrap()
@@ -213,6 +290,15 @@ fn generic_records_cross_between_java_and_rust(env: &Env) {
     let pair = KeyValue { key: "a".to_string(), value: 1 };
     let generic = KeyValue { key: GenericValue::String("a".to_string()), value: GenericValue::Int32(1) };
     generic_both_ways(env, "kv", schema, "a=1", pair, GenericValue::KeyValue(Box::new(generic)), "KEY_VALUE a=1");
+    // Records, each read with its writer's schema: Java's orders the fields of the same record otherwise.
+    let alice = Pojo { name: Some("alice".to_string()), age: 30 };
+    let json = GenericValue::Json(serde_json::json!({"age": 30, "name": "alice"}));
+    let java = r#"JSON {"name":"alice","age":30}"#;
+    generic_both_ways(env, "json", Schema::<Pojo>::json(), "alice:30", alice.clone(), json, java);
+    let name = Value::Union(1, Box::new(Value::String("alice".to_string())));
+    let avro = GenericValue::Avro(Value::Record(vec![("age".to_string(), Value::Int(30)), ("name".to_string(), name)]));
+    let java = r#"AVRO {"name": "alice", "age": 30}"#;
+    generic_both_ways(env, "avro", Schema::<Pojo>::avro(), "alice:30", alice, avro, java);
 }
 
 /// Sends `value` with `schema` from Java, as the tool takes it (`text`), and reads it in Rust as a generic record,

@@ -40,8 +40,10 @@ import org.apache.pulsar.common.schema.KeyValue;
  * The schemas are named as the V5 factories that make them: {@code string}, {@code bool}, {@code int8},
  * {@code int16}, {@code int32}, {@code int64}, {@code float32} and {@code float64}. {@code kv} is a key/value of a
  * string and an int32, written {@code key=value}: the V5 factory has none, so it is v4's, through {@code V5Interop}.
- * {@code auto} only consumes, with {@code Schema.autoConsume()}: it prints each generic record's schema type and
- * value, a key/value as {@code key=value} and bytes as text.
+ * {@code json} and {@code avro} are records of a name and an age, written {@code name:age}; {@code avro-v1} and
+ * {@code avro-v2} the two versions of Java's V5 evolution test, written {@code i} and {@code i:j}. {@code auto} only
+ * consumes, with {@code Schema.autoConsume()}: it prints each generic record's schema type and value, a key/value as
+ * {@code key=value} and bytes as text.
  */
 public final class SchemaTool {
     /** A schema, and how its values are read from the command line and printed. */
@@ -66,6 +68,10 @@ public final class SchemaTool {
                             org.apache.pulsar.client.api.Schema.STRING, org.apache.pulsar.client.api.Schema.INT32)),
                     text -> new KeyValue<>(text.split("=", 2)[0], Integer.parseInt(text.split("=", 2)[1])),
                     pair -> pair.getKey() + "=" + pair.getValue());
+            case "json" -> new Codec<>(Schema.json(Pojo.class), Pojo::parse);
+            case "avro" -> new Codec<>(Schema.avro(Pojo.class), Pojo::parse);
+            case "avro-v1" -> new Codec<>(Schema.avro(V1.class), V1::parse);
+            case "avro-v2" -> new Codec<>(Schema.avro(V2.class), V2::parse);
             case "auto" -> new Codec<GenericRecord>(
                     Schema.autoConsume(),
                     text -> {
@@ -83,6 +89,84 @@ public final class SchemaTool {
                 case "consume" -> consume(client, codec, args[2], Integer.parseInt(args[3]));
                 default -> throw new IllegalArgumentException("no command " + args[0]);
             }
+        }
+    }
+
+    /**
+     * A record of the JSON and Avro schemas, written {@code name:age}, {@code null} for no name. A static nested class,
+     * as Java's V5 schema tests have, which Avro names in a namespace that ends in {@code $}.
+     */
+    public static final class Pojo {
+        private String name;
+        private int age;
+
+        public Pojo() {
+        }
+
+        Pojo(String name, int age) {
+            this.name = name;
+            this.age = age;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public void setName(String name) {
+            this.name = name;
+        }
+
+        public int getAge() {
+            return age;
+        }
+
+        public void setAge(int age) {
+            this.age = age;
+        }
+
+        static Pojo parse(String text) {
+            String[] parts = text.split(":", 2);
+            return new Pojo("null".equals(parts[0]) ? null : parts[0], Integer.parseInt(parts[1]));
+        }
+
+        @Override
+        public String toString() {
+            return name + ":" + age;
+        }
+    }
+
+    /** The first version of Java's V5 evolution test's record: an int. */
+    public static final class V1 {
+        public int i;
+
+        static V1 parse(String text) {
+            V1 record = new V1();
+            record.i = Integer.parseInt(text);
+            return record;
+        }
+
+        @Override
+        public String toString() {
+            return String.valueOf(i);
+        }
+    }
+
+    /** The second version, which adds a nullable int, {@code null} in the first version's records. */
+    public static final class V2 {
+        public int i;
+        public Integer j;
+
+        static V2 parse(String text) {
+            String[] parts = text.split(":", 2);
+            V2 record = new V2();
+            record.i = Integer.parseInt(parts[0]);
+            record.j = "null".equals(parts[1]) ? null : Integer.valueOf(parts[1]);
+            return record;
+        }
+
+        @Override
+        public String toString() {
+            return i + ":" + j;
         }
     }
 
