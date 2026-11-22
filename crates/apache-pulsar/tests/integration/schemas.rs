@@ -18,6 +18,7 @@
 //! Schemas against the broker: C11's `IncompatibleSchema`, and each schema with the Java client, in both directions,
 //! typed and as generic records.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::time::Duration;
@@ -26,6 +27,10 @@ use apache_avro::types::Value;
 use apache_pulsar::{
     ErrorKind, GenericValue, KeyValue, ProducerAccessMode, Schema, SchemaType, SubscriptionInitialPosition, local,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use buffa::Message as _;
+use buffa_descriptor::generated::descriptor::{FileDescriptorProto, FileDescriptorSet};
 
 use crate::env::{self, Env};
 use crate::{run, token_client, unique};
@@ -41,6 +46,8 @@ pub const TESTS: &[(&str, fn(&Env))] = &[
     ("key_values_cross_between_java_and_rust", key_values_cross_between_java_and_rust),
     ("records_cross_between_java_and_rust", records_cross_between_java_and_rust),
     ("avro_records_evolve_across_a_split", avro_records_evolve_across_a_split),
+    ("protobuf_schemas_declare_what_java_declares", protobuf_schemas_declare_what_java_declares),
+    ("protobuf_messages_cross_between_java_and_rust", protobuf_messages_cross_between_java_and_rust),
     ("generic_records_cross_between_java_and_rust", generic_records_cross_between_java_and_rust),
     ("a_generic_consumer_decodes_each_message_by_its_version", a_generic_consumer_decodes_each_message_by_its_version),
 ];
@@ -233,6 +240,95 @@ fn avro_records_evolve_across_a_split(env: &Env) {
         2,
         "Java's first version and Rust's second:\n{versions}"
     );
+}
+
+/// A schema as the Java tool prints it: its name, type, definition and properties.
+fn java_info(text: &str) -> (String, String, String, BTreeMap<String, String>) {
+    let line = |prefix: &str| text.lines().find_map(|line| line.strip_prefix(prefix)).unwrap_or_default().to_string();
+    let properties = text.lines().filter_map(|line| line.strip_prefix("property ")?.split_once('='));
+    let properties = properties.map(|(key, value)| (key.to_string(), value.to_string())).collect();
+    (line("name "), line("type "), line("definition "), properties)
+}
+
+/// The files of a descriptor set, by name.
+fn files(set: &[u8]) -> BTreeMap<String, FileDescriptorProto> {
+    let set = FileDescriptorSet::decode_from_slice(set).unwrap();
+    set.file.into_iter().map(|file| (file.name.clone().unwrap_or_default(), file)).collect()
+}
+
+/// A `PROTOBUF_NATIVE` definition: its descriptor set's files, and the message's and its file's names.
+fn native(definition: &str) -> (BTreeMap<String, FileDescriptorProto>, String, String) {
+    let json: serde_json::Value = serde_json::from_str(definition).unwrap();
+    let set = STANDARD.decode(json["fileDescriptorSet"].as_str().unwrap()).unwrap();
+    let name = |key: &str| json[key].as_str().unwrap().to_string();
+    (files(&set), name("rootMessageTypeName"), name("rootFileDescriptorName"))
+}
+
+/// Rust declares what Java 5.0.1 declares for the same message, `PROTOBUF_NATIVE` as v4's `Schema.PROTOBUF_NATIVE`:
+/// the same descriptors, names and properties. For buffa's well-known types, with nesting, enums and imports, and
+/// for a prost type given the descriptor set Java declared.
+fn protobuf_schemas_declare_what_java_declares(env: &Env) {
+    let declared = |message: &str, info: &apache_pulsar::SchemaInfo| {
+        let java = java_info(&env.java_schema_info("protobuf-native", message));
+        assert_eq!((java.0.as_str(), java.1.as_str()), (info.name(), "PROTOBUF_NATIVE"), "{message}");
+        assert_eq!(native(&java.2), native(std::str::from_utf8(info.definition()).unwrap()), "{message}");
+        assert_eq!(&java.3, info.properties(), "{message}");
+        java.2
+    };
+    declared("timestamp", Schema::<buffa_types::google::protobuf::Timestamp>::protobuf_native().info());
+    declared("struct", Schema::<buffa_types::google::protobuf::Struct>::protobuf_native().info());
+    declared("type", Schema::<buffa_types::google::protobuf::Type>::protobuf_native().info());
+    let java = declared("duration", Schema::<buffa_types::google::protobuf::Duration>::protobuf_native().info());
+    let json: serde_json::Value = serde_json::from_str(&java).unwrap();
+    let set = STANDARD.decode(json["fileDescriptorSet"].as_str().unwrap()).unwrap();
+    declared("duration", Schema::<prost_types::Duration>::prost_native(&set).unwrap().info());
+}
+
+/// A `google.protobuf.Timestamp` written as `seconds:nanos`, as the Java tool takes and prints it.
+fn timestamp(text: &str) -> buffa_types::google::protobuf::Timestamp {
+    let (seconds, nanos) = text.split_once(':').unwrap();
+    buffa_types::google::protobuf::Timestamp {
+        seconds: seconds.parse().unwrap(),
+        nanos: nanos.parse().unwrap(),
+        ..Default::default()
+    }
+}
+
+/// `PROTOBUF_NATIVE` messages both ways, of a buffa type and of a prost type, typed and as generic records, with
+/// Java's v4 schema of the same message: the broker checks each side's descriptors against the other's.
+fn protobuf_messages_cross_between_java_and_rust(env: &Env) {
+    let times = ["5:7", "0:0", "-1:999999999"];
+    let schema = Schema::<buffa_types::google::protobuf::Timestamp>::protobuf_native();
+    both_ways(env, "protobuf-native", schema.clone(), &times, timestamp);
+    let json: serde_json::Value = serde_json::from_slice(schema.info().definition()).unwrap();
+    let set = STANDARD.decode(json["fileDescriptorSet"].as_str().unwrap()).unwrap();
+    let prost = Schema::<prost_types::Timestamp>::prost_native(&set).unwrap();
+    let prost_timestamp = |text: &str| {
+        let time = timestamp(text);
+        prost_types::Timestamp { seconds: time.seconds, nanos: time.nanos }
+    };
+    both_ways(env, "protobuf-native", prost, &times, prost_timestamp);
+
+    let topic = new_topic("java-generic-protobuf");
+    env.java_produce("protobuf-native", &topic, &["5:7"]);
+    run(async {
+        let client = client(env).await;
+        let consumer = queue(&client, Schema::auto_consume(), &topic, "rust").await.unwrap();
+        let record = take(&consumer, 1).await.remove(0);
+        assert_eq!(record.schema_type(), SchemaType::ProtobufNative);
+        assert_eq!(record.fields(), ["seconds", "nanos"]);
+        assert_eq!(record.field("seconds"), Some(GenericValue::Protobuf(buffa_descriptor::Value::I64(5))));
+        assert_eq!(record.field("nanos"), Some(GenericValue::Protobuf(buffa_descriptor::Value::I32(7))));
+        client.close().await.unwrap();
+    });
+    let topic = new_topic("rust-generic-protobuf");
+    run(async {
+        let client = client(env).await;
+        let producer = client.new_producer(schema).topic(&topic).create().await.unwrap();
+        producer.send(timestamp("5:7")).await.unwrap();
+        client.close().await.unwrap();
+    });
+    assert_eq!(env.java_consume("auto", &topic, 1), ["PROTOBUF_NATIVE seconds: 5 nanos: 7"]);
 }
 
 /// A value as Java prints it, parsed.

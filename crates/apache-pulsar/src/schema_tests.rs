@@ -487,3 +487,37 @@ fn avro_consumers_read_each_version_with_its_schema() {
         client.close().await.unwrap();
     });
 }
+
+/// Protobuf messages of a buffa type and of a prost type reach a consumer of their schema, which registered it, and
+/// a generic consumer reads them with the descriptors they were written with.
+#[cfg(feature = "prost")]
+#[test]
+fn protobuf_messages_reach_a_consumer() {
+    use buffa_descriptor::Value;
+    use buffa_types::google::protobuf::Timestamp;
+
+    run(async {
+        let schema = Schema::<Timestamp>::protobuf_native();
+        round_trip(schema.clone(), Timestamp { seconds: 5, nanos: 7, ..Default::default() }).await;
+        let definition: serde_json::Value = serde_json::from_slice(schema.info().definition()).unwrap();
+        let set = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            definition["fileDescriptorSet"].as_str().unwrap(),
+        )
+        .unwrap();
+        let prost = Schema::<prost_types::Timestamp>::prost_native(&set).unwrap();
+        round_trip(prost.clone(), prost_types::Timestamp { seconds: 6, nanos: 8 }).await;
+
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(prost).topic(TOPIC).create().await.unwrap();
+        producer.send(prost_types::Timestamp { seconds: 9, nanos: 0 }).await.unwrap();
+        let consumer = queue(&client, Schema::auto_consume(), "generic").await.unwrap();
+        let record = consumer.receive().await.unwrap().value().unwrap();
+        assert_eq!(record.schema_type(), SchemaType::ProtobufNative);
+        assert_eq!(record.fields(), ["seconds", "nanos"]);
+        assert_eq!(record.field("seconds"), Some(GenericValue::Protobuf(Value::I64(9))));
+        assert_eq!(schema_fetches(&server), 1);
+        client.close().await.unwrap();
+    });
+}

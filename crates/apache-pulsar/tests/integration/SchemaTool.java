@@ -41,9 +41,12 @@ import org.apache.pulsar.common.schema.KeyValue;
  * {@code int16}, {@code int32}, {@code int64}, {@code float32} and {@code float64}. {@code kv} is a key/value of a
  * string and an int32, written {@code key=value}: the V5 factory has none, so it is v4's, through {@code V5Interop}.
  * {@code json} and {@code avro} are records of a name and an age, written {@code name:age}; {@code avro-v1} and
- * {@code avro-v2} the two versions of Java's V5 evolution test, written {@code i} and {@code i:j}. {@code auto} only
+ * {@code avro-v2} the two versions of Java's V5 evolution test, written {@code i} and {@code i:j}.
+ * {@code protobuf-native} is a {@code google.protobuf.Timestamp} of v4's {@code Schema.PROTOBUF_NATIVE}, written
+ * {@code seconds:nanos}: the V5 factory has none, so it goes through {@code V5Interop}. {@code auto} only
  * consumes, with {@code Schema.autoConsume()}: it prints each generic record's schema type and value, a key/value as
- * {@code key=value} and bytes as text.
+ * {@code key=value}, a Protobuf message on one line and bytes as text.
+ * {@code SchemaTool info protobuf-native <message>} prints the schema Java declares for a Protobuf message.
  */
 public final class SchemaTool {
     /** A schema, and how its values are read from the command line and printed. */
@@ -54,6 +57,10 @@ public final class SchemaTool {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args[0].equals("info")) {
+            info(args[1], message(args[2]));
+            return;
+        }
         Codec<?> codec = switch (args[1]) {
             case "string" -> new Codec<>(Schema.string(), value -> value);
             case "bool" -> new Codec<>(Schema.bool(), Boolean::parseBoolean);
@@ -72,6 +79,11 @@ public final class SchemaTool {
             case "avro" -> new Codec<>(Schema.avro(Pojo.class), Pojo::parse);
             case "avro-v1" -> new Codec<>(Schema.avro(V1.class), V1::parse);
             case "avro-v2" -> new Codec<>(Schema.avro(V2.class), V2::parse);
+            case "protobuf-native" -> new Codec<>(
+                    V5Interop.toV5Schema(org.apache.pulsar.client.api.Schema.PROTOBUF_NATIVE(
+                            com.google.protobuf.Timestamp.class)),
+                    SchemaTool::timestamp,
+                    time -> time.getSeconds() + ":" + time.getNanos());
             case "auto" -> new Codec<GenericRecord>(
                     Schema.autoConsume(),
                     text -> {
@@ -170,8 +182,45 @@ public final class SchemaTool {
         }
     }
 
-    /** A generic record's value as text: a key/value as {@code key=value}, bytes as UTF-8. */
+    /** A {@code google.protobuf.Timestamp}, written {@code seconds:nanos}. */
+    private static com.google.protobuf.Timestamp timestamp(String text) {
+        String[] parts = text.split(":", 2);
+        return com.google.protobuf.Timestamp.newBuilder()
+                .setSeconds(Long.parseLong(parts[0]))
+                .setNanos(Integer.parseInt(parts[1]))
+                .build();
+    }
+
+    /** The Protobuf messages the tests use: well-known types, which the broker's classpath has. */
+    private static Class<? extends com.google.protobuf.Message> message(String name) {
+        return switch (name) {
+            case "timestamp" -> com.google.protobuf.Timestamp.class;
+            case "duration" -> com.google.protobuf.Duration.class;
+            case "struct" -> com.google.protobuf.Struct.class;
+            case "type" -> com.google.protobuf.Type.class;
+            default -> throw new IllegalArgumentException("no message " + name);
+        };
+    }
+
+    /** Prints the schema Java declares for a message: {@code protobuf-native} is v4's {@code PROTOBUF_NATIVE}. */
+    private static void info(String kind, Class<? extends com.google.protobuf.Message> message) {
+        org.apache.pulsar.common.schema.SchemaInfo info = switch (kind) {
+            case "protobuf-native" -> org.apache.pulsar.client.api.Schema.PROTOBUF_NATIVE(message).getSchemaInfo();
+            default -> throw new IllegalArgumentException("no kind " + kind);
+        };
+        System.out.println("name " + info.getName());
+        System.out.println("type " + info.getType());
+        System.out.println("definition " + new String(info.getSchema(), java.nio.charset.StandardCharsets.UTF_8));
+        new java.util.TreeMap<>(info.getProperties())
+                .forEach((key, value) -> System.out.println("property " + key + "=" + value));
+    }
+
+    /** A generic record's value as text: a key/value as {@code key=value}, a Protobuf message on one line, bytes as
+     * UTF-8. */
     private static String text(Object value) {
+        if (value instanceof com.google.protobuf.MessageOrBuilder message) {
+            return com.google.protobuf.TextFormat.shortDebugString(message);
+        }
         if (value instanceof org.apache.pulsar.client.api.v5.schema.KeyValue<?, ?> pair) {
             return text(pair.key()) + "=" + text(pair.value());
         }

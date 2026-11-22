@@ -41,10 +41,11 @@ const IMAGE: (&str, &str) = ("apachepulsar/pulsar", "5.0.1");
 const JDK_IMAGE: (&str, &str) = ("eclipse-temurin", "21-jdk-alpine");
 /// What the Java test tools compile against: the broker's V5 API, and, for v4's schemas through `V5Interop`, its V5
 /// client and the v4 API.
-const JAVA_TOOLS_CLASSPATH: [&str; 3] = [
+const JAVA_TOOLS_CLASSPATH: [&str; 4] = [
     "org.apache.pulsar-pulsar-client-api-v5-5.0.1.jar",
     "org.apache.pulsar-pulsar-client-v5-5.0.1.jar",
     "org.apache.pulsar-pulsar-client-api-5.0.1.jar",
+    "com.google.protobuf-protobuf-java-4.36.2.jar",
 ];
 /// The Java test tools, by file name.
 const JAVA_TOOLS: [(&str, &[u8]); 2] = [
@@ -283,6 +284,12 @@ impl Env {
     pub fn java_consume(&self, schema: &str, topic: &str, count: usize) -> Vec<String> {
         let output = self.java(&["SchemaTool", "consume", schema, topic, &count.to_string()]);
         output.lines().filter_map(|line| line.strip_prefix("value ")).map(str::to_string).collect()
+    }
+
+    /// The schema Java declares for a Protobuf message, `PROTOBUF` or `PROTOBUF_NATIVE` as `kind` says, as the Java
+    /// tool prints it: its name, type, definition and properties, a line each.
+    pub fn java_schema_info(&self, kind: &str, message: &str) -> String {
+        self.java(&["SchemaTool", "info", kind, message])
     }
 
     /// Runs one of the Java test tools in the broker container, with its arguments, and returns what it printed.

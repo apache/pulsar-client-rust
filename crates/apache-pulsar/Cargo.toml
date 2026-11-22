@@ -32,7 +32,11 @@ workspace = true
 # with apache-avro's `derive` feature.
 apache-avro = { version = "0.23", optional = true }
 apache-pulsar-protocol.workspace = true
+# The Protobuf schema's descriptor set, which Java writes in base64.
+base64 = { version = "0.22", optional = true }
 buffa.workspace = true
+# The Protobuf schema's descriptors, and messages read with them; buffa's types bring theirs.
+buffa-descriptor = { workspace = true, optional = true, features = ["reflect"] }
 bytes.workspace = true
 # `polling` gives Linux a fallback when io_uring is blocked (docs/2-architecture.md §4.4, rule 7). `ring` is the
 # rustls crypto provider (Leaning, docs/4-connections.md §7).
@@ -40,6 +44,8 @@ compio = { workspace = true, features = ["runtime", "net", "io", "io-compat", "t
 futures-channel = "0.3"
 futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
+# The Protobuf schema of prost's types.
+prost = { version = "0.14", optional = true, default-features = false, features = ["std"] }
 rustls-native-certs = "0.8"
 # The values of the JSON and Avro schemas.
 serde = { version = "1", optional = true }
@@ -52,8 +58,10 @@ tracing = "0.1"
 apache-avro = { version = "0.23", features = ["derive"] }
 apache-pulsar-testkit = { path = "../apache-pulsar-testkit" }
 base64 = "0.22"
+buffa-types = { version = "=0.9.2", features = ["reflect"] }
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 libtest-mimic = "0.8"
+prost-types = "0.14"
 rcgen = "0.14"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -62,7 +70,7 @@ testcontainers = { version = "0.28", features = ["blocking", "watchdog"] }
 # The compression codecs, each behind a feature, all on by default (docs/3-protocol.md §6). ZSTD binds the C
 # `libzstd`, so building it needs a C compiler.
 [features]
-default = ["lz4", "zlib", "snappy", "zstd", "json", "avro"]
+default = ["lz4", "zlib", "snappy", "zstd", "json", "avro", "protobuf", "prost"]
 lz4 = ["apache-pulsar-protocol/lz4"]
 zlib = ["apache-pulsar-protocol/zlib"]
 snappy = ["apache-pulsar-protocol/snappy"]
@@ -70,6 +78,10 @@ zstd = ["apache-pulsar-protocol/zstd"]
 # The JSON and Avro schemas, on by default (docs/7-api.md §8). Both describe their records in Avro, as Java's do.
 json = ["dep:apache-avro", "dep:serde"]
 avro = ["dep:apache-avro", "dep:serde"]
+# The Protobuf schema, on by default: `protobuf` reads descriptors with buffa's, and takes buffa's types; `prost` takes
+# prost's.
+protobuf = ["dep:buffa-descriptor", "dep:base64"]
+prost = ["protobuf", "dep:prost"]
 
 # Against a broker and a proxy in Docker. Not run by `cargo test`: `cargo test -p apache-pulsar --test integration`.
 [[test]]
