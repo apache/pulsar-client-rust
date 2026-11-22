@@ -23,6 +23,7 @@ members = [
     "crates/apache-pulsar-testkit",
     "checks/compio-checks",
     "checks/first-contact",
+    "tools/perf",
     "xtask",
 ]
 default-members = [

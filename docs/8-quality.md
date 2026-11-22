@@ -84,9 +84,80 @@ the voted source. Every source file carries the ASF license header, and the repo
 
 ## 6. Performance
 
-A benchmark harness measures throughput and latency for produce and consume, at different payload sizes, loop
-counts and segment counts. It compares the client with the Java client and pulsar-rs on the same broker. An
-OpenMessaging Benchmark driver can follow once the API is stable.
+Two harnesses measure the client, and a recorded baseline is what later rounds compare with.
+
+- **Micro-benchmarks**, with criterion: `cargo bench -p apache-pulsar-protocol`. The producer's state machine routes,
+  batches, encodes and matches the receipts of 1000 keyed messages, sans IO, batched or not; each codec compresses a
+  batch of 1000 small JSON messages, and the consumer decompresses it and splits it into its messages.
+- **End to end**, `tools/perf`: `perf produce` and `perf consume`, the producer's and the Queue consumer's throughput
+  and latency against a broker. Its options, its payloads and its summary lines are those of Java's `pulsar-perf`,
+  which drives the V5 client for a `topic://` topic, so that the two compare line for line. `tools/perf/baseline.sh`
+  runs both, each in a container of its own on the broker's Docker network, against a standalone broker of its own for
+  each run, both bounded by a 64 MiB client memory limit, the only bound a V5 producer has.
+
+Still to measure: loop counts, with producers spread over the thread-safe client's loops, and pulsar-rs, which has no
+scalable topics, so `persistent://` topics through the migration bridge, from a harness on tokio. An OpenMessaging
+Benchmark driver can follow once the API is stable.
+
+### 6.1 Baseline
+
+Recorded on 2026-11-21, at M6, on an Apple M5 Pro (18 cores, 48 GiB) on mains power, macOS 26, with Rust 1.99 in
+release builds. Docker Desktop's VM (10 CPUs, 19.5 GiB) ran the broker, `apachepulsar/pulsar:5.0.1` standalone, and
+both clients, Java's on Corretto 25. One laptop for the broker and both clients: the two runs of each case agree within
+about a tenth, but earlier ones, on battery power, came out up to a half lower, so the end-to-end numbers compare the
+clients roughly. A regression shows first in the micro-benchmarks, whose intervals are within a few percent.
+
+**Micro-benchmarks**, on the host, one thread:
+
+| Benchmark | Time | Throughput |
+|---|---|---|
+| Producer, 100 B messages, batched | 255 ns a message | 3.9 M messages/s |
+| Producer, 1 KiB messages, batched | 285 ns a message | 3.5 M messages/s |
+| Producer, 100 B messages, unbatched | 1.00 µs a message | 1.0 M messages/s |
+| Producer, 1 KiB messages, unbatched | 0.98 µs a message | 1.0 M messages/s |
+| Consumer, decoding an uncompressed batch of 1000 messages | 43 µs a batch | 1.9 GiB/s |
+
+| Codec, on a batch of 1000 messages of JSON (87 KB) | Compress | Decompress and split |
+|---|---|---|
+| LZ4 | 2.5 GiB/s | 1.5 GiB/s |
+| Snappy | 2.5 GiB/s | 1.4 GiB/s |
+| ZSTD, level 3 | 1.5 GiB/s | 1.2 GiB/s |
+| ZLIB, default level | 130 MiB/s | 990 MiB/s |
+
+**End to end**, `tools/perf/baseline.sh`, twice, each cell giving both runs: 20 s at the highest rate each client
+reaches, 1 KiB messages of uppercase letters, batches of up to 1 ms, one segment, unless the run says otherwise.
+
+| Run | This client, msg/s | Java's, msg/s |
+|---|---|---|
+| Produce | 453k / 463k | 929k / 997k |
+| Produce, four segments | 409k / 420k | 892k / 945k |
+| Produce, 100 B | 659k / 659k | 2.01M / 2.04M |
+| Produce, 10 KiB | 99.7k / 99.7k | 90.1k / 103k |
+| Produce, without batching | 178k / 179k | 426k / 444k |
+| Produce, LZ4, near-empty entries | 531k / 539k | 1.89M / 1.89M |
+| Produce, ZSTD, near-empty entries | 564k / 583k | 1.61M / 1.52M |
+| Consume 4M messages, receiving and acknowledging each | 18.3k / 18.3k thread-safe, 331k / 336k local | 411k / 423k |
+
+| Latency at 10,000 msg/s, 60 s after 10 s of warm-up | p50 | p99 | p99.9 | Max |
+|---|---|---|---|---|
+| This client | 1.48 / 1.50 ms | 2.42 / 2.41 ms | 2.87 / 2.72 ms | 6.2 / 6.7 ms |
+| Java's | 1.62 / 1.62 ms | 2.75 / 2.77 ms | 2.99 / 3.69 ms | 11.9 / 9.6 ms |
+
+What it shows:
+
+- **The producer is bound by its own CPU.** In a separate 1 KiB run, sampled with `docker stats`, this client used
+  150–180% of a core, its loop's thread and the one making the load, for about 500k msg/s, and 100% on the local
+  client, both on one thread, for about 400k. Java's used under one core for about 990k, and the broker had room every
+  time. The state machine takes under 0.3 µs of a message, the micro-benchmarks say, out of about 3 µs of CPU in all:
+  the next round looks for where the rest goes.
+- **Large messages are bound by the broker:** at 10 KiB both clients store about 1 GB/s.
+- **At a fixed rate, the latencies match**, this client's a little lower.
+- **The thread-safe consumer's receives and acks each cross to its loop's thread**, so a loop receiving and
+  acknowledging one message at a time gets 18k msg/s there, against 330k on the local client.
+- **The LZ4 and ZSTD runs send near-empty entries:** every message has the same payload, as `pulsar-perf`'s, so a batch
+  compresses to almost nothing. The micro-benchmarks measure the codecs.
+- **Latencies at the highest rate aren't compared:** they are mostly each message's wait for room in the 64 MiB window,
+  which this client fills and Java's doesn't.
 
 ## 7. Open questions
 
