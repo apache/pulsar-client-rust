@@ -52,7 +52,7 @@ pub use message_id::MessageId;
 pub use producer::{
     BatchingPolicy, CompressionPolicy, CompressionType, MessageBuilder, Producer, ProducerAccessMode, ProducerBuilder,
 };
-pub use schema::Schema;
+pub use schema::{Schema, SchemaInfo, SchemaType};
 
 #[cfg(test)]
 mod checkpoint_tests;
@@ -60,6 +60,8 @@ mod checkpoint_tests;
 mod consumer_tests;
 #[cfg(test)]
 mod producer_tests;
+#[cfg(test)]
+mod schema_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]

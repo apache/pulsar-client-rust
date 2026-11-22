@@ -297,12 +297,7 @@ impl<T: 'static, Api> ProducerBuilder<T, Api> {
             send_timeout: self.settings.send_timeout,
             initial_sequence_id: self.settings.initial_sequence_id,
             properties: self.settings.properties.clone(),
-            schema: self.schema.info().map(|info| proto::Schema {
-                name: info.name.clone(),
-                schema_data: info.data.clone(),
-                r#type: info.kind,
-                ..Default::default()
-            }),
+            schema: self.schema.info().to_proto(),
             operation_timeout,
         })
     }

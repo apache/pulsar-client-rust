@@ -24,6 +24,7 @@
 
 mod bridge;
 mod env;
+mod schemas;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -98,6 +99,7 @@ fn main() {
     let trials = TESTS
         .iter()
         .chain(bridge::TESTS)
+        .chain(schemas::TESTS)
         .map(|test| (test, false))
         .chain(ignored)
         .map(|(&(name, test), ignored)| {

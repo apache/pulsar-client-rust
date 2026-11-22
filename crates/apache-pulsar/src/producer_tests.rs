@@ -154,9 +154,12 @@ async fn serve(tcp: TcpStream, world: Rc<RefCell<World>>, wakers: Rc<RefCell<Has
     .await
 }
 
+/// A world with [`TOPIC`], whose schema is a string's, as if the other clients that store messages there with
+/// [`World::publish_raw`] had registered it.
 pub(crate) fn world(segments: u32) -> World {
     let mut world = World::default();
     world.create_topic(TOPIC, segments);
+    world.register_schema(TOPIC, Schema::string().info().to_proto().unwrap());
     world
 }
 
@@ -967,7 +970,7 @@ fn debug_output() {
         let connection = client.connection(&address).await.unwrap();
         assert!(format!("{connection:?}").contains("ConnHandle"));
         assert!(format!("{:?}", Schema::string()).contains("String"));
-        assert_eq!(format!("{:?}", Schema::bytes()), "Schema(bytes)");
+        assert_eq!(format!("{:?}", Schema::bytes()), r#"Schema { name: "Bytes", type: Bytes }"#);
         let id = crate::MessageId::earliest();
         assert_eq!(format!("{id:?}"), id.to_string());
         let watch = client.watches().open(&client, TOPIC).await.unwrap();

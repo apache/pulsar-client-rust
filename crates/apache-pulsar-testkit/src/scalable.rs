@@ -36,6 +36,11 @@
 //! which goes out again), goes with its consumer, and is told the segment ended only if it starts at the end, since
 //! readers don't acknowledge. `CommandGetLastMessageId` is answered with the segment's last message id.
 //!
+//! Schemas are a topic's, as on the broker: one history for all its segments. A producer's schema takes the version
+//! of an equal one, or becomes the next version unless its type differs from the latest's; a consumer's schema must
+//! have the latest's type, and becomes the topic's first on a segment with no producer, consumer or entry. A
+//! mismatch is refused with `IncompatibleSchema`. Unlike the broker, the world checks no compatibility within a type.
+//!
 //! Unlike the broker, the world hands a consumer one entry a turn, where the broker hands it up to
 //! `dispatcherMaxRoundRobinBatchSize`; and tells a consumer the topic ended once, where the broker tells it again on
 //! later acks and reads.
@@ -58,7 +63,7 @@ use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType}
 use apache_pulsar_protocol::proto::{
     BaseCommand, CommandCloseConsumer, CommandCloseProducer, CommandGetLastMessageIdResponse, CommandMessage,
     CommandProducerSuccess, CommandReachedEndOfTopic, CommandScalableTopicUpdate, CommandSendError, CommandSendReceipt,
-    CompressionType, FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG,
+    CompressionType, FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG, Schema,
     SegmentInfoProto, SegmentState, ServerError, SingleMessageMetadata,
 };
 use buffa::{EnumValue, Message};
@@ -173,6 +178,9 @@ struct Topic {
     /// The scalable topic a regular one became, once [`World::migrate`] migrated it: the name its layouts give, which
     /// a lookup finds it by too.
     migrated: Option<String>,
+    /// The schemas registered, oldest first: a schema's version is its index. As on the broker, a scalable topic
+    /// keeps one history, which all its segments share.
+    schemas: Vec<Schema>,
 }
 
 #[derive(Debug, Default)]
@@ -332,7 +340,8 @@ impl World {
     pub fn create_topic(&mut self, topic: &str, segments: u32) {
         assert!(segments > 0 && topic.starts_with("topic://"), "bad topic {topic} or segment count");
         let ledger = &mut self.next_ledger;
-        let mut topic_state = Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0, migrated: None };
+        let mut topic_state =
+            Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0, migrated: None, schemas: Vec::new() };
         let parent = &topic["topic://".len()..];
         for i in 0..segments {
             let start = (u64::from(i) * 0x1_0000 / u64::from(segments)) as u32;
@@ -356,7 +365,8 @@ impl World {
     /// non-partitioned topic (`partitions == 0`).
     pub fn create_legacy_topic(&mut self, topic: &str, partitions: u32) {
         assert!(topic.starts_with("persistent://"), "bad topic {topic}");
-        let mut topic_state = Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0, migrated: None };
+        let mut topic_state =
+            Topic { epoch: 0, segments: BTreeMap::new(), next_segment: 0, migrated: None, schemas: Vec::new() };
         let names: Vec<String> = match partitions {
             0 => vec![topic.to_string()],
             n => (0..n).map(|i| format!("{topic}-partition-{i}")).collect(),
@@ -584,6 +594,17 @@ impl World {
     /// What one segment stored, in order.
     pub fn stored_in(&self, topic: &str, segment: u64) -> Vec<Stored> {
         self.topic(topic).segments[&segment].entries.clone()
+    }
+
+    /// The schemas registered on a topic, oldest first: a schema's version is its index.
+    pub fn schemas(&self, topic: &str) -> &[Schema] {
+        &self.topic(topic).schemas
+    }
+
+    /// Registers a schema on a topic, as a producer with it does, and returns its version. Panics if the broker would
+    /// refuse it: its type isn't the latest schema's.
+    pub fn register_schema(&mut self, topic: &str, schema: Schema) -> Vec<u8> {
+        self.add_schema(topic, Some(&schema)).expect("a schema the topic refuses")
     }
 
     /// The messages of [`World::stored`]'s entries, in the same order.
@@ -918,6 +939,14 @@ impl World {
             self.push(conn, error);
             return;
         }
+        let schema_version = match self.add_schema(&topic, producer.schema.as_option()) {
+            Ok(version) => version,
+            Err(message) => {
+                self.push(conn, reply::error(request_id, ServerError::IncompatibleSchema, &message));
+                return;
+            }
+        };
+        let seg = self.topics.get_mut(&topic).unwrap().segments.get_mut(&segment).unwrap();
         // A producer coming back with the epoch it was given, after a newer one took the topic, was fenced.
         if producer.topic_epoch.is_some_and(|epoch| epoch < seg.topic_epoch) {
             let error = reply::error(request_id, ServerError::ProducerFenced, "the producer was fenced");
@@ -961,8 +990,52 @@ impl World {
         let last = if dedup { seg.last_sequence.get(&name).copied().unwrap_or(-1) } else { -1 };
         self.conn(conn).producers.insert(producer.producer_id, (topic, segment));
         let mut success = producer_success(request_id, &name, last, true);
-        success.producer_success.get_or_insert_default().topic_epoch = topic_epoch;
+        let answer = success.producer_success.get_or_insert_default();
+        answer.topic_epoch = topic_epoch;
+        answer.schema_version = Some(schema_version);
         self.push(conn, success);
+    }
+
+    /// Adds a producer's schema to the topic's, as the broker does: one equal to a version already there takes that
+    /// version, one of another type than the latest is refused, and any other becomes the next version. The version
+    /// is the broker's: 8 bytes, big endian, and none for a producer without a schema.
+    fn add_schema(&mut self, topic: &str, schema: Option<&Schema>) -> Result<Vec<u8>, String> {
+        let Some(schema) = schema else { return Ok(Vec::new()) };
+        let schemas = &mut self.topic_mut(topic).schemas;
+        let version = match schemas.iter().position(|registered| same_schema(registered, schema)) {
+            Some(version) => version,
+            None => match schemas.last() {
+                Some(latest) if latest.r#type != schema.r#type => {
+                    let (exists, new) = (latest.r#type, schema.r#type);
+                    return Err(format!("Incompatible schema: exists schema type {exists:?}, new schema type {new:?}"));
+                }
+                _ => {
+                    schemas.push(schema.clone());
+                    schemas.len() - 1
+                }
+            },
+        };
+        Ok((version as u64).to_be_bytes().to_vec())
+    }
+
+    /// Checks a consumer's schema, as the broker does on subscribing: on a segment with no producer, no consumer and
+    /// no entry, of a topic without a schema, it becomes the topic's; otherwise the topic's latest schema must have
+    /// its type.
+    fn check_schema(&mut self, topic: &str, segment: u64, schema: Option<&Schema>) -> Option<ServerError> {
+        let schema = schema?;
+        let topic = self.topic_mut(topic);
+        let seg = &topic.segments[&segment];
+        let idle = seg.producers.is_empty()
+            && seg.entries.is_empty()
+            && seg.subscriptions.values().all(|subscription| subscription.consumers.is_empty());
+        match topic.schemas.last() {
+            None if idle => {
+                topic.schemas.push(schema.clone());
+                None
+            }
+            Some(latest) if latest.r#type == schema.r#type => None,
+            _ => Some(ServerError::IncompatibleSchema),
+        }
     }
 
     fn remove_producer(&mut self, conn: ConnId, producer_id: u64, topic: &str, segment: u64) {
@@ -1083,7 +1156,9 @@ impl World {
         let reader = subscribe.durable == Some(false);
         let refusal = match &found {
             None => Some(ServerError::TopicNotFound),
-            Some((topic, segment)) => self.refusal(topic, *segment, subscribe),
+            Some((topic, segment)) => self
+                .check_schema(topic, *segment, subscribe.schema.as_option())
+                .or_else(|| self.refusal(topic, *segment, subscribe)),
         }
         .or_else(|| match self.fail_subscribes_to.get_mut(&subscribe.topic).and_then(VecDeque::pop_front) {
             Some(error) => Some(error),
@@ -1318,6 +1393,11 @@ impl Segment {
             subscriptions: BTreeMap::new(),
         }
     }
+}
+
+/// Whether two schemas are the same version, as the broker compares them: by type and definition.
+fn same_schema(a: &Schema, b: &Schema) -> bool {
+    a.r#type == b.r#type && a.schema_data == b.schema_data
 }
 
 fn segment_name(parent: &str, start: u32, end: u32, id: u64) -> String {
