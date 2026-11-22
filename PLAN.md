@@ -156,9 +156,10 @@ with each codec, the ZLIB ones finished streams.
 
 A first round of benchmarks, and a baseline against Java's V5 client on a 5.0.1 broker ([8](docs/8-quality.md) §6):
 micro-benchmarks of the producer's state machine and of the codecs, and `tools/perf`, which measures the producer's and
-the Queue consumer's throughput and latency against a broker as Java's `pulsar-perf` does. The producer is bound by
-its own CPU, most of a send's spent outside the state machine, and the thread-safe consumer's receives and acks each
-cross threads: the next rounds look for where a send's time goes, and measure loops.
+the Queue consumer's throughput and latency against a broker as Java's `pulsar-perf` does. The client side, the
+producer and `perf` driving it, is bound by its CPU, most of a send's spent outside the state machine, and the
+thread-safe consumer's receives and acks each cross threads: the next rounds look for where a send's time goes, and
+measure loops.
 
 ## M7: Conformance and a first release
 

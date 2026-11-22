@@ -70,12 +70,23 @@ topic() {
     echo "topic://public/default/$name"
 }
 
+# The summary lines a tool prints at the end of a run. A run that ends without them stops the script, after the last
+# lines the tool printed.
+summary() {
+    local out
+    out=$(cat)
+    grep -o 'Aggregated.*' <<<"$out" && return
+    tail -n 20 <<<"$out" >&2
+    echo "baseline.sh: the run ended without its summary line" >&2
+    return 1
+}
+
 rust() {
-    docker run --rm --network "$NET" -v "$BIN:/perf:ro" "$RUST_IMAGE" /perf/perf "$@" 2>&1 | grep -o 'Aggregated.*'
+    docker run --rm --network "$NET" -v "$BIN:/perf:ro" "$RUST_IMAGE" /perf/perf "$@" 2>&1 | summary
 }
 
 java() {
-    docker run --rm --network "$NET" "$IMAGE" bin/pulsar-perf "$@" 2>&1 | grep -o 'Aggregated.*'
+    docker run --rm --network "$NET" "$IMAGE" bin/pulsar-perf "$@" 2>&1 | summary
 }
 
 # The rate over a run of `$1` seconds, from the records its summary line counts.
