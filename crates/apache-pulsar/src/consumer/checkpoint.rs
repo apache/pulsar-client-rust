@@ -127,6 +127,7 @@ impl<T: 'static, Api> CheckpointConsumerBuilder<T, Api> {
             let name = self.settings.consumer_name.take().filter(|name| !name.is_empty());
             self.settings.consumer_name = Some(name.unwrap_or_else(|| random_name("checkpoint")));
         }
+        self.schema.check_consumer()?;
         let (topic, options) = reader_options(&self.settings, self.schema.info(), operation_timeout)?;
         let member = self.settings.group.clone().zip(self.settings.consumer_name.clone());
         Ok((topic, options, self.settings.start.0.clone(), member))
@@ -220,6 +221,7 @@ async fn create_on(
     start: wire::Checkpoint,
     member: Option<Member>,
 ) -> Result<Link> {
+    let writers = super::writers::wanted(&options);
     let machine = move |layout: Rc<Layout>| {
         let now = Instant::now();
         Machine::Checkpoint(match member {
@@ -227,7 +229,7 @@ async fn create_on(
             None => Reader::new(options, start, layout, now),
         })
     };
-    super::start(client, topic, Box::new(machine)).await
+    super::start(client, topic, Box::new(machine), writers).await
 }
 
 /// A Checkpoint consumer: a reader on every segment of a topic, and no subscription on the brokers (*client-api*
@@ -327,7 +329,7 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
         self.shared.link.close().await
     }
 
-    fn message(&self, message: apache_pulsar_protocol::entry::ReceivedMessage) -> Message<T> {
+    fn message(&self, message: super::writers::Delivered) -> Message<T> {
         self.shared.link.message(message, &self.schema)
     }
 }

@@ -29,7 +29,13 @@ use std::time::Instant;
 use compio::runtime::JoinHandle;
 
 use apache_pulsar_protocol::backoff::Backoff;
-use apache_pulsar_protocol::lookup::{BrokerAddress, Lookup, LookupStep, ServiceUrl};
+use apache_pulsar_protocol::connection::RequestError;
+use apache_pulsar_protocol::frame::Frame;
+use apache_pulsar_protocol::lookup::{BrokerAddress, HostPort, Lookup, LookupStep, ServiceUrl};
+use apache_pulsar_protocol::proto::{
+    self, BaseCommand, CommandGetSchema, ServerError, base_command::Type as CommandType,
+};
+use buffa::{EnumValue, MessageView};
 
 use crate::config::{ClientBuilder, Local};
 use crate::conn::ConnHandle;
@@ -166,6 +172,31 @@ impl PulsarClient {
     /// Finds the broker that serves `topic`, retrying connection failures with backoff, across the service URL's
     /// hosts, until the operation timeout.
     pub(crate) async fn lookup(&self, topic: &str) -> Result<BrokerAddress> {
+        let tls = self.inner.pool.config().service.tls;
+        self.on_service(&format!("lookup of {topic}"), |host| self.lookup_from(topic, Lookup::new(topic, host, tls)))
+            .await
+    }
+
+    /// The schema of `topic` at `version`, from a broker of the service URL, as Java asks for it: `None` if the topic
+    /// has no schema of that version, as Java reads the broker's `TopicNotFound`. Retries connection failures as a
+    /// lookup does.
+    pub(crate) async fn schema(&self, topic: &str, version: &[u8]) -> Result<Option<proto::Schema>> {
+        self.on_service(&format!("the schema of {topic}"), |host| async move {
+            let connection = self.inner.pool.get(&BrokerAddress::direct(host)).await?;
+            let (topic, version) = (topic.to_string(), version.to_vec());
+            let frame = connection.request(move |request_id| get_schema_command(topic, version, request_id)).await?;
+            schema_response(&frame)
+        })
+        .await
+    }
+
+    /// Runs `attempt` on a host of the service URL, retrying connection failures with backoff, across the hosts, until
+    /// the operation timeout. `what` names the attempt for the timeout's error.
+    async fn on_service<T, F: Future<Output = Result<T>>>(
+        &self,
+        what: &str,
+        attempt: impl Fn(HostPort) -> F,
+    ) -> Result<T> {
         self.check_open()?;
         let config = self.inner.pool.config();
         let deadline = Instant::now() + config.operation_timeout;
@@ -174,16 +205,16 @@ impl PulsarClient {
         loop {
             let index = self.inner.next_host.get() % hosts.len();
             let host = hosts[index].clone();
-            match self.lookup_from(topic, Lookup::new(topic, host.clone(), config.service.tls)).await {
-                Ok(address) => return Ok(address),
+            match attempt(host.clone()).await {
+                Ok(found) => return Ok(found),
                 Err(error) if error.is_retryable() => {
                     // Start the next attempt, and the next lookup, at another host.
                     self.inner.next_host.set(index + 1);
                     let delay = backoff.next_delay(jitter());
                     if Instant::now() + delay >= deadline {
-                        return Err(Error::new(ErrorKind::Timeout, format!("lookup of {topic} timed out: {error}")));
+                        return Err(Error::new(ErrorKind::Timeout, format!("{what} timed out: {error}")));
                     }
-                    tracing::debug!(%topic, %host, %error, ?delay, "lookup failed, retrying");
+                    tracing::debug!(%host, %error, ?delay, "{what} failed, retrying");
                     compio::time::sleep(delay).await;
                     self.check_open()?;
                 }
@@ -241,4 +272,68 @@ impl ClientBuilder<Local> {
 pub(crate) fn jitter() -> f64 {
     use std::hash::{BuildHasher, RandomState};
     (RandomState::new().hash_one(Instant::now()) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Asks for the schema of `topic` at `version`.
+fn get_schema_command(topic: String, version: Vec<u8>, request_id: u64) -> BaseCommand {
+    let get = CommandGetSchema { request_id, topic, schema_version: Some(version), ..Default::default() };
+    BaseCommand { r#type: CommandType::GET_SCHEMA.into(), getSchema: get.into(), ..Default::default() }
+}
+
+/// The schema in a `CommandGetSchemaResponse`: `None` for the broker's `TopicNotFound`, which it answers for a topic
+/// without a schema of the version asked. An answer with neither a schema nor an error fails.
+fn schema_response(frame: &Frame) -> Result<Option<proto::Schema>> {
+    let command = frame.command_view().ok().and_then(|view| view.to_owned_message().ok()).unwrap_or_default();
+    let response = command.getSchemaResponse.as_option().cloned().unwrap_or_default();
+    match (response.error_code, response.schema.as_option()) {
+        (Some(ServerError::TopicNotFound), _) => Ok(None),
+        (Some(error), _) => {
+            let message = response.error_message.unwrap_or_default();
+            Err(RequestError::Server { error: EnumValue::Known(error), message }.into())
+        }
+        (None, Some(schema)) => Ok(Some(schema.clone())),
+        (None, None) => Err(Error::new(ErrorKind::Other, "the broker's answer has no schema")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use apache_pulsar_protocol::frame::{FrameDecoder, encode_command};
+    use apache_pulsar_protocol::proto::CommandGetSchemaResponse;
+    use bytes::BytesMut;
+
+    use super::*;
+
+    fn frame(command: BaseCommand) -> Frame {
+        let mut bytes = BytesMut::new();
+        encode_command(&command, &mut bytes).unwrap();
+        FrameDecoder::default().decode(&mut bytes).unwrap().unwrap()
+    }
+
+    fn response(response: CommandGetSchemaResponse) -> Frame {
+        let kind = CommandType::GET_SCHEMA_RESPONSE.into();
+        frame(BaseCommand { r#type: kind, getSchemaResponse: response.into(), ..Default::default() })
+    }
+
+    /// The broker's answers to `CommandGetSchema`, as Java reads them.
+    #[test]
+    fn schema_responses() {
+        let schema = proto::Schema { name: "acme/orders/events".into(), ..Default::default() };
+        let found = CommandGetSchemaResponse { schema: schema.clone().into(), ..Default::default() };
+        assert_eq!(schema_response(&response(found)).unwrap(), Some(schema));
+        let missing = CommandGetSchemaResponse { error_code: Some(ServerError::TopicNotFound), ..Default::default() };
+        assert_eq!(schema_response(&response(missing)).unwrap(), None);
+        let failed = CommandGetSchemaResponse {
+            error_code: Some(ServerError::MetadataError),
+            error_message: Some("no metadata".into()),
+            ..Default::default()
+        };
+        let error = schema_response(&response(failed)).unwrap_err();
+        assert!(error.to_string().contains("no metadata"), "{error}");
+        // Neither a schema nor an error: nothing to keep for the version.
+        let empty = schema_response(&response(CommandGetSchemaResponse::default())).unwrap_err();
+        assert_eq!(empty.kind(), ErrorKind::Other);
+        let success = frame(BaseCommand { r#type: CommandType::SUCCESS.into(), ..Default::default() });
+        assert_eq!(schema_response(&success).unwrap_err().kind(), ErrorKind::Other);
+    }
 }

@@ -24,6 +24,7 @@ import org.apache.pulsar.client.api.v5.Producer;
 import org.apache.pulsar.client.api.v5.PulsarClient;
 import org.apache.pulsar.client.api.v5.QueueConsumer;
 import org.apache.pulsar.client.api.v5.config.SubscriptionInitialPosition;
+import org.apache.pulsar.client.api.v5.schema.GenericRecord;
 import org.apache.pulsar.client.api.v5.schema.Schema;
 import org.apache.pulsar.client.impl.v5.V5Interop;
 import org.apache.pulsar.common.schema.KeyValue;
@@ -39,6 +40,8 @@ import org.apache.pulsar.common.schema.KeyValue;
  * The schemas are named as the V5 factories that make them: {@code string}, {@code bool}, {@code int8},
  * {@code int16}, {@code int32}, {@code int64}, {@code float32} and {@code float64}. {@code kv} is a key/value of a
  * string and an int32, written {@code key=value}: the V5 factory has none, so it is v4's, through {@code V5Interop}.
+ * {@code auto} only consumes, with {@code Schema.autoConsume()}: it prints each generic record's schema type and
+ * value, a key/value as {@code key=value} and bytes as text.
  */
 public final class SchemaTool {
     /** A schema, and how its values are read from the command line and printed. */
@@ -63,6 +66,12 @@ public final class SchemaTool {
                             org.apache.pulsar.client.api.Schema.STRING, org.apache.pulsar.client.api.Schema.INT32)),
                     text -> new KeyValue<>(text.split("=", 2)[0], Integer.parseInt(text.split("=", 2)[1])),
                     pair -> pair.getKey() + "=" + pair.getValue());
+            case "auto" -> new Codec<GenericRecord>(
+                    Schema.autoConsume(),
+                    text -> {
+                        throw new IllegalArgumentException("auto only consumes");
+                    },
+                    record -> record.schemaType() + " " + text(record.nativeObject()));
             default -> throw new IllegalArgumentException("no schema " + args[1]);
         };
         try (PulsarClient client = PulsarClient.builder()
@@ -75,6 +84,17 @@ public final class SchemaTool {
                 default -> throw new IllegalArgumentException("no command " + args[0]);
             }
         }
+    }
+
+    /** A generic record's value as text: a key/value as {@code key=value}, bytes as UTF-8. */
+    private static String text(Object value) {
+        if (value instanceof org.apache.pulsar.client.api.v5.schema.KeyValue<?, ?> pair) {
+            return text(pair.key()) + "=" + text(pair.value());
+        }
+        if (value instanceof byte[] bytes) {
+            return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+        }
+        return String.valueOf(value);
     }
 
     private static <T> void produce(PulsarClient client, Codec<T> codec, String topic, String[] values)

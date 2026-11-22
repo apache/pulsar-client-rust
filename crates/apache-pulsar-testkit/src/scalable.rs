@@ -40,6 +40,8 @@
 //! of an equal one, or becomes the next version unless its type differs from the latest's; a consumer's schema must
 //! have the latest's type, and becomes the topic's first on a segment with no producer, consumer or entry. A
 //! mismatch is refused with `IncompatibleSchema`. Unlike the broker, the world checks no compatibility within a type.
+//! As on the broker, a consumer of an `AUTO_CONSUME` schema isn't checked, nor counted as a consumer of the segment;
+//! and `CommandGetSchema` on a segment gets its topic's schema of a version, named after the topic, or `TopicNotFound`.
 //!
 //! Unlike the broker, the world hands a consumer one entry a turn, where the broker hands it up to
 //! `dispatcherMaxRoundRobinBatchSize`; and tells a consumer the topic ended once, where the broker tells it again on
@@ -60,11 +62,12 @@ use apache_pulsar_protocol::layout::Layout;
 use apache_pulsar_protocol::proto::base_command::Type;
 use apache_pulsar_protocol::proto::command_ack::AckType;
 use apache_pulsar_protocol::proto::command_subscribe::{InitialPosition, SubType};
+use apache_pulsar_protocol::proto::schema::Type as SchemaKind;
 use apache_pulsar_protocol::proto::{
-    BaseCommand, CommandCloseConsumer, CommandCloseProducer, CommandGetLastMessageIdResponse, CommandMessage,
-    CommandProducerSuccess, CommandReachedEndOfTopic, CommandScalableTopicUpdate, CommandSendError, CommandSendReceipt,
-    CompressionType, FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode, ScalableTopicDAG, Schema,
-    SegmentInfoProto, SegmentState, ServerError, SingleMessageMetadata,
+    BaseCommand, CommandCloseConsumer, CommandCloseProducer, CommandGetLastMessageIdResponse, CommandGetSchemaResponse,
+    CommandMessage, CommandProducerSuccess, CommandReachedEndOfTopic, CommandScalableTopicUpdate, CommandSendError,
+    CommandSendReceipt, CompressionType, FeatureFlags, MessageIdData, MessageMetadata, ProducerAccessMode,
+    ScalableTopicDAG, Schema, SegmentInfoProto, SegmentState, ServerError, SingleMessageMetadata,
 };
 use buffa::{EnumValue, Message};
 use bytes::{Buf, Bytes, BytesMut};
@@ -168,6 +171,9 @@ struct Consumer {
     pending: BTreeSet<u64>,
     /// Whether it was told the topic ended.
     ended: bool,
+    /// Whether its schema is `AUTO_CONSUME`'s, which the broker doesn't count as a consumer of the segment when it
+    /// checks a schema.
+    auto_consume: bool,
 }
 
 #[derive(Debug)]
@@ -230,6 +236,10 @@ pub struct World {
     pub hold_last_message_ids: bool,
     /// Errors to answer the next `CommandGetLastMessageId` with, one each.
     pub fail_last_message_ids: VecDeque<ServerError>,
+    /// While set, `CommandGetSchema` waits unanswered until [`World::release_schemas`].
+    pub hold_schemas: bool,
+    /// Errors to answer the next `CommandGetSchema` with, one each.
+    pub fail_schemas: VecDeque<ServerError>,
     /// While set, scalable-topic lookups get no answer.
     pub silent_lookups: bool,
     /// Every command received, per connection.
@@ -242,6 +252,7 @@ pub struct World {
     held_sends: Vec<(ConnId, Frame)>,
     held_subscribes: Vec<(ConnId, BaseCommand)>,
     held_last_message_ids: Vec<(ConnId, BaseCommand)>,
+    held_schemas: Vec<(ConnId, BaseCommand)>,
     next_conn: ConnId,
     next_ledger: u64,
     next_name: u64,
@@ -270,6 +281,8 @@ impl Default for World {
             hold_subscribes_to: BTreeSet::new(),
             hold_last_message_ids: false,
             fail_last_message_ids: VecDeque::new(),
+            hold_schemas: false,
+            fail_schemas: VecDeque::new(),
             silent_lookups: false,
             log: Vec::new(),
             topics: BTreeMap::new(),
@@ -278,6 +291,7 @@ impl Default for World {
             held_sends: Vec::new(),
             held_subscribes: Vec::new(),
             held_last_message_ids: Vec::new(),
+            held_schemas: Vec::new(),
             next_conn: 0,
             next_ledger: 100,
             next_name: 0,
@@ -542,6 +556,13 @@ impl World {
     pub fn release_last_message_ids(&mut self) {
         for (conn, command) in std::mem::take(&mut self.held_last_message_ids) {
             self.last_message_id(conn, &command);
+        }
+    }
+
+    /// Answers the `CommandGetSchema` held while [`World::hold_schemas`] was set, in order.
+    pub fn release_schemas(&mut self) {
+        for (conn, command) in std::mem::take(&mut self.held_schemas) {
+            self.get_schema(conn, &command);
         }
     }
 
@@ -837,12 +858,44 @@ impl World {
             Type::CLOSE_CONSUMER => self.close_consumer(conn, &command),
             Type::GET_LAST_MESSAGE_ID if self.hold_last_message_ids => self.held_last_message_ids.push((conn, command)),
             Type::GET_LAST_MESSAGE_ID => self.last_message_id(conn, &command),
+            Type::GET_SCHEMA if self.hold_schemas => self.held_schemas.push((conn, command)),
+            Type::GET_SCHEMA => self.get_schema(conn, &command),
             _ => {}
         }
     }
 
     /// Answers `CommandGetLastMessageId` with the id of the segment's last message, as the broker does: the last
     /// entry, with the index of its last message for a batch; `-1:-1` for an empty segment.
+    /// Answers a `CommandGetSchema` on a segment as the broker does: with its topic's schema of the version asked,
+    /// named after the topic; `TopicNotFound` for a version the topic doesn't have.
+    fn get_schema(&mut self, conn: ConnId, command: &BaseCommand) {
+        let get = &command.getSchema;
+        let failure = self.fail_schemas.pop_front();
+        let index = get.schema_version.as_deref().and_then(|version| <[u8; 8]>::try_from(version).ok());
+        let topic = self.find_segment(&get.topic).map(|(topic, _)| topic).unwrap_or_default();
+        let schemas = self.topics.get(&topic).map(|topic| &topic.schemas);
+        let schema = schemas.zip(index).and_then(|(schemas, index)| schemas.get(u64::from_be_bytes(index) as usize));
+        let mut response = CommandGetSchemaResponse { request_id: get.request_id, ..Default::default() };
+        let (error, message) = match (failure, schema) {
+            (Some(error), _) => (Some(error), format!("the broker failed: {error:?}")),
+            (None, Some(schema)) => {
+                let name = topic.strip_prefix("topic://").unwrap_or(&topic).to_string();
+                response.schema = Schema { name, ..schema.clone() }.into();
+                response.schema_version = get.schema_version.clone();
+                (None, String::new())
+            }
+            (None, None) => (Some(ServerError::TopicNotFound), format!("Topic not found or no-schema {}", get.topic)),
+        };
+        response.error_code = error;
+        response.error_message = error.map(|_| message);
+        let response = BaseCommand {
+            r#type: Type::GET_SCHEMA_RESPONSE.into(),
+            getSchemaResponse: response.into(),
+            ..Default::default()
+        };
+        self.push(conn, response);
+    }
+
     fn last_message_id(&mut self, conn: ConnId, command: &BaseCommand) {
         let get = &command.getLastMessageId;
         let place = self.conns.get(&conn).and_then(|c| c.consumers.get(&get.consumer_id)).cloned();
@@ -1020,14 +1073,14 @@ impl World {
 
     /// Checks a consumer's schema, as the broker does on subscribing: on a segment with no producer, no consumer and
     /// no entry, of a topic without a schema, it becomes the topic's; otherwise the topic's latest schema must have
-    /// its type.
+    /// its type. The broker checks no `AUTO_CONSUME` schema, nor counts its consumers.
     fn check_schema(&mut self, topic: &str, segment: u64, schema: Option<&Schema>) -> Option<ServerError> {
-        let schema = schema?;
+        let schema = schema.filter(|schema| schema.r#type != SchemaKind::AutoConsume)?;
         let topic = self.topic_mut(topic);
         let seg = &topic.segments[&segment];
         let idle = seg.producers.is_empty()
             && seg.entries.is_empty()
-            && seg.subscriptions.values().all(|subscription| subscription.consumers.is_empty());
+            && seg.subscriptions.values().flat_map(|subscription| &subscription.consumers).all(|c| c.auto_consume);
         match topic.schemas.last() {
             None if idle => {
                 topic.schemas.push(schema.clone());
@@ -1202,6 +1255,7 @@ impl World {
             permits: 0,
             pending: BTreeSet::new(),
             ended: false,
+            auto_consume: subscribe.schema.as_option().is_some_and(|schema| schema.r#type == SchemaKind::AutoConsume),
         });
         let place = (topic.clone(), segment, subscribe.subscription.clone());
         self.conn(conn).consumers.insert(id, place);

@@ -20,6 +20,8 @@
 //! The schema is topic-level (*data-model* §6): the broker keeps one history of schemas for a scalable topic, which
 //! every segment shares, and checks a producer's or a consumer's schema against it as it registers on a segment.
 
+mod generic;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -27,10 +29,13 @@ use apache_pulsar_protocol::proto;
 use apache_pulsar_protocol::proto::schema::Type;
 use bytes::{BufMut, Bytes, BytesMut};
 
+pub use self::generic::{GenericRecord, GenericValue};
 use crate::error::{Error, ErrorKind, Result};
 
 type Encode<T> = Arc<dyn Fn(&T) -> Result<Bytes> + Send + Sync>;
-type Decode<T> = Arc<dyn Fn(&[u8]) -> Result<T> + Send + Sync>;
+/// Decodes a payload. Only [`Schema::auto_consume`] reads the schema it was written with: `None` for a message
+/// without one.
+type Decode<T> = Arc<dyn Fn(&[u8], Option<&SchemaInfo>) -> Result<T> + Send + Sync>;
 
 /// How values of type `T` are encoded, and the schema the broker is told about. Cheap to clone.
 ///
@@ -44,10 +49,24 @@ type Decode<T> = Arc<dyn Fn(&[u8]) -> Result<T> + Send + Sync>;
 /// | `int8()` to `int64()` | `i8` to `i64` | big endian |
 /// | `float32()`, `float64()` | `f32`, `f64` | IEEE 754, big endian |
 /// | `key_value(key, value)` | [`KeyValue<K, V>`] | the key's length, 4 bytes big endian, and bytes, then the value's |
+/// | `auto_consume()` | [`GenericRecord`] | decoded with the schema each message was written with |
 pub struct Schema<T> {
     info: SchemaInfo,
     encode: Encode<T>,
     decode: Decode<T>,
+    generic: Generic,
+}
+
+/// Whether a schema decodes with the schema each message was written with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Generic {
+    /// No: it decodes with its own.
+    No,
+    /// It does: [`Schema::auto_consume`].
+    Whole,
+    /// A key/value schema with a key or a value of [`Schema::auto_consume`], which neither producers nor consumers
+    /// take.
+    Part,
 }
 
 /// The type of a schema, as Java V5's `SchemaType` names it.
@@ -67,25 +86,56 @@ pub enum SchemaType {
     Float,
     /// [`Schema::float64`].
     Double,
+    /// Java's JSON schema, which describes its records in Avro.
+    Json,
+    Avro,
+    /// Java's `Schema.protobuf`, which describes its messages in Avro.
+    Protobuf,
+    /// Java's Protobuf schema that holds the messages' descriptors.
+    ProtobufNative,
     /// [`Schema::key_value`].
     KeyValue,
+    /// [`Schema::auto_consume`], which only consumers declare.
+    AutoConsume,
+    /// A type Java V5 doesn't name, such as Java v4's date and time types.
+    None,
 }
+
+/// Each type, as the broker's protocol and Java name it. Bytes and none declare no schema; a schema of the protocol's
+/// `None` type reads as bytes, as in Java.
+const TYPES: [(SchemaType, Type, &str); 16] = [
+    (SchemaType::Bytes, Type::None, "BYTES"),
+    (SchemaType::String, Type::String, "STRING"),
+    (SchemaType::Boolean, Type::Bool, "BOOLEAN"),
+    (SchemaType::Int8, Type::Int8, "INT8"),
+    (SchemaType::Int16, Type::Int16, "INT16"),
+    (SchemaType::Int32, Type::Int32, "INT32"),
+    (SchemaType::Int64, Type::Int64, "INT64"),
+    (SchemaType::Float, Type::Float, "FLOAT"),
+    (SchemaType::Double, Type::Double, "DOUBLE"),
+    (SchemaType::Json, Type::Json, "JSON"),
+    (SchemaType::Avro, Type::Avro, "AVRO"),
+    (SchemaType::Protobuf, Type::Protobuf, "PROTOBUF"),
+    (SchemaType::ProtobufNative, Type::ProtobufNative, "PROTOBUF_NATIVE"),
+    (SchemaType::KeyValue, Type::KeyValue, "KEY_VALUE"),
+    (SchemaType::AutoConsume, Type::AutoConsume, "AUTO_CONSUME"),
+    (SchemaType::None, Type::None, "NONE"),
+];
 
 impl SchemaType {
     /// The name of Java's `SchemaType` constant, which a key/value schema records for its key's and value's.
     fn java_name(self) -> &'static str {
-        match self {
-            SchemaType::Bytes => "BYTES",
-            SchemaType::String => "STRING",
-            SchemaType::Boolean => "BOOLEAN",
-            SchemaType::Int8 => "INT8",
-            SchemaType::Int16 => "INT16",
-            SchemaType::Int32 => "INT32",
-            SchemaType::Int64 => "INT64",
-            SchemaType::Float => "FLOAT",
-            SchemaType::Double => "DOUBLE",
-            SchemaType::KeyValue => "KEY_VALUE",
-        }
+        TYPES.iter().find(|(schema_type, ..)| *schema_type == self).map_or("NONE", |(.., name)| name)
+    }
+
+    /// The type of Java's `SchemaType` constant `name`: [`SchemaType::None`] for one Java V5 doesn't have.
+    fn from_java_name(name: &str) -> Self {
+        TYPES.iter().find(|(.., java)| *java == name).map_or(SchemaType::None, |(schema_type, ..)| *schema_type)
+    }
+
+    /// The type of a schema the broker recorded: [`SchemaType::None`] for one Java V5 doesn't have.
+    fn from_proto(kind: Type) -> Self {
+        TYPES.iter().find(|(_, proto, _)| *proto == kind).map_or(SchemaType::None, |(schema_type, ..)| *schema_type)
     }
 }
 
@@ -138,18 +188,10 @@ impl SchemaInfo {
 
     /// What a producer or a consumer declares on registering: nothing for raw bytes, as Java declares nothing.
     pub(crate) fn to_proto(&self) -> Option<proto::Schema> {
-        let kind = match self.schema_type {
-            SchemaType::Bytes => return None,
-            SchemaType::String => Type::String,
-            SchemaType::Boolean => Type::Bool,
-            SchemaType::Int8 => Type::Int8,
-            SchemaType::Int16 => Type::Int16,
-            SchemaType::Int32 => Type::Int32,
-            SchemaType::Int64 => Type::Int64,
-            SchemaType::Float => Type::Float,
-            SchemaType::Double => Type::Double,
-            SchemaType::KeyValue => Type::KeyValue,
-        };
+        if self.schema_type == SchemaType::Bytes {
+            return None;
+        }
+        let kind = TYPES.iter().find(|(schema_type, ..)| *schema_type == self.schema_type).map(|(_, kind, _)| *kind);
         let properties = self.properties.iter().map(|(key, value)| proto::KeyValue {
             key: key.clone(),
             value: value.clone(),
@@ -158,16 +200,32 @@ impl SchemaInfo {
         Some(proto::Schema {
             name: self.name.clone(),
             schema_data: self.definition.clone(),
-            r#type: kind,
+            r#type: kind.unwrap_or_default(),
             properties: properties.collect(),
             ..Default::default()
         })
+    }
+
+    /// A schema as the broker records it, such as the one a message was written with. The broker names it after
+    /// the topic.
+    pub(crate) fn from_proto(schema: &proto::Schema) -> Self {
+        Self {
+            name: schema.name.clone(),
+            schema_type: SchemaType::from_proto(schema.r#type),
+            definition: schema.schema_data.clone(),
+            properties: schema.properties.iter().map(|p| (p.key.clone(), p.value.clone())).collect(),
+        }
     }
 }
 
 impl<T> Clone for Schema<T> {
     fn clone(&self) -> Self {
-        Self { info: self.info.clone(), encode: self.encode.clone(), decode: self.decode.clone() }
+        Self {
+            info: self.info.clone(),
+            encode: self.encode.clone(),
+            decode: self.decode.clone(),
+            generic: self.generic,
+        }
     }
 }
 
@@ -183,7 +241,8 @@ impl Schema<Vec<u8>> {
         Self {
             info: SchemaInfo::new("Bytes", SchemaType::Bytes),
             encode: Arc::new(|value: &Vec<u8>| Ok(Bytes::copy_from_slice(value))),
-            decode: Arc::new(|data: &[u8]| Ok(data.to_vec())),
+            decode: Arc::new(|data: &[u8], _: Option<&SchemaInfo>| Ok(data.to_vec())),
+            generic: Generic::No,
         }
     }
 }
@@ -194,19 +253,27 @@ impl Schema<String> {
         Self {
             info: SchemaInfo::new("String", SchemaType::String),
             encode: Arc::new(|value: &String| Ok(Bytes::copy_from_slice(value.as_bytes()))),
-            decode: Arc::new(|data: &[u8]| {
-                String::from_utf8(data.to_vec())
-                    .map_err(|e| Error::new(ErrorKind::Other, format!("the payload is not UTF-8: {e}")))
-            }),
+            decode: Arc::new(|data: &[u8], _: Option<&SchemaInfo>| utf8(data)),
+            generic: Generic::No,
         }
     }
+}
+
+/// A string payload: UTF-8 text.
+fn utf8(data: &[u8]) -> Result<String> {
+    String::from_utf8(data.to_vec()).map_err(|e| Error::new(ErrorKind::Other, format!("the payload is not UTF-8: {e}")))
 }
 
 impl Schema<bool> {
     /// A boolean, as one byte: Java's `Schema.bool()`. Any byte but 0 reads as `true`, as in Java.
     pub fn bool() -> Self {
-        Self::fixed("Boolean", SchemaType::Boolean, |value| [u8::from(*value)], |[byte]| byte != 0)
+        Self::fixed("Boolean", SchemaType::Boolean, |value| [u8::from(*value)], boolean)
     }
+}
+
+/// A boolean's byte: any but 0 is `true`, as in Java.
+fn boolean([byte]: [u8; 1]) -> bool {
+    byte != 0
 }
 
 impl Schema<i8> {
@@ -265,8 +332,13 @@ impl<K: 'static, V: 'static> Schema<KeyValue<K, V>> {
     /// a null key or value, which fails to decode here.
     ///
     /// The key is the payload's: a message's key, which routes it, is set apart (`MessageBuilder::key`).
+    ///
+    /// Neither producers nor consumers take a key or a value of [`Schema::auto_consume`], which reads key/value
+    /// messages whole: they fail with [`ErrorKind::InvalidConfiguration`].
     pub fn key_value(key: Schema<K>, value: Schema<V>) -> Self {
         let info = SchemaInfo::key_value(&key.info, &value.info);
+        let generic =
+            if (key.generic, value.generic) == (Generic::No, Generic::No) { Generic::No } else { Generic::Part };
         let (encode_key, encode_value) = (key.encode, value.encode);
         let (decode_key, decode_value) = (key.decode, value.decode);
         Self {
@@ -274,13 +346,14 @@ impl<K: 'static, V: 'static> Schema<KeyValue<K, V>> {
             encode: Arc::new(move |pair: &KeyValue<K, V>| {
                 Ok(inline(&encode_key(&pair.key)?, &encode_value(&pair.value)?))
             }),
-            decode: Arc::new(move |data: &[u8]| {
+            decode: Arc::new(move |data: &[u8], _: Option<&SchemaInfo>| {
                 let (key, value) = split_inline(data)?;
                 Ok(KeyValue {
-                    key: decode_key(not_null(key, "key")?)?,
-                    value: decode_value(not_null(value, "value")?)?,
+                    key: decode_key(not_null(key, "key")?, None)?,
+                    value: decode_value(not_null(value, "value")?, None)?,
                 })
             }),
+            generic,
         }
     }
 }
@@ -334,17 +407,21 @@ impl<T: 'static> Schema<T> {
         Self {
             info: SchemaInfo::new(name, schema_type),
             encode: Arc::new(move |value: &T| Ok(Bytes::copy_from_slice(&to(value)))),
-            decode: Arc::new(move |data: &[u8]| match <[u8; N]>::try_from(data) {
-                Ok(bytes) => Ok(from(bytes)),
-                Err(_) => Err(wrong_size(name, N, data.len())),
-            }),
+            decode: Arc::new(move |data: &[u8], _: Option<&SchemaInfo>| sized(name, data, from)),
+            generic: Generic::No,
         }
     }
 }
 
-/// A payload whose size doesn't fit its schema.
-fn wrong_size(name: &str, expected: usize, size: usize) -> Error {
-    Error::new(ErrorKind::Other, format!("a {name} value takes {expected} bytes, but the payload has {size}"))
+/// A value of `N` bytes, which a payload of another size can't hold.
+fn sized<const N: usize, T>(name: &str, data: &[u8], from: fn([u8; N]) -> T) -> Result<T> {
+    match <[u8; N]>::try_from(data) {
+        Ok(bytes) => Ok(from(bytes)),
+        Err(_) => Err(Error::new(
+            ErrorKind::Other,
+            format!("a {name} value takes {N} bytes, but the payload has {}", data.len()),
+        )),
+    }
 }
 
 impl<T> Schema<T> {
@@ -357,8 +434,45 @@ impl<T> Schema<T> {
         (self.encode)(value)
     }
 
+    /// Decodes a payload written with `writer`, which only [`Schema::auto_consume`] reads: `None` for a message
+    /// without a schema.
+    pub(crate) fn decode_with(&self, data: &[u8], writer: Option<&SchemaInfo>) -> Result<T> {
+        (self.decode)(data, writer)
+    }
+
+    #[cfg(test)]
     pub(crate) fn decode(&self, data: &[u8]) -> Result<T> {
-        (self.decode)(data)
+        self.decode_with(data, None)
+    }
+
+    /// Fails for a schema a producer can't encode with: [`Schema::auto_consume`], which Java v4's producers refuse too,
+    /// and a key/value schema with a part of it.
+    pub(crate) fn check_producer(&self) -> Result<()> {
+        self.generic.check_producer()
+    }
+
+    /// Fails for a key/value schema with a part of [`Schema::auto_consume`], which reads key/value messages whole.
+    pub(crate) fn check_consumer(&self) -> Result<()> {
+        self.generic.check_consumer()
+    }
+}
+
+impl Generic {
+    fn check_producer(self) -> Result<()> {
+        match self {
+            Generic::No => Ok(()),
+            _ => Err(Error::new(ErrorKind::InvalidConfiguration, "auto_consume() is a schema for consumers only")),
+        }
+    }
+
+    fn check_consumer(self) -> Result<()> {
+        match self {
+            Generic::Part => Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                "a key/value schema can't hold auto_consume(), which reads key/value messages whole",
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
