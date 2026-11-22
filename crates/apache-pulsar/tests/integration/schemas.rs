@@ -21,7 +21,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::time::Duration;
 
-use apache_pulsar::{ErrorKind, ProducerAccessMode, Schema, SubscriptionInitialPosition, local};
+use apache_pulsar::{ErrorKind, KeyValue, ProducerAccessMode, Schema, SubscriptionInitialPosition, local};
 
 use crate::env::{self, Env};
 use crate::{run, token_client, unique};
@@ -34,6 +34,7 @@ pub const TESTS: &[(&str, fn(&Env))] = &[
         a_topic_with_data_and_no_schema_refuses_a_typed_consumer,
     ),
     ("primitive_values_cross_between_java_and_rust", primitive_values_cross_between_java_and_rust),
+    ("key_values_cross_between_java_and_rust", key_values_cross_between_java_and_rust),
 ];
 
 fn new_topic(name: &str) -> String {
@@ -130,24 +131,41 @@ fn a_topic_with_data_and_no_schema_refuses_a_typed_consumer(env: &Env) {
 /// Values of string and of each primitive schema, from a Rust producer to a Java consumer, and from a Java producer to
 /// a Rust consumer. The Java tool takes and prints the values as Java writes them.
 fn primitive_values_cross_between_java_and_rust(env: &Env) {
-    both_ways(env, "string", Schema::string(), &["hello", "with spaces"]);
-    both_ways(env, "bool", Schema::bool(), &["true", "false"]);
-    both_ways(env, "int8", Schema::int8(), &["-128", "0", "127"]);
-    both_ways(env, "int16", Schema::int16(), &["-32768", "12345", "32767"]);
-    both_ways(env, "int32", Schema::int32(), &["-2147483648", "123456789", "2147483647"]);
-    both_ways(env, "int64", Schema::int64(), &["-9223372036854775808", "1234567890123", "9223372036854775807"]);
-    both_ways(env, "float32", Schema::float32(), &["-1.5", "1.1", "3.4028235E38"]);
-    both_ways(env, "float64", Schema::float64(), &["-2.5", "1.1", "1.7976931348623157E308"]);
+    both_ways(env, "string", Schema::string(), &["hello", "with spaces"], parsed);
+    both_ways(env, "bool", Schema::bool(), &["true", "false"], parsed);
+    both_ways(env, "int8", Schema::int8(), &["-128", "0", "127"], parsed);
+    both_ways(env, "int16", Schema::int16(), &["-32768", "12345", "32767"], parsed);
+    both_ways(env, "int32", Schema::int32(), &["-2147483648", "123456789", "2147483647"], parsed);
+    let longs = ["-9223372036854775808", "1234567890123", "9223372036854775807"];
+    both_ways(env, "int64", Schema::int64(), &longs, parsed);
+    both_ways(env, "float32", Schema::float32(), &["-1.5", "1.1", "3.4028235E38"], parsed);
+    both_ways(env, "float64", Schema::float64(), &["-2.5", "1.1", "1.7976931348623157E308"], parsed);
+}
+
+/// Key/value pairs of a string and an int32, inline in the payload. Java V5's factory has no key/value schema, so the
+/// Java tool takes v4's, through `V5Interop`.
+fn key_values_cross_between_java_and_rust(env: &Env) {
+    let schema = Schema::key_value(Schema::string(), Schema::int32());
+    let pair = |text: &str| {
+        let (key, value) = text.split_once('=').unwrap();
+        KeyValue { key: key.to_string(), value: value.parse().unwrap() }
+    };
+    both_ways(env, "kv", schema, &["a=1", "b=-2", "=0"], pair);
+}
+
+/// A value as Java prints it, parsed.
+fn parsed<T: FromStr<Err: Debug>>(text: &str) -> T {
+    text.parse().unwrap()
 }
 
 /// Sends `values` with `schema` from Rust and reads them with the Java schema named `name`, then the other way, each
 /// on a topic of its own. Messages without a key spread over the segments, so the values may come in another order.
-fn both_ways<T>(env: &Env, name: &str, schema: Schema<T>, values: &[&str])
+/// `parse` reads a value as the Java tool takes and prints it.
+fn both_ways<T>(env: &Env, name: &str, schema: Schema<T>, values: &[&str], parse: impl Fn(&str) -> T)
 where
-    T: Clone + Debug + FromStr + PartialEq + 'static,
-    T::Err: Debug,
+    T: Clone + Debug + PartialEq + 'static,
 {
-    let expected: Vec<T> = values.iter().map(|value| value.parse().unwrap()).collect();
+    let expected: Vec<T> = values.iter().map(|value| parse(value)).collect();
     let same = |got: &[T]| got.len() == expected.len() && expected.iter().all(|value| got.contains(value));
 
     let topic = new_topic(&format!("rust-{name}"));
@@ -159,8 +177,7 @@ where
         }
         client.close().await.unwrap();
     });
-    let read: Vec<T> =
-        env.java_consume(name, &topic, values.len()).iter().map(|value| value.parse().unwrap()).collect();
+    let read: Vec<T> = env.java_consume(name, &topic, values.len()).iter().map(|value| parse(value)).collect();
     assert!(same(&read), "{name}: Java read {read:?} of {expected:?}");
 
     let topic = new_topic(&format!("java-{name}"));

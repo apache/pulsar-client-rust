@@ -254,7 +254,10 @@ declare no schema, as in Java, and read any topic.
 Built-in schemas come in this order:
 
 1. bytes, string, and the primitive types: `bool`, `int8`, `int16`, `int32`, `int64`, `float32` and `float64`;
-2. key/value, which Java V5's factory lacks;
+2. key/value: `Schema::key_value(key, value)`, with Java's inline encoding, the key and the value in the payload.
+   Java V5's factory has none ([J21](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)), but its v4
+   schema reads and writes the same messages. Java's other encoding, which puts the key in the message's key, comes
+   later;
 3. generic records (`AUTO_CONSUME`), which decode each message with the schema of its version. C11 requires them,
    so they are part of conformance;
 4. JSON through `serde`, and Avro through `apache-avro`, each behind a feature;

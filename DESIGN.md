@@ -117,6 +117,7 @@ two in the broker, J14 and J16, lose data and go first.
 | J18 | In the broker, the `ScalableTopicController` of a regular topic fails to start until the topic migrates, so a Stream consumer can't register on a topic that isn't migrated (gap 28). | Serve a regular topic's Stream consumers over its synthetic layout, assigning them its legacy segments, and keep their group when the topic migrates. | To propose |
 | J19 | In the broker, a migration commits the migrated layout at epoch 0, the epoch of the synthetic layout that the clients of the regular topic watched until then (gap 29). | Commit it at epoch 1, so that the epoch rule orders it after the synthetic layout. | To propose |
 | J20 | A batch takes its first message's replication clusters (`Commands.initBatchMessageMetadata`), and `ProducerImpl.canAddToBatch` doesn't check them: every message of a batch is replicated to the first one's clusters, though *client-api* §3.2 sets them per message. | Send a message with replication clusters in an entry of its own, as one with a delivery time already is, as this client does. | To propose |
+| J21 | Java V5's `Schema` has no key/value factory, though *data-model* §6 lists key/value in the standard schema set. A Java V5 application reaches one only through `V5Interop.toV5Schema` over v4's `Schema.KeyValue`. | Add `Schema.keyValue(key, value)` to the V5 API, with v4's encodings, as this client has `Schema::key_value`. | To propose |
 
 ## Reference material
 

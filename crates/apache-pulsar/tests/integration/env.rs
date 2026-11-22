@@ -39,8 +39,13 @@ use testcontainers::{Container, GenericImage, ImageExt};
 const IMAGE: (&str, &str) = ("apachepulsar/pulsar", "5.0.1");
 /// A JDK, to compile the Java test tools: the broker image has a Java runtime only.
 const JDK_IMAGE: (&str, &str) = ("eclipse-temurin", "21-jdk-alpine");
-/// What the Java test tools compile against: the broker's V5 API.
-const V5_API_JAR: &str = "/pulsar/lib/org.apache.pulsar-pulsar-client-api-v5-5.0.1.jar";
+/// What the Java test tools compile against: the broker's V5 API, and, for v4's schemas through `V5Interop`, its V5
+/// client and the v4 API.
+const JAVA_TOOLS_CLASSPATH: [&str; 3] = [
+    "org.apache.pulsar-pulsar-client-api-v5-5.0.1.jar",
+    "org.apache.pulsar-pulsar-client-v5-5.0.1.jar",
+    "org.apache.pulsar-pulsar-client-api-5.0.1.jar",
+];
 /// The Java test tools, by file name.
 const JAVA_TOOLS: [(&str, &[u8]); 2] = [
     ("CheckpointTool.java", include_bytes!("CheckpointTool.java")),
@@ -286,19 +291,19 @@ impl Env {
         self.exec(&[&["java", "-cp", "/pulsar/lib/*:/tmp/tools.jar"], args].concat())
     }
 
-    /// Compiles the Java test tools against the broker's V5 API in a JDK container, and copies them into the broker
-    /// container, as `/tmp/tools.jar`.
+    /// Compiles the Java test tools against the broker's client jars in a JDK container, and copies them into the
+    /// broker container, as `/tmp/tools.jar`.
     fn install_java_tools(&self) {
-        let api = self.broker.copy_file_from(V5_API_JAR, Vec::new()).unwrap();
-        let mut jdk = GenericImage::new(JDK_IMAGE.0, JDK_IMAGE.1).with_copy_to("/work/api.jar", api);
+        let mut jdk = GenericImage::new(JDK_IMAGE.0, JDK_IMAGE.1).with_cmd(["sleep", "600"]);
+        for jar in JAVA_TOOLS_CLASSPATH {
+            let bytes = self.broker.copy_file_from(format!("/pulsar/lib/{jar}"), Vec::new()).unwrap();
+            jdk = jdk.with_copy_to(format!("/work/lib/{jar}"), bytes);
+        }
         for (name, source) in JAVA_TOOLS {
             jdk = jdk.with_copy_to(format!("/work/src/{name}"), source.to_vec());
         }
-        let jdk = jdk
-            .with_cmd(["sleep", "600"])
-            .start()
-            .unwrap_or_else(|error| panic!("starting {JDK_IMAGE:?} failed: {error}"));
-        let build = "javac --release 21 -cp /work/api.jar -d /work/classes /work/src/*.java \
+        let jdk = jdk.start().unwrap_or_else(|error| panic!("starting {JDK_IMAGE:?} failed: {error}"));
+        let build = "javac --release 21 -cp '/work/lib/*' -d /work/classes /work/src/*.java \
                      && jar cf /work/tools.jar -C /work/classes .";
         let mut result =
             jdk.exec(ExecCommand::new(["sh", "-c", build]).with_cmd_ready_condition(CmdWaitFor::exit())).unwrap();
