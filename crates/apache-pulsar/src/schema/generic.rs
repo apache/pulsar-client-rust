@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "avro")]
 use apache_avro::reader::datum::GenericDatumReader;
+#[cfg(feature = "protobuf")]
+use buffa_descriptor::ReflectMessage as _;
 
 #[cfg(feature = "avro")]
 use super::avro::undecodable;
@@ -57,9 +59,10 @@ impl GenericRecord {
         &self.fields
     }
 
-    /// A field of a JSON or an Avro record, as Java V5's `field(name)`: its value, as Java's record holds it, an Avro
-    /// union's branch without the union, or `None` for a field it doesn't have, and for a value that isn't a record.
-    #[cfg_attr(not(any(feature = "json", feature = "avro")), expect(unused_variables))]
+    /// A field of a JSON, an Avro or a Protobuf record, as Java V5's `field(name)`: its value, as Java's record holds
+    /// it, an Avro union's branch without the union and a Protobuf field the message doesn't have its default; or
+    /// `None` for a field the record doesn't have, and for a value that isn't a record.
+    #[cfg_attr(not(any(feature = "json", feature = "avro", feature = "protobuf")), expect(unused_variables))]
     pub fn field(&self, name: &str) -> Option<GenericValue> {
         match &self.value {
             #[cfg(feature = "json")]
@@ -67,6 +70,11 @@ impl GenericRecord {
             #[cfg(feature = "avro")]
             GenericValue::Avro(apache_avro::types::Value::Record(fields)) => {
                 fields.iter().find(|(field, _)| field == name).map(|(_, value)| GenericValue::Avro(branch(value)))
+            }
+            #[cfg(feature = "protobuf")]
+            GenericValue::Protobuf(buffa_descriptor::Value::Message(message)) => {
+                let field = message.message_descriptor().field_by_name(name)?;
+                Some(GenericValue::Protobuf(message.get(field).to_owned()))
             }
             _ => None,
         }
@@ -107,6 +115,10 @@ pub enum GenericValue {
     /// in that schema's order.
     #[cfg(feature = "avro")]
     Avro(apache_avro::types::Value),
+    /// A value of a Protobuf schema, as buffa reads it with the descriptors it was written with: a message for a
+    /// record.
+    #[cfg(feature = "protobuf")]
+    Protobuf(buffa_descriptor::Value),
 }
 
 impl Schema<GenericRecord> {
@@ -116,9 +128,9 @@ impl Schema<GenericRecord> {
     /// message's [`value`](crate::Message::value), and the next message of that version fetches again.
     ///
     /// The broker doesn't check this schema against the topic's, so it reads any topic, and registers none. It
-    /// decodes the primitive types, key/value, and with their features JSON and Avro; Protobuf values fail to decode,
-    /// as this client doesn't read them yet. Producers don't take it: they fail to create with
-    /// [`ErrorKind::InvalidConfiguration`], as Java v4's do.
+    /// decodes the primitive types, key/value, and with their features JSON, Avro and Protobuf's `PROTOBUF_NATIVE`;
+    /// values of Java V5's `PROTOBUF` fail to decode, as this client doesn't read them yet. Producers don't take it:
+    /// they fail to create with [`ErrorKind::InvalidConfiguration`], as Java v4's do.
     pub fn auto_consume() -> Self {
         let definitions = Definitions::default();
         Self {
@@ -157,6 +169,7 @@ fn decode_value(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> 
         SchemaType::KeyValue => key_value(definitions, data, writer)?,
         SchemaType::Json => json(data)?,
         SchemaType::Avro => avro(definitions, data, writer)?,
+        SchemaType::ProtobufNative => protobuf_native(definitions, data, writer)?,
         _ => {
             return Err(Error::new(
                 ErrorKind::Other,
@@ -166,20 +179,28 @@ fn decode_value(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> 
     })
 }
 
-/// The names of a record's fields, in the order of the schema it was written with: an Avro record's own, and a JSON
-/// one's from the Avro schema that describes it, or its own if that doesn't describe a record.
+/// The names of a record's fields, in the order of the schema it was written with: an Avro record's and a Protobuf
+/// message's own, and a JSON one's from the Avro schema that describes it, or its own if that doesn't describe a
+/// record.
 #[cfg_attr(not(feature = "json"), expect(unused_variables))]
 fn fields(definitions: &Definitions, value: &GenericValue, writer: &SchemaInfo) -> Vec<String> {
     match value {
         #[cfg(feature = "json")]
-        GenericValue::Json(serde_json::Value::Object(fields)) => match definitions.parse(&writer.definition).as_deref()
-        {
-            Ok(apache_avro::Schema::Record(record)) => record.fields.iter().map(|field| field.name.clone()).collect(),
-            _ => fields.keys().cloned().collect(),
-        },
+        GenericValue::Json(serde_json::Value::Object(fields)) => {
+            match definitions.avro.parse(&writer.definition).as_deref() {
+                Ok(apache_avro::Schema::Record(record)) => {
+                    record.fields.iter().map(|field| field.name.clone()).collect()
+                }
+                _ => fields.keys().cloned().collect(),
+            }
+        }
         #[cfg(feature = "avro")]
         GenericValue::Avro(apache_avro::types::Value::Record(fields)) => {
             fields.iter().map(|(name, _)| name.clone()).collect()
+        }
+        #[cfg(feature = "protobuf")]
+        GenericValue::Protobuf(buffa_descriptor::Value::Message(message)) => {
+            message.message_descriptor().fields().iter().map(|field| field.name().to_string()).collect()
         }
         _ => Vec::new(),
     }
@@ -199,7 +220,7 @@ fn json(_: &[u8]) -> Result<GenericValue> {
 /// An Avro payload, read with the schema it was written with.
 #[cfg(feature = "avro")]
 fn avro(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
-    let schema = definitions.parse(&writer.definition)?;
+    let schema = definitions.avro.parse(&writer.definition)?;
     let value = GenericDatumReader::builder(&schema).build().and_then(|reader| reader.read_value(&mut &data[..]));
     value.map(GenericValue::Avro).map_err(undecodable)
 }
@@ -207,6 +228,18 @@ fn avro(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> Result<G
 #[cfg(not(feature = "avro"))]
 fn avro(_: &Definitions, _: &[u8], _: &SchemaInfo) -> Result<GenericValue> {
     Err(Error::new(ErrorKind::Other, "reading Avro records takes the `avro` feature"))
+}
+
+/// A `PROTOBUF_NATIVE` payload, read with the descriptors it was written with.
+#[cfg(feature = "protobuf")]
+fn protobuf_native(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
+    let message = definitions.protobuf.read(&writer.definition, data)?;
+    Ok(GenericValue::Protobuf(buffa_descriptor::Value::Message(message)))
+}
+
+#[cfg(not(feature = "protobuf"))]
+fn protobuf_native(_: &Definitions, _: &[u8], _: &SchemaInfo) -> Result<GenericValue> {
+    Err(Error::new(ErrorKind::Other, "reading Protobuf records takes the `protobuf` feature"))
 }
 
 /// A key/value payload, as Java's `KeyValueSchemaInfo` reads its schema: the key's and the value's schemas from its
@@ -300,11 +333,10 @@ mod tests {
         #[cfg(not(feature = "avro"))]
         assert!(refused(&[], &writer(SchemaType::Avro, &[], &[])).contains("takes the `avro` feature"));
         // The types this client doesn't decode yet fail, naming themselves.
-        for (schema_type, name) in [(SchemaType::Protobuf, "PROTOBUF"), (SchemaType::ProtobufNative, "PROTOBUF_NATIVE")]
-        {
-            let error = refused(b"{}", &writer(schema_type, &[], &[]));
-            assert!(error.contains(&format!("generic records of {name} schemas")), "{error}");
-        }
+        let error = refused(b"{}", &writer(SchemaType::Protobuf, &[], &[]));
+        assert!(error.contains("generic records of PROTOBUF schemas"), "{error}");
+        #[cfg(not(feature = "protobuf"))]
+        assert!(refused(&[], &writer(SchemaType::ProtobufNative, &[], &[])).contains("takes the `protobuf` feature"));
     }
 
     #[test]
@@ -390,6 +422,59 @@ mod tests {
     struct Pojo {
         name: Option<String>,
         age: i32,
+    }
+
+    /// A Protobuf message, read with the descriptors of the schema it was written with: its fields in its
+    /// descriptor's order, and a field the message doesn't have read as its default, as in Java.
+    #[cfg(feature = "protobuf")]
+    #[test]
+    fn generic_protobuf_records() {
+        use buffa_descriptor::Value;
+        use buffa_types::google::protobuf::Timestamp;
+
+        let schema = Schema::<Timestamp>::protobuf_native();
+        let read = generic(&schema, &Timestamp { seconds: 5, ..Default::default() });
+        assert_eq!(read.schema_type(), SchemaType::ProtobufNative);
+        assert!(matches!(read.value(), GenericValue::Protobuf(Value::Message(_))));
+        assert_eq!(read.fields(), ["seconds", "nanos"]);
+        assert_eq!(read.field("seconds"), Some(GenericValue::Protobuf(Value::I64(5))));
+        assert_eq!(read.field("nanos"), Some(GenericValue::Protobuf(Value::I32(0))));
+        assert_eq!(read.field("city"), None);
+        let error = Schema::auto_consume().decode_with(&[0xff], Some(schema.info())).unwrap_err().to_string();
+        assert!(error.contains("the payload doesn't decode in Protobuf"), "{error}");
+    }
+
+    /// The fields of a richer message: a repeated one, an enum, a message the record doesn't have, and a map.
+    #[cfg(feature = "protobuf")]
+    #[test]
+    fn generic_protobuf_records_of_each_kind_of_field() {
+        use buffa_descriptor::Value;
+        use buffa_types::google::protobuf::{Struct, Syntax, Type, value};
+
+        let kind = Type { oneofs: vec!["o".to_string()], syntax: Syntax::SYNTAX_PROTO3.into(), ..Default::default() };
+        let read = generic(&Schema::<Type>::protobuf_native(), &kind);
+        assert_eq!(read.fields(), ["name", "fields", "oneofs", "options", "source_context", "syntax", "edition"]);
+        let field = |name: &str| read.field(name);
+        assert_eq!(field("oneofs"), Some(GenericValue::Protobuf(Value::List(vec![Value::String("o".to_string())]))));
+        assert_eq!(field("fields"), Some(GenericValue::Protobuf(Value::List(Vec::new()))));
+        assert_eq!(field("syntax"), Some(GenericValue::Protobuf(Value::EnumNumber(1))));
+        let unset = field("source_context");
+        assert!(
+            matches!(unset, Some(GenericValue::Protobuf(Value::Message(_)))),
+            "a message the record doesn't have: {unset:?}"
+        );
+
+        let entry = buffa_types::google::protobuf::Value {
+            kind: Some(value::Kind::StringValue("v".to_string())),
+            ..Default::default()
+        };
+        let structure = Struct { fields: [("k".to_string(), entry)].into_iter().collect(), ..Default::default() };
+        let read = generic(&Schema::<Struct>::protobuf_native(), &structure);
+        assert!(
+            matches!(read.field("fields"), Some(GenericValue::Protobuf(Value::Map(_)))),
+            "{:?}",
+            read.field("fields")
+        );
     }
 
     #[test]

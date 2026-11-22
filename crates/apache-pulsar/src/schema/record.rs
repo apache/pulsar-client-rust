@@ -45,9 +45,9 @@ pub(super) fn avro_error(what: &str, error: apache_avro::Error) -> Error {
 
 /// The Avro schemas of the definitions messages were written with, each parsed once.
 #[derive(Default)]
-pub(super) struct Definitions(Mutex<HashMap<Vec<u8>, Arc<apache_avro::Schema>>>);
+pub(super) struct Parsed(Mutex<HashMap<Vec<u8>, Arc<apache_avro::Schema>>>);
 
-impl Definitions {
+impl Parsed {
     /// The schema `definition` describes. A definition that doesn't parse fails each time.
     pub(super) fn parse(&self, definition: &[u8]) -> Result<Arc<apache_avro::Schema>> {
         let mut parsed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn javas_nested_classes_parse() {
-        let definitions = Definitions::default();
+        let definitions = Parsed::default();
         let schema = definitions.parse(JAVA.as_bytes()).unwrap();
         let json = serde_json::to_value(&*schema).unwrap();
         assert_eq!(json["namespace"], "com.acme.Shop_");
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn definitions_that_dont_parse() {
-        let definitions = Definitions::default();
+        let definitions = Parsed::default();
         let error = definitions.parse(b"{").unwrap_err().to_string();
         assert!(error.contains("isn't JSON"), "{error}");
         let error = definitions.parse(br#"{"type":"record"}"#).unwrap_err().to_string();

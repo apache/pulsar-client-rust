@@ -27,7 +27,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::record::{Definitions, avro_error, info};
+use super::record::{Parsed, avro_error, info};
 use super::{Generic, Schema, SchemaInfo, SchemaType};
 use crate::error::{Error, Result};
 
@@ -57,13 +57,13 @@ struct Avro {
     schema: apache_avro::Schema,
     /// The definition the broker is told about, which a message written with this schema has.
     definition: Vec<u8>,
-    writers: Definitions,
+    writers: Parsed,
 }
 
 impl Avro {
     fn new(schema: apache_avro::Schema) -> Self {
         let definition = info(SchemaType::Avro, &schema).definition;
-        Self { schema, definition, writers: Definitions::default() }
+        Self { schema, definition, writers: Parsed::default() }
     }
 
     fn encode<T: Serialize>(&self, value: &T) -> Result<Bytes> {

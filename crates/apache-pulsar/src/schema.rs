@@ -25,6 +25,8 @@ mod avro;
 mod generic;
 #[cfg(feature = "json")]
 mod json;
+#[cfg(feature = "protobuf")]
+mod protobuf;
 #[cfg(any(feature = "json", feature = "avro"))]
 mod record;
 
@@ -36,14 +38,17 @@ use apache_pulsar_protocol::proto::schema::Type;
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub use self::generic::{GenericRecord, GenericValue};
-#[cfg(any(feature = "json", feature = "avro"))]
-use self::record::Definitions;
 use crate::error::{Error, ErrorKind, Result};
 
-/// Without JSON and Avro, no definitions to parse.
-#[cfg(not(any(feature = "json", feature = "avro")))]
+/// The definitions of the schemas messages were written with, each read once: Avro's, for JSON and Avro, and
+/// Protobuf's descriptors.
 #[derive(Default)]
-struct Definitions {}
+struct Definitions {
+    #[cfg(any(feature = "json", feature = "avro"))]
+    avro: record::Parsed,
+    #[cfg(feature = "protobuf")]
+    protobuf: protobuf::Parsed,
+}
 
 type Encode<T> = Arc<dyn Fn(&T) -> Result<Bytes> + Send + Sync>;
 /// Decodes a payload, written with the schema given: `None` for a message without one. Only the schemas that fetch the
@@ -64,6 +69,8 @@ type Decode<T> = Arc<dyn Fn(&[u8], Option<&SchemaInfo>) -> Result<T> + Send + Sy
 /// | `key_value(key, value)` | [`KeyValue<K, V>`] | the key's length, 4 bytes big endian, and bytes, then the value's |
 /// | `json()` (feature `json`) | a record type of `serde` and apache-avro | JSON, described in Avro |
 /// | `avro()` (feature `avro`) | a record type of `serde` and apache-avro | an Avro datum |
+/// | `protobuf_native()` (feature `protobuf`) | a buffa message type | Protobuf, described by its descriptors |
+/// | `prost_native(descriptors)` (feature `prost`) | a prost message type | Protobuf, described by its descriptors |
 /// | `auto_consume()` | [`GenericRecord`] | decoded with the schema each message was written with |
 pub struct Schema<T> {
     info: SchemaInfo,
