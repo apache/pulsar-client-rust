@@ -145,11 +145,11 @@ reaches, 1 KiB messages of uppercase letters, batches of up to 1 ms, one segment
 
 What it shows:
 
-- **The producer is bound by its own CPU.** In a separate 1 KiB run, sampled with `docker stats`, this client used
-  150–180% of a core, its loop's thread and the one making the load, for about 500k msg/s, and 100% on the local
-  client, both on one thread, for about 400k. Java's used under one core for about 990k, and the broker had room every
-  time. The state machine takes under 0.3 µs of a message, the micro-benchmarks say, out of about 3 µs of CPU in all:
-  the next round looks for where the rest goes.
+- **The client side is bound by its CPU, the producer and `perf` driving it.** In a separate 1 KiB run, sampled with
+  `docker stats`, this client used 150–180% of a core, its loop's thread and the one making the load, for about 500k
+  msg/s, and 100% on the local client, both on one thread, for about 400k. Java's used under one core for about 990k,
+  and the broker had room every time. The state machine takes under 0.3 µs of a message, the micro-benchmarks say,
+  out of about 3 µs of CPU in all, `perf`'s share included: the next round looks for where the rest goes.
 - **Large messages are bound by the broker:** at 10 KiB both clients store about 1 GB/s.
 - **At a fixed rate, the latencies match**, this client's a little lower.
 - **The thread-safe consumer's receives and acks each cross to its loop's thread**, so a loop receiving and
