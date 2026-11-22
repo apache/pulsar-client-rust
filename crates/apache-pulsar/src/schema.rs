@@ -20,11 +20,12 @@
 //! The schema is topic-level (*data-model* §6): the broker keeps one history of schemas for a scalable topic, which
 //! every segment shares, and checks a producer's or a consumer's schema against it as it registers on a segment.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use apache_pulsar_protocol::proto;
 use apache_pulsar_protocol::proto::schema::Type;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, ErrorKind, Result};
 
@@ -42,6 +43,7 @@ type Decode<T> = Arc<dyn Fn(&[u8]) -> Result<T> + Send + Sync>;
 /// | `bool()` | `bool` | one byte, 1 or 0 |
 /// | `int8()` to `int64()` | `i8` to `i64` | big endian |
 /// | `float32()`, `float64()` | `f32`, `f64` | IEEE 754, big endian |
+/// | `key_value(key, value)` | [`KeyValue<K, V>`] | the key's length, 4 bytes big endian, and bytes, then the value's |
 pub struct Schema<T> {
     info: SchemaInfo,
     encode: Encode<T>,
@@ -65,6 +67,26 @@ pub enum SchemaType {
     Float,
     /// [`Schema::float64`].
     Double,
+    /// [`Schema::key_value`].
+    KeyValue,
+}
+
+impl SchemaType {
+    /// The name of Java's `SchemaType` constant, which a key/value schema records for its key's and value's.
+    fn java_name(self) -> &'static str {
+        match self {
+            SchemaType::Bytes => "BYTES",
+            SchemaType::String => "STRING",
+            SchemaType::Boolean => "BOOLEAN",
+            SchemaType::Int8 => "INT8",
+            SchemaType::Int16 => "INT16",
+            SchemaType::Int32 => "INT32",
+            SchemaType::Int64 => "INT64",
+            SchemaType::Float => "FLOAT",
+            SchemaType::Double => "DOUBLE",
+            SchemaType::KeyValue => "KEY_VALUE",
+        }
+    }
 }
 
 /// A schema as the broker records it: Java V5's `SchemaInfo`.
@@ -73,11 +95,26 @@ pub struct SchemaInfo {
     name: String,
     schema_type: SchemaType,
     definition: Vec<u8>,
+    properties: BTreeMap<String, String>,
 }
 
 impl SchemaInfo {
     fn new(name: &str, schema_type: SchemaType) -> Self {
-        Self { name: name.to_string(), schema_type, definition: Vec::new() }
+        Self { name: name.to_string(), schema_type, definition: Vec::new(), properties: BTreeMap::new() }
+    }
+
+    /// Java's key/value schema: the key's and the value's definitions in its definition, as an inline key/value
+    /// payload holds a key and a value, and their names, types and properties in its properties, with the encoding.
+    fn key_value(key: &SchemaInfo, value: &SchemaInfo) -> Self {
+        let mut properties = BTreeMap::from([("kv.encoding.type".to_string(), "INLINE".to_string())]);
+        for (side, info) in [("key", key), ("value", value)] {
+            let nested = serde_json::to_string(&info.properties).expect("strings are JSON");
+            properties.insert(format!("{side}.schema.name"), info.name.clone());
+            properties.insert(format!("{side}.schema.type"), info.schema_type.java_name().to_string());
+            properties.insert(format!("{side}.schema.properties"), nested);
+        }
+        let definition = inline(&key.definition, &value.definition).to_vec();
+        Self { name: "KeyValue".to_string(), schema_type: SchemaType::KeyValue, definition, properties }
     }
 
     /// The name, as Java names its schema of the same type.
@@ -94,6 +131,11 @@ impl SchemaInfo {
         &self.definition
     }
 
+    /// What else the schema records, such as a key/value schema's encoding. Empty for the primitive types.
+    pub fn properties(&self) -> &BTreeMap<String, String> {
+        &self.properties
+    }
+
     /// What a producer or a consumer declares on registering: nothing for raw bytes, as Java declares nothing.
     pub(crate) fn to_proto(&self) -> Option<proto::Schema> {
         let kind = match self.schema_type {
@@ -106,11 +148,18 @@ impl SchemaInfo {
             SchemaType::Int64 => Type::Int64,
             SchemaType::Float => Type::Float,
             SchemaType::Double => Type::Double,
+            SchemaType::KeyValue => Type::KeyValue,
         };
+        let properties = self.properties.iter().map(|(key, value)| proto::KeyValue {
+            key: key.clone(),
+            value: value.clone(),
+            ..Default::default()
+        });
         Some(proto::Schema {
             name: self.name.clone(),
             schema_data: self.definition.clone(),
             r#type: kind,
+            properties: properties.collect(),
             ..Default::default()
         })
     }
@@ -200,6 +249,78 @@ impl Schema<f64> {
     pub fn float64() -> Self {
         Self::fixed("Double", SchemaType::Double, |value| value.to_be_bytes(), f64::from_be_bytes)
     }
+}
+
+/// A key and a value: the values of [`Schema::key_value`], as Java's `KeyValue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct KeyValue<K, V> {
+    pub key: K,
+    pub value: V,
+}
+
+impl<K: 'static, V: 'static> Schema<KeyValue<K, V>> {
+    /// A key and a value in one payload, each encoded with its own schema, as Java's `Schema.KeyValue(key, value)`
+    /// encodes them by default (`INLINE`): the key's length, 4 bytes big endian, and its bytes, then the value's. Java
+    /// V5's factory has no key/value schema, but Java's other one reads and writes the same messages. Java can write
+    /// a null key or value, which fails to decode here.
+    ///
+    /// The key is the payload's: a message's key, which routes it, is set apart (`MessageBuilder::key`).
+    pub fn key_value(key: Schema<K>, value: Schema<V>) -> Self {
+        let info = SchemaInfo::key_value(&key.info, &value.info);
+        let (encode_key, encode_value) = (key.encode, value.encode);
+        let (decode_key, decode_value) = (key.decode, value.decode);
+        Self {
+            info,
+            encode: Arc::new(move |pair: &KeyValue<K, V>| {
+                Ok(inline(&encode_key(&pair.key)?, &encode_value(&pair.value)?))
+            }),
+            decode: Arc::new(move |data: &[u8]| {
+                let (key, value) = split_inline(data)?;
+                Ok(KeyValue {
+                    key: decode_key(not_null(key, "key")?)?,
+                    value: decode_value(not_null(value, "value")?)?,
+                })
+            }),
+        }
+    }
+}
+
+/// An inline key/value payload, as Java writes it: the key's length, 4 bytes big endian, and its bytes, then the
+/// value's.
+fn inline(key: &[u8], value: &[u8]) -> Bytes {
+    let mut payload = BytesMut::with_capacity(8 + key.len() + value.len());
+    for part in [key, value] {
+        payload.put_i32(part.len() as i32);
+        payload.put_slice(part);
+    }
+    payload.freeze()
+}
+
+/// The key and the value of a key/value payload, each `None` if null.
+type Parts<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// The key and the value of an inline key/value payload, each `None` if null, as Java writes a null one: length -1,
+/// and no bytes. As in Java, bytes after the value are left.
+fn split_inline(data: &[u8]) -> Result<Parts<'_>> {
+    let (key, rest) = inline_part(data, "key")?;
+    let (value, _) = inline_part(rest, "value")?;
+    Ok((key, value))
+}
+
+/// One part of an inline key/value payload, and what follows it.
+fn inline_part<'a>(data: &'a [u8], part: &str) -> Result<(Option<&'a [u8]>, &'a [u8])> {
+    let truncated = || Error::new(ErrorKind::Other, format!("the key/value payload ends in its {part}"));
+    let Some((length, rest)) = data.split_first_chunk::<4>() else { return Err(truncated()) };
+    let Ok(length) = usize::try_from(i32::from_be_bytes(*length)) else { return Ok((None, rest)) };
+    match rest.split_at_checked(length) {
+        Some((bytes, rest)) => Ok((Some(bytes), rest)),
+        None => Err(truncated()),
+    }
+}
+
+/// A part of a key/value payload that a typed schema can decode: not a null one.
+fn not_null<'a>(part: Option<&'a [u8]>, name: &str) -> Result<&'a [u8]> {
+    part.ok_or_else(|| Error::new(ErrorKind::Other, format!("the key/value payload's {name} is null")))
 }
 
 impl<T: 'static> Schema<T> {
@@ -325,5 +446,89 @@ mod tests {
             ]
         );
         assert_eq!(format!("{:?}", Schema::int32()), r#"Schema { name: "INT32", type: Int32 }"#);
+    }
+
+    fn properties(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect()
+    }
+
+    /// The payload and the schema Java's `Schema.KeyValue(Schema.STRING, Schema.INT32)` writes.
+    #[test]
+    fn key_values_encode_as_java_does() {
+        let schema = Schema::key_value(Schema::string(), Schema::int32());
+        let pair = KeyValue { key: "k".to_string(), value: 1 };
+        let payload = [0, 0, 0, 1, b'k', 0, 0, 0, 4, 0, 0, 0, 1];
+        assert_eq!(&schema.encode(&pair).unwrap()[..], payload);
+        assert_eq!(schema.decode(&payload).unwrap(), pair);
+        let info = schema.info();
+        assert_eq!(
+            (info.name(), info.schema_type(), info.definition()),
+            ("KeyValue", SchemaType::KeyValue, &[0; 8][..])
+        );
+        let expected = properties(&[
+            ("key.schema.name", "String"),
+            ("key.schema.properties", "{}"),
+            ("key.schema.type", "STRING"),
+            ("kv.encoding.type", "INLINE"),
+            ("value.schema.name", "INT32"),
+            ("value.schema.properties", "{}"),
+            ("value.schema.type", "INT32"),
+        ]);
+        assert_eq!(info.properties(), &expected);
+        let declared = info.to_proto().unwrap();
+        assert_eq!((declared.name.as_str(), declared.r#type), ("KeyValue", Type::KeyValue));
+        let declared: Vec<(String, String)> = declared.properties.into_iter().map(|p| (p.key, p.value)).collect();
+        assert_eq!(declared, expected.into_iter().collect::<Vec<_>>());
+    }
+
+    /// A key/value schema within another records its definition and properties, as Java's does.
+    #[test]
+    fn a_key_value_schema_nests_as_javas_does() {
+        let inner = Schema::key_value(Schema::string(), Schema::int32());
+        let nested = Schema::key_value(inner, Schema::bool());
+        let info = nested.info();
+        assert_eq!(info.definition(), [0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let inner_properties = r#"{"key.schema.name":"String","key.schema.properties":"{}","key.schema.type":"STRING","kv.encoding.type":"INLINE","value.schema.name":"INT32","value.schema.properties":"{}","value.schema.type":"INT32"}"#;
+        assert_eq!(info.properties()["key.schema.properties"], inner_properties);
+        assert_eq!(info.properties()["key.schema.type"], "KEY_VALUE");
+        assert_eq!(info.properties()["value.schema.name"], "Boolean");
+        let value = KeyValue { key: KeyValue { key: "k".to_string(), value: -1 }, value: true };
+        assert_eq!(nested.decode(&nested.encode(&value).unwrap()).unwrap(), value);
+    }
+
+    /// The names of Java's `SchemaType` constants, which key/value schemas record.
+    #[test]
+    fn key_value_schemas_name_the_types_as_java_does() {
+        fn key_type<K: 'static>(key: Schema<K>) -> String {
+            Schema::key_value(key, Schema::bytes()).info().properties()["key.schema.type"].clone()
+        }
+        let names = [
+            key_type(Schema::bytes()),
+            key_type(Schema::string()),
+            key_type(Schema::bool()),
+            key_type(Schema::int8()),
+            key_type(Schema::int16()),
+            key_type(Schema::int32()),
+            key_type(Schema::int64()),
+            key_type(Schema::float32()),
+            key_type(Schema::float64()),
+        ];
+        assert_eq!(names, ["BYTES", "STRING", "BOOLEAN", "INT8", "INT16", "INT32", "INT64", "FLOAT", "DOUBLE"]);
+    }
+
+    /// Java writes a null key or value with length -1; a typed schema can't decode it. A payload that ends early
+    /// isn't one.
+    #[test]
+    fn key_value_payloads_that_dont_decode() {
+        let schema = Schema::key_value(Schema::string(), Schema::int32());
+        let refused = |payload: &[u8]| schema.decode(payload).unwrap_err().to_string();
+        assert!(refused(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 4, 0, 0, 0, 1]).contains("key is null"));
+        assert!(refused(&[0, 0, 0, 1, b'k', 0xff, 0xff, 0xff, 0xff]).contains("value is null"));
+        assert!(refused(&[0, 0, 0]).contains("ends in its key"));
+        assert!(refused(&[0, 0, 0, 2, b'k']).contains("ends in its key"));
+        assert!(refused(&[0, 0, 0, 1, b'k', 0, 0, 0, 4, 0]).contains("ends in its value"));
+        // A part that doesn't decode with its own schema.
+        assert!(refused(&[0, 0, 0, 1, 0xff, 0, 0, 0, 4, 0, 0, 0, 1]).contains("not UTF-8"));
+        assert_eq!(split_inline(&[0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 9]).unwrap(), (Some(&[][..]), None));
     }
 }

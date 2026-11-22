@@ -38,6 +38,8 @@ futures-channel = "0.3"
 futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 rustls-native-certs = "0.8"
+# Key/value schemas record their key's and value's properties as JSON, as Java's do.
+serde_json = "1"
 thiserror.workspace = true
 tracing = "0.1"
 
@@ -48,7 +50,6 @@ jsonwebtoken = { version = "12", default-features = false, features = ["rust_cry
 libtest-mimic = "0.8"
 rcgen = "0.14"
 ring = "0.17"
-serde_json = "1"
 testcontainers = { version = "0.28", features = ["blocking", "watchdog"] }
 
 # The compression codecs, each behind a feature, all on by default (docs/3-protocol.md §6). ZSTD binds the C

@@ -25,6 +25,8 @@ import org.apache.pulsar.client.api.v5.PulsarClient;
 import org.apache.pulsar.client.api.v5.QueueConsumer;
 import org.apache.pulsar.client.api.v5.config.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.v5.schema.Schema;
+import org.apache.pulsar.client.impl.v5.V5Interop;
+import org.apache.pulsar.common.schema.KeyValue;
 
 /**
  * Produces and reads a scalable topic with the Java client's schemas, for the Rust client's integration tests, in the
@@ -35,11 +37,15 @@ import org.apache.pulsar.client.api.v5.schema.Schema;
  *       consumer, and prints each value as {@code value <value>}.</li>
  * </ul>
  * The schemas are named as the V5 factories that make them: {@code string}, {@code bool}, {@code int8},
- * {@code int16}, {@code int32}, {@code int64}, {@code float32} and {@code float64}.
+ * {@code int16}, {@code int32}, {@code int64}, {@code float32} and {@code float64}. {@code kv} is a key/value of a
+ * string and an int32, written {@code key=value}: the V5 factory has none, so it is v4's, through {@code V5Interop}.
  */
 public final class SchemaTool {
     /** A schema, and how its values are read from the command line and printed. */
-    private record Codec<T>(Schema<T> schema, Function<String, T> parse) {
+    private record Codec<T>(Schema<T> schema, Function<String, T> parse, Function<T, String> format) {
+        Codec(Schema<T> schema, Function<String, T> parse) {
+            this(schema, parse, String::valueOf);
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -52,6 +58,11 @@ public final class SchemaTool {
             case "int64" -> new Codec<>(Schema.int64(), Long::parseLong);
             case "float32" -> new Codec<>(Schema.float32(), Float::parseFloat);
             case "float64" -> new Codec<>(Schema.float64(), Double::parseDouble);
+            case "kv" -> new Codec<>(
+                    V5Interop.toV5Schema(org.apache.pulsar.client.api.Schema.KeyValue(
+                            org.apache.pulsar.client.api.Schema.STRING, org.apache.pulsar.client.api.Schema.INT32)),
+                    text -> new KeyValue<>(text.split("=", 2)[0], Integer.parseInt(text.split("=", 2)[1])),
+                    pair -> pair.getKey() + "=" + pair.getValue());
             default -> throw new IllegalArgumentException("no schema " + args[1]);
         };
         try (PulsarClient client = PulsarClient.builder()
@@ -86,7 +97,7 @@ public final class SchemaTool {
                 if (message == null) {
                     throw new IllegalStateException("received " + i + " of " + count + " messages");
                 }
-                System.out.println("value " + message.value());
+                System.out.println("value " + codec.format().apply(message.value()));
                 consumer.acknowledge(message.id());
             }
         }

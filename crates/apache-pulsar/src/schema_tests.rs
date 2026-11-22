@@ -25,7 +25,7 @@ use crate::error::ErrorKind;
 use apache_pulsar_testkit::scalable::World;
 
 use crate::producer_tests::{TOPIC, WorldServer, local_client, run};
-use crate::{ProducerAccessMode, Schema, SubscriptionInitialPosition, local};
+use crate::{KeyValue, ProducerAccessMode, Schema, SubscriptionInitialPosition, local};
 
 /// A world with [`TOPIC`], and no schema registered yet.
 fn world(segments: u32) -> World {
@@ -50,7 +50,7 @@ async fn queue<T: 'static>(
 }
 
 /// Sends `value` with `schema` on a topic of its own, and reads it back with a consumer of the same schema, which
-/// registered the schema as it subscribed first.
+/// registered the schema as it subscribed first: its name, type, definition and properties.
 async fn round_trip<T: Clone + PartialEq + std::fmt::Debug + 'static>(schema: Schema<T>, value: T) {
     let server = WorldServer::start(world(1)).await;
     let client = local_client(&server).await;
@@ -58,12 +58,12 @@ async fn round_trip<T: Clone + PartialEq + std::fmt::Debug + 'static>(schema: Sc
     let producer = client.new_producer(schema.clone()).topic(TOPIC).create().await.unwrap();
     producer.send(value.clone()).await.unwrap();
     assert_eq!(consumer.receive().await.unwrap().value().unwrap(), value);
-    assert_eq!(schema_types(&server), [schema.info().to_proto().unwrap().r#type]);
+    assert_eq!(server.world.borrow().schemas(TOPIC), [schema.info().to_proto().unwrap()]);
     client.close().await.unwrap();
 }
 
 #[test]
-fn values_of_each_primitive_type_reach_a_consumer() {
+fn values_of_each_schema_reach_a_consumer() {
     run(async {
         round_trip(Schema::bool(), true).await;
         round_trip(Schema::int8(), -7).await;
@@ -72,6 +72,8 @@ fn values_of_each_primitive_type_reach_a_consumer() {
         round_trip(Schema::int64(), 1_234_567_890_123).await;
         round_trip(Schema::float32(), 1.1).await;
         round_trip(Schema::float64(), 1.1).await;
+        let pair = KeyValue { key: "k".to_string(), value: 7 };
+        round_trip(Schema::key_value(Schema::string(), Schema::int64()), pair).await;
     });
 }
 

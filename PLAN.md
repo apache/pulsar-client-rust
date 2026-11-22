@@ -169,12 +169,13 @@ covered.
 The schemas land in five pull requests: the primitive types and C11's typed error; key/value; generic records, with
 each message decoded by the schema of its version; JSON and Avro; Protobuf.
 
-Schemas so far: bytes, string and the primitive types, named and encoded as Java's, with a public `SchemaInfo` and
-`SchemaType`. The simulated cluster keeps a schema history per topic, as the broker does. C11 holds there and against
-a 5.0.1 broker: a schema of another type than the topic's fails with `IncompatibleSchema` for a Shared producer's
-sends, an exclusive producer's create, and each kind of consumer's subscribe; the first consumer of a new topic
-registers its schema; and a topic with messages but no schema refuses a schema. Java reads the values of each
-primitive type that Rust sends, and Rust those Java sends.
+Schemas so far: bytes, string, the primitive types and key/value, named and encoded as Java's, with a public
+`SchemaInfo` and `SchemaType`. The simulated cluster keeps a schema history per topic, as the broker does. C11 holds
+there and against a 5.0.1 broker: a schema of another type than the topic's fails with `IncompatibleSchema` for a
+Shared producer's sends, an exclusive producer's create, and each kind of consumer's subscribe; the first consumer of
+a new topic registers its schema; and a topic with messages but no schema refuses a schema. Java reads the values of
+each primitive type and key/value pairs that Rust sends, and Rust those Java sends. Key/value is Java's inline
+encoding; its separated one, with the key in the message's key, comes later.
 
 The migration bridge's end-to-end tests run against 5.0.1, on partitioned and non-partitioned topics, with Java v4
 clients running alongside (`tests/integration/bridge.rs`):
