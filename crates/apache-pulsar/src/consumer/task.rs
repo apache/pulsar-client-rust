@@ -53,6 +53,7 @@ use futures_util::stream::{FuturesUnordered, SelectAll};
 use futures_util::{Stream, StreamExt};
 
 use super::stream_task::{Session, register};
+use super::writers::{Delivered, Writers};
 use crate::conn::{ConnHandle, Push};
 use crate::error::{Error, ErrorKind, Result, server_error_kind};
 use crate::local;
@@ -88,7 +89,7 @@ pub(crate) enum Request {
 /// The answer to a receive: its messages, and where a Checkpoint consumer's checkpoint was for their segments before
 /// them, to go back to if they come back: per segment, with the attachment of its messages.
 pub(crate) struct Delivery {
-    pub(crate) messages: Vec<ReceivedMessage>,
+    pub(crate) messages: Vec<Delivered>,
     undo: Vec<(i64, u64, EntryId)>,
 }
 
@@ -297,7 +298,7 @@ impl Drop for Link {
 struct Waiter {
     max: usize,
     deadline: Option<Instant>,
-    got: Vec<ReceivedMessage>,
+    got: Vec<Delivered>,
     reply: oneshot::Sender<Delivery>,
 }
 
@@ -328,8 +329,10 @@ pub(crate) struct Task {
     pushes: SelectAll<Pushes>,
     /// Receives, in the order they came.
     waiters: VecDeque<Waiter>,
-    /// Messages given back by receives that went away, for the next ones.
+    /// Messages given back by receives that went away, for the next ones, and messages waiting for their schema.
     returned: VecDeque<ReceivedMessage>,
+    /// The schemas the messages were written with, for a consumer that decodes with them.
+    writers: Writers,
     subscribed: Option<oneshot::Sender<Result<()>>>,
     close_replies: Vec<oneshot::Sender<Result<()>>>,
     closed: bool,
@@ -344,6 +347,7 @@ impl Task {
         watch: Option<LayoutWatch>,
         requests: mpsc::UnboundedReceiver<Request>,
         subscribed: oneshot::Sender<Result<()>>,
+        writers: Writers,
     ) -> Self {
         Self {
             machine,
@@ -363,6 +367,7 @@ impl Task {
             pushes: SelectAll::new(),
             waiters: VecDeque::new(),
             returned: VecDeque::new(),
+            writers,
             subscribed: Some(subscribed),
             close_replies: Vec::new(),
             closed: false,
@@ -397,6 +402,8 @@ impl Task {
             progressed |= self.poll_asks(cx);
             // Before the timer: a receive whose time is up takes the messages in first.
             progressed |= self.serve();
+            // After serving, which may start a fetch.
+            progressed |= self.writers.poll(cx);
             progressed |= self.poll_timer(cx);
             // An action may start a future (a subscribe, a close) that must be polled before going to sleep.
             progressed |= self.drain_actions();
@@ -622,7 +629,12 @@ impl Task {
             let gone = waiter.reply.is_canceled();
             while !gone && waiter.got.len() < waiter.max {
                 let Some(message) = self.returned.pop_front().or_else(|| self.machine.next_message()) else { break };
-                waiter.got.push(message);
+                // A message whose schema is on its way waits for it, and the messages after it.
+                let Some(writer) = self.writers.resolve(&message) else {
+                    self.returned.push_front(message);
+                    break;
+                };
+                waiter.got.push((message, writer));
                 progressed = true;
             }
             if !gone && waiter.got.len() < waiter.max {
@@ -639,7 +651,7 @@ impl Task {
     /// next ones.
     fn answer(&mut self, waiter: Waiter) {
         let mut undo: Vec<(i64, u64, EntryId)> = Vec::new();
-        for message in &waiter.got {
+        for (message, _) in &waiter.got {
             let segment = message.id.segment_id;
             if let Some(before) = self.machine.deliver(message)
                 && !undo.iter().any(|(s, _, _)| *s == segment)
@@ -659,7 +671,7 @@ impl Task {
             let Machine::Checkpoint(reader) = &mut self.machine else { break };
             reader.rewind(segment, attachment, position);
         }
-        for message in delivery.messages.into_iter().rev() {
+        for (message, _) in delivery.messages.into_iter().rev() {
             self.returned.push_front(message);
         }
     }
@@ -721,6 +733,7 @@ impl Task {
 
     fn connect(&mut self, segment: u64, generation: u64, topic: String) {
         let Some(command) = self.machine.subscribe_command(segment) else { return };
+        self.writers.connect(segment, &topic);
         let client = self.client.clone();
         let registered = Rc::new(RefCell::new(None));
         self.registering.insert((segment, generation), registered.clone());

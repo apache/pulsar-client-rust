@@ -283,6 +283,7 @@ impl<T: 'static, Api> ProducerBuilder<T, Api> {
     }
 
     fn options(&self, operation_timeout: Duration) -> Result<ProducerOptions> {
+        self.schema.check_producer()?;
         let compression = self.settings.compression.codec.to_proto();
         #[cfg(not(all(feature = "lz4", feature = "zlib", feature = "zstd", feature = "snappy")))]
         if !apache_pulsar_protocol::compression::supports(compression) {

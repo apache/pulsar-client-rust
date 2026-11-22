@@ -52,6 +52,7 @@ use futures_util::stream::{FuturesUnordered, SelectAll};
 use futures_util::{Stream, StreamExt};
 
 use super::task::{Link, Linked, close_command, subscribe, subscribe_error};
+use super::writers::{Delivered, Writers};
 use crate::conn::{ConnHandle, Push};
 use crate::error::{Error, Result};
 use crate::local;
@@ -59,9 +60,9 @@ use crate::local;
 /// What a Stream consumer's handle asks of its task.
 pub(crate) enum Request {
     /// Up to `max` messages: answered once it has them, or at the deadline with what it has.
-    Receive { max: usize, deadline: Option<Instant>, reply: oneshot::Sender<Vec<ReceivedMessage>> },
+    Receive { max: usize, deadline: Option<Instant>, reply: oneshot::Sender<Vec<Delivered>> },
     /// Messages a receive was answered with, and went away without taking: the next receives get them first.
-    Return(Vec<ReceivedMessage>),
+    Return(Vec<Delivered>),
     /// A cumulative ack.
     Ack { id: MessageId, reply: oneshot::Sender<Result<()>> },
     /// `None` when the last handle dropped, or the client is closing: close in the background.
@@ -96,8 +97,8 @@ pub(super) struct Session {
 struct Waiter {
     max: usize,
     deadline: Option<Instant>,
-    got: Vec<ReceivedMessage>,
-    reply: oneshot::Sender<Vec<ReceivedMessage>>,
+    got: Vec<Delivered>,
+    reply: oneshot::Sender<Vec<Delivered>>,
 }
 
 pub(crate) struct Task {
@@ -122,8 +123,10 @@ pub(crate) struct Task {
     pushes: SelectAll<Pushes>,
     /// Receives, in the order they came.
     waiters: VecDeque<Waiter>,
-    /// Messages given back by receives that went away, for the next ones.
+    /// Messages given back by receives that went away, for the next ones, and messages waiting for their schema.
     returned: VecDeque<ReceivedMessage>,
+    /// The schemas the messages were written with, for a consumer that decodes with them.
+    writers: Writers,
     subscribed: Option<oneshot::Sender<Result<()>>>,
     close_replies: Vec<oneshot::Sender<Result<()>>>,
     closed: bool,
@@ -137,6 +140,7 @@ impl Task {
         topic: String,
         requests: mpsc::UnboundedReceiver<Request>,
         subscribed: oneshot::Sender<Result<()>>,
+        writers: Writers,
     ) -> Self {
         Self {
             stream,
@@ -154,6 +158,7 @@ impl Task {
             pushes: SelectAll::new(),
             waiters: VecDeque::new(),
             returned: VecDeque::new(),
+            writers,
             subscribed: Some(subscribed),
             close_replies: Vec::new(),
             closed: false,
@@ -186,6 +191,8 @@ impl Task {
             progressed |= self.poll_closes(cx);
             // Before the timer: a receive whose time is up takes the messages in first.
             progressed |= self.serve();
+            // After serving, which may start a fetch.
+            progressed |= self.writers.poll(cx);
             progressed |= self.poll_timer(cx);
             // An action may start a future that must be polled before going to sleep.
             progressed |= self.drain_actions();
@@ -379,7 +386,12 @@ impl Task {
             while !gone && waiter.got.len() < waiter.max {
                 let next = self.returned.pop_front().or_else(|| self.stream.next_message(Instant::now()));
                 let Some(message) = next else { break };
-                waiter.got.push(message);
+                // A message whose schema is on its way waits for it, and the messages after it.
+                let Some(writer) = self.writers.resolve(&message) else {
+                    self.returned.push_front(message);
+                    break;
+                };
+                waiter.got.push((message, writer));
                 progressed = true;
             }
             if !gone && waiter.got.len() < waiter.max {
@@ -399,8 +411,8 @@ impl Task {
         }
     }
 
-    fn give_back(&mut self, messages: Vec<ReceivedMessage>) {
-        for message in messages.into_iter().rev() {
+    fn give_back(&mut self, messages: Vec<Delivered>) {
+        for (message, _) in messages.into_iter().rev() {
             self.returned.push_front(message);
         }
     }
@@ -460,6 +472,7 @@ impl Task {
 
     fn connect(&mut self, segment: u64, generation: u64, topic: String) {
         let Some(command) = self.stream.subscribe_command(segment, 0) else { return };
+        self.writers.connect(segment, &topic);
         let client = self.client.clone();
         let registered = Rc::new(RefCell::new(None));
         self.registering.insert((segment, generation), registered.clone());

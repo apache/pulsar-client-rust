@@ -24,12 +24,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use apache_pulsar_protocol::consumer::ConsumerOptions;
-use apache_pulsar_protocol::entry::ReceivedMessage;
 use apache_pulsar_protocol::stream_consumer::StreamConsumer as Machine;
 use futures_channel::{mpsc, oneshot};
 use futures_util::Stream;
 
 use super::stream_task::{Request, Task};
+use super::writers::{self, Delivered, Writers};
 use super::{Message, Settings, SubscriptionInitialPosition, consumer_closed, consumer_options, invalid};
 use crate::client::{LoopSlot, PulsarClient};
 use crate::config::{Blocking, Local, ThreadSafe};
@@ -108,6 +108,7 @@ impl<T: 'static, Api> StreamConsumerBuilder<T, Api> {
 
     /// The topic, the consumer's name and the segment consumers' options, once checked.
     fn options(&self, operation_timeout: Duration) -> Result<(String, String, ConsumerOptions)> {
+        self.schema.check_consumer()?;
         let (topic, options) = consumer_options(&self.settings, self.schema.info(), operation_timeout)?;
         let name = self
             .settings
@@ -208,11 +209,12 @@ async fn subscribe_on(
     let watch = client.watches().open(&client, &topic).await?;
     let layout = watch.current();
     let initial: BTreeSet<u64> = layout.segments().map(|segment| segment.id).collect();
+    let writers = Writers::new(client.clone(), writers::wanted(&options));
     let machine = Machine::new(options, layout.topic().to_string(), name, initial, Instant::now());
     let resolved = Arc::from(machine.topic());
     let (requests, receiver) = mpsc::unbounded();
     let (subscribed, is_subscribed) = oneshot::channel();
-    let task = Task::new(machine, client.clone(), topic, receiver, subscribed);
+    let task = Task::new(machine, client.clone(), topic, receiver, subscribed, writers);
     let closer = requests.clone();
     let close = move || {
         let _ = closer.unbounded_send(Request::Close { reply: None });
@@ -244,7 +246,7 @@ struct Shared {
 
 impl Shared {
     /// Up to `max` messages: once there are, or at the deadline with what there is.
-    async fn receive(&self, max: usize, deadline: Option<Instant>) -> Result<Vec<ReceivedMessage>> {
+    async fn receive(&self, max: usize, deadline: Option<Instant>) -> Result<Vec<Delivered>> {
         let (reply, answer) = oneshot::channel();
         let request = Request::Receive { max, deadline, reply };
         self.link.requests.unbounded_send(request).map_err(consumer_closed)?;
@@ -256,7 +258,7 @@ impl Shared {
 /// A receive's answer on its way. Dropped with the answer in, it gives the messages back, for the next receives: a
 /// receive dropped before it completes loses no message.
 struct Pending {
-    answer: oneshot::Receiver<Vec<ReceivedMessage>>,
+    answer: oneshot::Receiver<Vec<Delivered>>,
     requests: mpsc::UnboundedSender<Request>,
 }
 
@@ -360,12 +362,13 @@ impl<T: 'static, Api> StreamConsumer<T, Api> {
         done.await.unwrap_or(Ok(()))
     }
 
-    fn message(&self, message: ReceivedMessage) -> Message<T> {
+    fn message(&self, (message, writer): Delivered) -> Message<T> {
         Message {
             id: MessageId(message.id.clone()),
             message,
             topic: self.shared.link.topic.clone(),
             schema: self.schema.clone(),
+            writer,
         }
     }
 }

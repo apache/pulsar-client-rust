@@ -21,6 +21,7 @@ mod checkpoint;
 mod stream;
 mod stream_task;
 mod task;
+mod writers;
 
 pub use checkpoint::{CheckpointConsumer, CheckpointConsumerBuilder};
 pub use stream::{StreamConsumer, StreamConsumerBuilder};
@@ -47,6 +48,7 @@ use crate::message_id::MessageId;
 use crate::producer::{ApiClient, normalize_topic};
 use crate::schema::{Schema, SchemaInfo};
 use task::{Machine, Task};
+use writers::{Delivered, Writer, Writers};
 
 /// Where a new subscription starts on each segment (*client-api* §4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -183,6 +185,7 @@ impl<T: 'static, Api> QueueConsumerBuilder<T, Api> {
     }
 
     fn options(&self, operation_timeout: Duration) -> Result<(String, ConsumerOptions)> {
+        self.schema.check_consumer()?;
         consumer_options(&self.settings, self.schema.info(), operation_timeout)
     }
 }
@@ -289,17 +292,19 @@ impl Drop for Link {
 
 /// Subscribes a Queue consumer on `client`'s loop, and waits for every segment to be subscribed.
 async fn subscribe_on(client: local::PulsarClient, topic: String, options: ConsumerOptions) -> Result<Link> {
+    let wanted = writers::wanted(&options);
     let machine = move |layout| Machine::Queue(QueueMachine::new(options, layout, Instant::now()));
-    start(client, topic, Box::new(machine)).await
+    start(client, topic, Box::new(machine), wanted).await
 }
 
 /// Opens the topic's layout watch on `client`'s loop, starts the task of the consumer `machine` makes on the first
 /// layout, and waits until it is subscribed. A Checkpoint consumer in a group holds the watch only until then: its
-/// task's first look for the controller shares it.
+/// task's first look for the controller shares it. The task fetches the schemas of the messages if `writers`.
 async fn start(
     client: local::PulsarClient,
     topic: String,
     machine: Box<dyn FnOnce(Rc<Layout>) -> Machine>,
+    writers: bool,
 ) -> Result<Link> {
     let watch = client.watches().open(&client, &topic).await?;
     let machine = machine(watch.current());
@@ -310,7 +315,8 @@ async fn start(
         true => (Some(watch), None),
         false => (None, Some(watch)),
     };
-    let task = Task::new(machine, client.clone(), topic, layouts, receiver, subscribed);
+    let writers = Writers::new(client.clone(), writers);
+    let task = Task::new(machine, client.clone(), topic, layouts, receiver, subscribed, writers);
     let closer = requests.clone();
     let close = move || {
         let _ = closer.unbounded_send(Request::Close { reply: None });
@@ -341,7 +347,7 @@ struct Shared {
 
 impl Link {
     /// Up to `max` messages: once there are, or at the deadline with what there is.
-    async fn receive(&self, max: usize, deadline: Option<Instant>) -> Result<Vec<ReceivedMessage>> {
+    async fn receive(&self, max: usize, deadline: Option<Instant>) -> Result<Vec<Delivered>> {
         let (reply, answer) = oneshot::channel();
         let request = Request::Receive { max, deadline, reply };
         self.requests.unbounded_send(request).map_err(consumer_closed)?;
@@ -361,8 +367,9 @@ impl Link {
     }
 
     /// A message, as the application gets it.
-    fn message<T>(&self, message: ReceivedMessage, schema: &Schema<T>) -> Message<T> {
-        Message { id: MessageId(message.id.clone()), message, topic: self.topic.clone(), schema: schema.clone() }
+    fn message<T>(&self, (message, writer): Delivered, schema: &Schema<T>) -> Message<T> {
+        let id = MessageId(message.id.clone());
+        Message { id, message, topic: self.topic.clone(), schema: schema.clone(), writer }
     }
 }
 
@@ -477,7 +484,7 @@ impl<T: 'static, Api> QueueConsumer<T, Api> {
         self.shared.link.close().await
     }
 
-    fn message(&self, message: ReceivedMessage) -> Message<T> {
+    fn message(&self, message: Delivered) -> Message<T> {
         self.shared.link.message(message, &self.schema)
     }
 }
@@ -488,6 +495,8 @@ pub struct Message<T> {
     message: ReceivedMessage,
     topic: Arc<str>,
     schema: Schema<T>,
+    /// The schema the message was written with, for a schema that decodes with it.
+    writer: Writer,
 }
 
 impl<T> Clone for Message<T> {
@@ -497,6 +506,7 @@ impl<T> Clone for Message<T> {
             message: self.message.clone(),
             topic: self.topic.clone(),
             schema: self.schema.clone(),
+            writer: self.writer.clone(),
         }
     }
 }
@@ -513,9 +523,11 @@ impl<T> std::fmt::Debug for Message<T> {
 }
 
 impl<T> Message<T> {
-    /// The value, decoded with the consumer's schema each time.
+    /// The value, decoded with the consumer's schema each time. [`Schema::auto_consume`] decodes it with the schema
+    /// it was written with, which the consumer fetched before delivering it: a fetch that failed fails here.
     pub fn value(&self) -> Result<T> {
-        self.schema.decode(&self.message.payload)
+        let writer = self.writer.as_ref().map_err(Clone::clone)?;
+        self.schema.decode_with(&self.message.payload, writer.as_deref())
     }
 
     /// The payload as it came, without a copy.

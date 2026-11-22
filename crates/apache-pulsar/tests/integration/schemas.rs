@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Schemas against the broker: C11's `IncompatibleSchema`, and each schema with the Java client, in both directions.
+//! Schemas against the broker: C11's `IncompatibleSchema`, and each schema with the Java client, in both directions,
+//! typed and as generic records.
 
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::time::Duration;
 
-use apache_pulsar::{ErrorKind, KeyValue, ProducerAccessMode, Schema, SubscriptionInitialPosition, local};
+use apache_pulsar::{
+    ErrorKind, GenericValue, KeyValue, ProducerAccessMode, Schema, SchemaType, SubscriptionInitialPosition, local,
+};
 
 use crate::env::{self, Env};
 use crate::{run, token_client, unique};
@@ -35,6 +38,8 @@ pub const TESTS: &[(&str, fn(&Env))] = &[
     ),
     ("primitive_values_cross_between_java_and_rust", primitive_values_cross_between_java_and_rust),
     ("key_values_cross_between_java_and_rust", key_values_cross_between_java_and_rust),
+    ("generic_records_cross_between_java_and_rust", generic_records_cross_between_java_and_rust),
+    ("a_generic_consumer_decodes_each_message_by_its_version", a_generic_consumer_decodes_each_message_by_its_version),
 ];
 
 fn new_topic(name: &str) -> String {
@@ -187,6 +192,97 @@ where
         let consumer = queue(&client, schema, &topic, "rust").await.unwrap();
         let read = take(&consumer, values.len()).await;
         assert!(same(&read), "{name}: Rust read {read:?} of {expected:?}");
+        client.close().await.unwrap();
+    });
+}
+
+/// Generic records, both ways: a Rust consumer of `Schema::auto_consume()` reads what Java writes with each schema, and
+/// a Java consumer of `Schema.autoConsume()` what Rust writes, each decoding with the schema the broker recorded.
+fn generic_records_cross_between_java_and_rust(env: &Env) {
+    let string = GenericValue::String("hello".to_string());
+    generic_both_ways(env, "string", Schema::string(), "hello", "hello".to_string(), string, "STRING hello");
+    generic_both_ways(env, "bool", Schema::bool(), "true", true, GenericValue::Boolean(true), "BOOLEAN true");
+    generic_both_ways(env, "int8", Schema::int8(), "-7", -7, GenericValue::Int8(-7), "INT8 -7");
+    generic_both_ways(env, "int16", Schema::int16(), "12345", 12345, GenericValue::Int16(12345), "INT16 12345");
+    generic_both_ways(env, "int32", Schema::int32(), "-123", -123, GenericValue::Int32(-123), "INT32 -123");
+    let long = GenericValue::Int64(1 << 40);
+    generic_both_ways(env, "int64", Schema::int64(), "1099511627776", 1 << 40, long, "INT64 1099511627776");
+    generic_both_ways(env, "float32", Schema::float32(), "1.5", 1.5, GenericValue::Float(1.5), "FLOAT 1.5");
+    generic_both_ways(env, "float64", Schema::float64(), "-2.5", -2.5, GenericValue::Double(-2.5), "DOUBLE -2.5");
+    let schema = Schema::key_value(Schema::string(), Schema::int32());
+    let pair = KeyValue { key: "a".to_string(), value: 1 };
+    let generic = KeyValue { key: GenericValue::String("a".to_string()), value: GenericValue::Int32(1) };
+    generic_both_ways(env, "kv", schema, "a=1", pair, GenericValue::KeyValue(Box::new(generic)), "KEY_VALUE a=1");
+}
+
+/// Sends `value` with `schema` from Java, as the tool takes it (`text`), and reads it in Rust as a generic record,
+/// `generic`; then sends it from Rust, and reads it in Java as a generic record, which the tool prints as `java`.
+fn generic_both_ways<T: 'static>(
+    env: &Env,
+    name: &str,
+    schema: Schema<T>,
+    text: &str,
+    value: T,
+    generic: GenericValue,
+    java: &str,
+) {
+    let topic = new_topic(&format!("java-generic-{name}"));
+    env.java_produce(name, &topic, &[text]);
+    let schema_type = schema.info().schema_type();
+    run(async {
+        let client = client(env).await;
+        let consumer = queue(&client, Schema::auto_consume(), &topic, "rust").await.unwrap();
+        let record = take(&consumer, 1).await.remove(0);
+        assert_eq!((record.schema_type(), record.into_value()), (schema_type, generic), "{name}");
+        client.close().await.unwrap();
+    });
+
+    let topic = new_topic(&format!("rust-generic-{name}"));
+    run(async {
+        let client = client(env).await;
+        let producer = client.new_producer(schema).topic(&topic).create().await.unwrap();
+        producer.send(value).await.unwrap();
+        client.close().await.unwrap();
+    });
+    assert_eq!(env.java_consume("auto", &topic, 1), [java], "{name}");
+}
+
+/// A generic consumer decodes each message with the schema of its version: on a topic with a schema, the messages of
+/// a producer of raw bytes have none, and read as bytes. It asks for the schema on the service URL, here the proxy's.
+/// The broker doesn't count a generic consumer as it checks a schema: the first typed consumer of a new topic still
+/// registers its own, and a topic with messages but no schema takes a generic consumer.
+fn a_generic_consumer_decodes_each_message_by_its_version(env: &Env) {
+    let topic = new_topic("generic-versions");
+    run(async {
+        let client = client(env).await;
+        let proxied = crate::proxy_client(env).build().await.unwrap();
+        let generic = queue(&proxied, Schema::auto_consume(), &topic, "generic").await.unwrap();
+        let _typed = queue(&client, Schema::int32(), &topic, "typed").await.unwrap();
+        let text = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        assert_eq!(text.send("x".to_string()).await.unwrap_err().kind(), ErrorKind::IncompatibleSchema);
+        let raw = client.new_producer(Schema::bytes()).topic(&topic).create().await.unwrap();
+        let numbers = client.new_producer(Schema::int32()).topic(&topic).create().await.unwrap();
+        raw.send(b"raw".to_vec()).await.unwrap();
+        numbers.send(7).await.unwrap();
+        let read: Vec<(SchemaType, GenericValue)> =
+            take(&generic, 2).await.into_iter().map(|record| (record.schema_type(), record.into_value())).collect();
+        let bytes = (SchemaType::Bytes, GenericValue::Bytes(b"raw".to_vec()));
+        assert!(read.contains(&bytes) && read.contains(&(SchemaType::Int32, GenericValue::Int32(7))), "{read:?}");
+        proxied.close().await.unwrap();
+        client.close().await.unwrap();
+    });
+
+    let topic = new_topic("generic-no-schema");
+    run(async {
+        let client = client(env).await;
+        let producer = client.new_producer(Schema::bytes()).topic(&topic).create().await.unwrap();
+        producer.send(b"raw".to_vec()).await.unwrap();
+        let generic = queue(&client, Schema::auto_consume(), &topic, "generic").await.unwrap();
+        let record = take(&generic, 1).await.remove(0);
+        assert_eq!(
+            (record.schema_type(), record.into_value()),
+            (SchemaType::Bytes, GenericValue::Bytes(b"raw".to_vec()))
+        );
         client.close().await.unwrap();
     });
 }
