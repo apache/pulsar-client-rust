@@ -17,10 +17,14 @@
 
 //! Generic records: values decoded with the schema each message was written with ([`Schema::auto_consume`]).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{Generic, KeyValue, Schema, SchemaInfo, SchemaType, boolean, sized, split_inline, utf8};
+#[cfg(feature = "avro")]
+use apache_avro::reader::datum::GenericDatumReader;
+
+#[cfg(feature = "avro")]
+use super::avro::undecodable;
+use super::{Definitions, Generic, KeyValue, Schema, SchemaInfo, SchemaType, boolean, sized, split_inline, utf8};
 use crate::error::{Error, ErrorKind, Result};
 
 /// A value decoded with the schema its message was written with: the values of [`Schema::auto_consume`], as Java
@@ -29,6 +33,7 @@ use crate::error::{Error, ErrorKind, Result};
 pub struct GenericRecord {
     schema_type: SchemaType,
     value: GenericValue,
+    fields: Vec<String>,
 }
 
 impl GenericRecord {
@@ -44,6 +49,36 @@ impl GenericRecord {
 
     pub fn into_value(self) -> GenericValue {
         self.value
+    }
+
+    /// The names of a record's fields, in the order of the schema it was written with, as Java V5's `fields()`: none
+    /// for a value that isn't a JSON or an Avro record.
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    /// A field of a JSON or an Avro record, as Java V5's `field(name)`: its value, as Java's record holds it, an Avro
+    /// union's branch without the union, or `None` for a field it doesn't have, and for a value that isn't a record.
+    #[cfg_attr(not(any(feature = "json", feature = "avro")), expect(unused_variables))]
+    pub fn field(&self, name: &str) -> Option<GenericValue> {
+        match &self.value {
+            #[cfg(feature = "json")]
+            GenericValue::Json(serde_json::Value::Object(fields)) => fields.get(name).cloned().map(GenericValue::Json),
+            #[cfg(feature = "avro")]
+            GenericValue::Avro(apache_avro::types::Value::Record(fields)) => {
+                fields.iter().find(|(field, _)| field == name).map(|(_, value)| GenericValue::Avro(branch(value)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// An Avro value as Java's record holds it: a union's branch without the union.
+#[cfg(feature = "avro")]
+fn branch(value: &apache_avro::types::Value) -> apache_avro::types::Value {
+    match value {
+        apache_avro::types::Value::Union(_, branch) => (**branch).clone(),
+        value => value.clone(),
     }
 }
 
@@ -65,6 +100,13 @@ pub enum GenericValue {
     Double(f64),
     /// A key and a value, each by its own schema.
     KeyValue(Box<KeyValue<GenericValue, GenericValue>>),
+    /// A value of a JSON schema, as `serde_json` reads it: an object for a record.
+    #[cfg(feature = "json")]
+    Json(serde_json::Value),
+    /// A value of an Avro schema, as apache-avro reads it with the schema it was written with: a record's fields come
+    /// in that schema's order.
+    #[cfg(feature = "avro")]
+    Avro(apache_avro::types::Value),
 }
 
 impl Schema<GenericRecord> {
@@ -74,30 +116,33 @@ impl Schema<GenericRecord> {
     /// message's [`value`](crate::Message::value), and the next message of that version fetches again.
     ///
     /// The broker doesn't check this schema against the topic's, so it reads any topic, and registers none. It
-    /// decodes the primitive types and key/value; JSON, Avro and Protobuf values fail to decode, as this client
-    /// doesn't read them yet. Producers don't take it: they fail to create with [`ErrorKind::InvalidConfiguration`], as
-    /// Java v4's do.
+    /// decodes the primitive types, key/value, and with their features JSON and Avro; Protobuf values fail to decode,
+    /// as this client doesn't read them yet. Producers don't take it: they fail to create with
+    /// [`ErrorKind::InvalidConfiguration`], as Java v4's do.
     pub fn auto_consume() -> Self {
+        let definitions = Definitions::default();
         Self {
             info: SchemaInfo::new("AutoConsume", SchemaType::AutoConsume),
             encode: Arc::new(|_: &GenericRecord| {
                 Err(Error::new(ErrorKind::InvalidConfiguration, "auto_consume() only decodes"))
             }),
-            decode: Arc::new(decode),
+            decode: Arc::new(move |data: &[u8], writer: Option<&SchemaInfo>| decode(&definitions, data, writer)),
             generic: Generic::Whole,
         }
     }
 }
 
 /// Decodes a payload with the schema it was written with: as bytes without one.
-fn decode(data: &[u8], writer: Option<&SchemaInfo>) -> Result<GenericRecord> {
+fn decode(definitions: &Definitions, data: &[u8], writer: Option<&SchemaInfo>) -> Result<GenericRecord> {
     let bytes = SchemaInfo::new("Bytes", SchemaType::Bytes);
     let writer = writer.unwrap_or(&bytes);
-    Ok(GenericRecord { schema_type: writer.schema_type, value: decode_value(data, writer)? })
+    let value = decode_value(definitions, data, writer)?;
+    let fields = fields(definitions, &value, writer);
+    Ok(GenericRecord { schema_type: writer.schema_type, value, fields })
 }
 
 /// A payload's value, by the schema it was written with.
-fn decode_value(data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
+fn decode_value(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
     let name = writer.schema_type.java_name();
     Ok(match writer.schema_type {
         SchemaType::Bytes | SchemaType::None => GenericValue::Bytes(data.to_vec()),
@@ -109,7 +154,9 @@ fn decode_value(data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
         SchemaType::Int64 => GenericValue::Int64(sized(name, data, i64::from_be_bytes)?),
         SchemaType::Float => GenericValue::Float(sized(name, data, f32::from_be_bytes)?),
         SchemaType::Double => GenericValue::Double(sized(name, data, f64::from_be_bytes)?),
-        SchemaType::KeyValue => key_value(data, writer)?,
+        SchemaType::KeyValue => key_value(definitions, data, writer)?,
+        SchemaType::Json => json(data)?,
+        SchemaType::Avro => avro(definitions, data, writer)?,
         _ => {
             return Err(Error::new(
                 ErrorKind::Other,
@@ -119,37 +166,62 @@ fn decode_value(data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
     })
 }
 
+/// The names of a record's fields, in the order of the schema it was written with: an Avro record's own, and a JSON
+/// one's from the Avro schema that describes it, or its own if that doesn't describe a record.
+#[cfg_attr(not(feature = "json"), expect(unused_variables))]
+fn fields(definitions: &Definitions, value: &GenericValue, writer: &SchemaInfo) -> Vec<String> {
+    match value {
+        #[cfg(feature = "json")]
+        GenericValue::Json(serde_json::Value::Object(fields)) => match definitions.parse(&writer.definition).as_deref()
+        {
+            Ok(apache_avro::Schema::Record(record)) => record.fields.iter().map(|field| field.name.clone()).collect(),
+            _ => fields.keys().cloned().collect(),
+        },
+        #[cfg(feature = "avro")]
+        GenericValue::Avro(apache_avro::types::Value::Record(fields)) => {
+            fields.iter().map(|(name, _)| name.clone()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(feature = "json")]
+fn json(data: &[u8]) -> Result<GenericValue> {
+    let value = serde_json::from_slice(data);
+    value.map(GenericValue::Json).map_err(|e| Error::new(ErrorKind::Other, format!("the payload isn't JSON: {e}")))
+}
+
+#[cfg(not(feature = "json"))]
+fn json(_: &[u8]) -> Result<GenericValue> {
+    Err(Error::new(ErrorKind::Other, "reading JSON records takes the `json` feature"))
+}
+
+/// An Avro payload, read with the schema it was written with.
+#[cfg(feature = "avro")]
+fn avro(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
+    let schema = definitions.parse(&writer.definition)?;
+    let value = GenericDatumReader::builder(&schema).build().and_then(|reader| reader.read_value(&mut &data[..]));
+    value.map(GenericValue::Avro).map_err(undecodable)
+}
+
+#[cfg(not(feature = "avro"))]
+fn avro(_: &Definitions, _: &[u8], _: &SchemaInfo) -> Result<GenericValue> {
+    Err(Error::new(ErrorKind::Other, "reading Avro records takes the `avro` feature"))
+}
+
 /// A key/value payload, as Java's `KeyValueSchemaInfo` reads its schema: the key's and the value's schemas from its
 /// properties and definition. Only the inline encoding is read: Java's other one puts the key in the message's key.
-fn key_value(data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
+fn key_value(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> Result<GenericValue> {
     if writer.properties.get("kv.encoding.type").is_some_and(|encoding| encoding == "SEPARATED") {
         let message = "key/value messages with the key in the message's key aren't supported yet";
         return Err(Error::new(ErrorKind::Other, message));
     }
-    let (key_definition, value_definition) = split_inline(&writer.definition)?;
-    let (key_schema, value_schema) = (part(writer, "key", key_definition)?, part(writer, "value", value_definition)?);
+    let (key_schema, value_schema) = writer.parts()?;
     let (key, value) = split_inline(data)?;
-    let read = |data: Option<&[u8]>, schema| data.map_or(Ok(GenericValue::Null), |data| decode_value(data, schema));
-    Ok(GenericValue::KeyValue(Box::new(KeyValue { key: read(key, &key_schema)?, value: read(value, &value_schema)? })))
-}
-
-/// The schema of a key/value schema's key or value, `side`: its name, type and properties, which the key/value
-/// schema's properties record, and its part of the key/value schema's definition. Without a type, it is bytes, as in
-/// Java.
-fn part(writer: &SchemaInfo, side: &str, definition: Option<&[u8]>) -> Result<SchemaInfo> {
-    let property = |name: &str| writer.properties.get(&format!("{side}.schema.{name}"));
-    let properties = match property("properties").filter(|json| !json.is_empty()) {
-        Some(json) => serde_json::from_str(json).map_err(|e| {
-            Error::new(ErrorKind::Other, format!("the key/value schema's {side} properties aren't JSON: {e}"))
-        })?,
-        None => BTreeMap::new(),
+    let read = |data: Option<&[u8]>, schema| {
+        data.map_or(Ok(GenericValue::Null), |data| decode_value(definitions, data, schema))
     };
-    Ok(SchemaInfo {
-        name: property("name").cloned().unwrap_or_default(),
-        schema_type: property("type").map_or(SchemaType::Bytes, |name| SchemaType::from_java_name(name)),
-        definition: definition.unwrap_or_default().to_vec(),
-        properties,
-    })
+    Ok(GenericValue::KeyValue(Box::new(KeyValue { key: read(key, &key_schema)?, value: read(value, &value_schema)? })))
 }
 
 #[cfg(test)]
@@ -166,7 +238,7 @@ mod tests {
     }
 
     fn record(schema_type: SchemaType, value: GenericValue) -> GenericRecord {
-        GenericRecord { schema_type, value }
+        GenericRecord { schema_type, value, fields: Vec::new() }
     }
 
     fn pair(key: GenericValue, value: GenericValue) -> GenericValue {
@@ -215,14 +287,21 @@ mod tests {
         let refused = |data: &[u8], writer: &SchemaInfo| auto.decode_with(data, Some(writer)).unwrap_err().to_string();
         assert!(refused(&[0, 1], Schema::int32().info()).contains("a INT32 value takes 4 bytes"));
         assert!(refused(&[0xff], Schema::string().info()).contains("not UTF-8"));
+        #[cfg(feature = "json")]
+        assert!(refused(b"{", &writer(SchemaType::Json, &[], b"\"int\"")).contains("the payload isn't JSON"));
+        #[cfg(feature = "avro")]
+        {
+            assert!(refused(&[], &writer(SchemaType::Avro, &[], b"\"int\"")).contains("doesn't decode in Avro"));
+            assert!(refused(&[], &writer(SchemaType::Avro, &[], b"{")).contains("isn't JSON"));
+        }
+        // Without their features, JSON and Avro records fail to decode, naming the feature.
+        #[cfg(not(feature = "json"))]
+        assert!(refused(b"{}", &writer(SchemaType::Json, &[], &[])).contains("takes the `json` feature"));
+        #[cfg(not(feature = "avro"))]
+        assert!(refused(&[], &writer(SchemaType::Avro, &[], &[])).contains("takes the `avro` feature"));
         // The types this client doesn't decode yet fail, naming themselves.
-        let later = [
-            (SchemaType::Json, "JSON"),
-            (SchemaType::Avro, "AVRO"),
-            (SchemaType::Protobuf, "PROTOBUF"),
-            (SchemaType::ProtobufNative, "PROTOBUF_NATIVE"),
-        ];
-        for (schema_type, name) in later {
+        for (schema_type, name) in [(SchemaType::Protobuf, "PROTOBUF"), (SchemaType::ProtobufNative, "PROTOBUF_NATIVE")]
+        {
             let error = refused(b"{}", &writer(schema_type, &[], &[]));
             assert!(error.contains(&format!("generic records of {name} schemas")), "{error}");
         }
@@ -248,12 +327,77 @@ mod tests {
 
     /// A key/value schema with parts missing, as Java's `KeyValueSchemaInfo` reads it: a part without a type is bytes,
     /// one without a name or properties has none.
+    /// Java's definition of the record its tool writes: its reflection orders the fields otherwise than the record's
+    /// JSON.
+    #[cfg(any(feature = "json", feature = "avro"))]
+    const JAVA_POJO: &[u8] = br#"{"type":"record","name":"Pojo","namespace":"SchemaTool","fields":[
+        {"name":"age","type":"int"},{"name":"name","type":["null","string"],"default":null}]}"#;
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn generic_json_records() {
+        use serde_json::json;
+
+        let auto = Schema::auto_consume();
+        let read = auto.decode_with(br#"{"name":"alice","age":30}"#, Some(&writer(SchemaType::Json, &[], JAVA_POJO)));
+        let read = read.unwrap();
+        assert_eq!(
+            (read.schema_type(), read.value()),
+            (SchemaType::Json, &GenericValue::Json(json!({"name": "alice", "age": 30})))
+        );
+        assert_eq!(read.fields(), ["age", "name"], "in the definition's order");
+        assert_eq!(read.field("name"), Some(GenericValue::Json(json!("alice"))));
+        assert_eq!(read.field("city"), None);
+        // A definition that doesn't describe a record: the object's fields, in serde_json's order.
+        let not_a_record = writer(SchemaType::Json, &[], br#""string""#);
+        assert_eq!(auto.decode_with(br#"{"b":1,"a":2}"#, Some(&not_a_record)).unwrap().fields(), ["a", "b"]);
+        // A value that isn't an object has no fields.
+        let read = auto.decode_with(b"7", Some(&not_a_record)).unwrap();
+        assert!(read.fields().is_empty() && read.field("a").is_none());
+    }
+
+    #[cfg(feature = "avro")]
+    #[test]
+    fn generic_avro_records() {
+        use apache_avro::types::Value;
+
+        let auto = Schema::auto_consume();
+        let payload = [60, 2, 10, b'a', b'l', b'i', b'c', b'e'];
+        let read = auto.decode_with(&payload, Some(&writer(SchemaType::Avro, &[], JAVA_POJO))).unwrap();
+        assert_eq!(read.schema_type(), SchemaType::Avro);
+        assert_eq!(read.fields(), ["age", "name"]);
+        assert_eq!(read.field("age"), Some(GenericValue::Avro(Value::Int(30))));
+        assert_eq!(read.field("name"), Some(GenericValue::Avro(Value::String("alice".to_string()))));
+        assert_eq!(read.field("city"), None);
+        let nameless = auto.decode_with(&[60, 0], Some(&writer(SchemaType::Avro, &[], JAVA_POJO))).unwrap();
+        assert_eq!(nameless.field("name"), Some(GenericValue::Avro(Value::Null)), "the union's null branch");
+        // A value that isn't a record has no fields.
+        let read = auto.decode_with(&[60], Some(&writer(SchemaType::Avro, &[], br#""int""#))).unwrap();
+        assert_eq!(read.value(), &GenericValue::Avro(Value::Int(30)));
+        assert!(read.fields().is_empty() && read.field("a").is_none());
+        // A key/value of an Avro record: each part read with its own schema.
+        let schema = Schema::key_value(Schema::string(), Schema::<Pojo>::avro());
+        let read = generic(&schema, &KeyValue { key: "k".to_string(), value: Pojo { name: None, age: 7 } });
+        let record = Value::Record(vec![
+            ("name".to_string(), Value::Union(0, Box::new(Value::Null))),
+            ("age".to_string(), Value::Int(7)),
+        ]);
+        assert_eq!(read.into_value(), pair(GenericValue::String("k".into()), GenericValue::Avro(record)));
+    }
+
+    #[cfg(feature = "avro")]
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, apache_avro::AvroSchema)]
+    struct Pojo {
+        name: Option<String>,
+        age: i32,
+    }
+
     #[test]
     fn key_value_schemas_as_java_reads_them() {
         let bare = writer(SchemaType::KeyValue, &[("key.schema.properties", "")], &[0; 8]);
         let read = Schema::auto_consume().decode_with(&[0, 0, 0, 1, 7, 0, 0, 0, 0], Some(&bare)).unwrap();
         assert_eq!(read.into_value(), pair(GenericValue::Bytes(vec![7]), GenericValue::Bytes(Vec::new())));
-        let key = part(&bare, "key", None).unwrap();
+        let key = bare.part("key", None).unwrap();
         assert_eq!((key.name(), key.schema_type(), key.definition()), ("", SchemaType::Bytes, &[][..]));
         assert!(key.properties().is_empty());
     }

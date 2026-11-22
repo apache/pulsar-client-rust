@@ -20,7 +20,13 @@
 //! The schema is topic-level (*data-model* §6): the broker keeps one history of schemas for a scalable topic, which
 //! every segment shares, and checks a producer's or a consumer's schema against it as it registers on a segment.
 
+#[cfg(feature = "avro")]
+mod avro;
 mod generic;
+#[cfg(feature = "json")]
+mod json;
+#[cfg(any(feature = "json", feature = "avro"))]
+mod record;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,11 +36,18 @@ use apache_pulsar_protocol::proto::schema::Type;
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub use self::generic::{GenericRecord, GenericValue};
+#[cfg(any(feature = "json", feature = "avro"))]
+use self::record::Definitions;
 use crate::error::{Error, ErrorKind, Result};
 
+/// Without JSON and Avro, no definitions to parse.
+#[cfg(not(any(feature = "json", feature = "avro")))]
+#[derive(Default)]
+struct Definitions {}
+
 type Encode<T> = Arc<dyn Fn(&T) -> Result<Bytes> + Send + Sync>;
-/// Decodes a payload. Only [`Schema::auto_consume`] reads the schema it was written with: `None` for a message
-/// without one.
+/// Decodes a payload, written with the schema given: `None` for a message without one. Only the schemas that fetch the
+/// schemas of their messages read it: [`Schema::auto_consume`], the Avro schemas, and a key/value schema of them.
 type Decode<T> = Arc<dyn Fn(&[u8], Option<&SchemaInfo>) -> Result<T> + Send + Sync>;
 
 /// How values of type `T` are encoded, and the schema the broker is told about. Cheap to clone.
@@ -49,6 +62,8 @@ type Decode<T> = Arc<dyn Fn(&[u8], Option<&SchemaInfo>) -> Result<T> + Send + Sy
 /// | `int8()` to `int64()` | `i8` to `i64` | big endian |
 /// | `float32()`, `float64()` | `f32`, `f64` | IEEE 754, big endian |
 /// | `key_value(key, value)` | [`KeyValue<K, V>`] | the key's length, 4 bytes big endian, and bytes, then the value's |
+/// | `json()` (feature `json`) | a record type of `serde` and apache-avro | JSON, described in Avro |
+/// | `avro()` (feature `avro`) | a record type of `serde` and apache-avro | an Avro datum |
 /// | `auto_consume()` | [`GenericRecord`] | decoded with the schema each message was written with |
 pub struct Schema<T> {
     info: SchemaInfo,
@@ -165,6 +180,30 @@ impl SchemaInfo {
         }
         let definition = inline(&key.definition, &value.definition).to_vec();
         Self { name: "KeyValue".to_string(), schema_type: SchemaType::KeyValue, definition, properties }
+    }
+
+    /// The schemas of a key/value schema's key and value, as Java's `KeyValueSchemaInfo` reads them: their names,
+    /// types and properties from its properties, and their definitions from its. Without a type, a part is bytes, as
+    /// in Java.
+    fn parts(&self) -> Result<(SchemaInfo, SchemaInfo)> {
+        let (key, value) = split_inline(&self.definition)?;
+        Ok((self.part("key", key)?, self.part("value", value)?))
+    }
+
+    fn part(&self, side: &str, definition: Option<&[u8]>) -> Result<SchemaInfo> {
+        let property = |name: &str| self.properties.get(&format!("{side}.schema.{name}"));
+        let properties = match property("properties").filter(|json| !json.is_empty()) {
+            Some(json) => serde_json::from_str(json).map_err(|e| {
+                Error::new(ErrorKind::Other, format!("the key/value schema's {side} properties aren't JSON: {e}"))
+            })?,
+            None => BTreeMap::new(),
+        };
+        Ok(SchemaInfo {
+            name: property("name").cloned().unwrap_or_default(),
+            schema_type: property("type").map_or(SchemaType::Bytes, |name| SchemaType::from_java_name(name)),
+            definition: definition.unwrap_or_default().to_vec(),
+            properties,
+        })
     }
 
     /// The name, as Java names its schema of the same type.
@@ -346,15 +385,27 @@ impl<K: 'static, V: 'static> Schema<KeyValue<K, V>> {
             encode: Arc::new(move |pair: &KeyValue<K, V>| {
                 Ok(inline(&encode_key(&pair.key)?, &encode_value(&pair.value)?))
             }),
-            decode: Arc::new(move |data: &[u8], _: Option<&SchemaInfo>| {
+            decode: Arc::new(move |data: &[u8], writer: Option<&SchemaInfo>| {
                 let (key, value) = split_inline(data)?;
+                let (key_writer, value_writer) = part_writers(writer)?;
                 Ok(KeyValue {
-                    key: decode_key(not_null(key, "key")?, None)?,
-                    value: decode_value(not_null(value, "value")?, None)?,
+                    key: decode_key(not_null(key, "key")?, key_writer.as_ref())?,
+                    value: decode_value(not_null(value, "value")?, value_writer.as_ref())?,
                 })
             }),
             generic,
         }
+    }
+}
+
+/// The schemas a key/value message's key and value were written with: the parts of the key/value schema it was
+/// written with, which an Avro key or value reads with.
+fn part_writers(writer: Option<&SchemaInfo>) -> Result<(Option<SchemaInfo>, Option<SchemaInfo>)> {
+    match writer {
+        Some(writer) if writer.schema_type == SchemaType::KeyValue => {
+            writer.parts().map(|(key, value)| (Some(key), Some(value)))
+        }
+        _ => Ok((None, None)),
     }
 }
 
@@ -434,7 +485,7 @@ impl<T> Schema<T> {
         (self.encode)(value)
     }
 
-    /// Decodes a payload written with `writer`, which only [`Schema::auto_consume`] reads: `None` for a message
+    /// Decodes a payload written with `writer`, which the schemas that fetch their messages' read: `None` for a message
     /// without a schema.
     pub(crate) fn decode_with(&self, data: &[u8], writer: Option<&SchemaInfo>) -> Result<T> {
         (self.decode)(data, writer)

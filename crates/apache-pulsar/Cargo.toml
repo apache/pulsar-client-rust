@@ -28,6 +28,9 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+# The JSON and Avro schemas' definitions, which are Avro's, and Avro's encoding. Applications derive `AvroSchema`
+# with apache-avro's `derive` feature.
+apache-avro = { version = "0.23", optional = true }
 apache-pulsar-protocol.workspace = true
 buffa.workspace = true
 bytes.workspace = true
@@ -38,28 +41,35 @@ futures-channel = "0.3"
 futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 rustls-native-certs = "0.8"
+# The values of the JSON and Avro schemas.
+serde = { version = "1", optional = true }
 # Key/value schemas record their key's and value's properties as JSON, as Java's do.
 serde_json = "1"
 thiserror.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+apache-avro = { version = "0.23", features = ["derive"] }
 apache-pulsar-testkit = { path = "../apache-pulsar-testkit" }
 base64 = "0.22"
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 libtest-mimic = "0.8"
 rcgen = "0.14"
 ring = "0.17"
+serde = { version = "1", features = ["derive"] }
 testcontainers = { version = "0.28", features = ["blocking", "watchdog"] }
 
 # The compression codecs, each behind a feature, all on by default (docs/3-protocol.md §6). ZSTD binds the C
 # `libzstd`, so building it needs a C compiler.
 [features]
-default = ["lz4", "zlib", "snappy", "zstd"]
+default = ["lz4", "zlib", "snappy", "zstd", "json", "avro"]
 lz4 = ["apache-pulsar-protocol/lz4"]
 zlib = ["apache-pulsar-protocol/zlib"]
 snappy = ["apache-pulsar-protocol/snappy"]
 zstd = ["apache-pulsar-protocol/zstd"]
+# The JSON and Avro schemas, on by default (docs/7-api.md §8). Both describe their records in Avro, as Java's do.
+json = ["dep:apache-avro", "dep:serde"]
+avro = ["dep:apache-avro", "dep:serde"]
 
 # Against a broker and a proxy in Docker. Not run by `cargo test`: `cargo test -p apache-pulsar --test integration`.
 [[test]]
