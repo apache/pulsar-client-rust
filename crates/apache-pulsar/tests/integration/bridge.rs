@@ -460,7 +460,7 @@ fn v4_and_rust_clients_across_a_forced_migration(env: &Env) {
     let v4_producer = env.v4_producer(&topic);
     let publishing = |s: &serde_json::Value| s["publishers"].as_array().is_some_and(|p| !p.is_empty());
     eventually("the v4 producer attaches", || stored_in(env, &topic, partitions).iter().all(publishing));
-    let (legacy, rust) = run(async {
+    let (counted, from_v4, rust) = run(async {
         let client = proxy_client(env).build().await.unwrap();
         let queue = queue_consumer(&client, Schema::bytes(), &topic, SubscriptionInitialPosition::Earliest).await;
         let producer = client.new_producer(Schema::bytes()).topic(&topic).create().await.unwrap();
@@ -473,23 +473,23 @@ fn v4_and_rust_clients_across_a_forced_migration(env: &Env) {
             let id = message.send().await.unwrap();
             assert_eq!(segment(&id) >= u64::from(partitions), i >= 20, "{value} sent to {id}");
         }
-        // The regular topic is terminated: what it stored is final.
-        let legacy = messages_in(env, &topic, partitions);
-        let from_queue = text(&receive_all(&queue, legacy + 20).await);
-        assert_eq!(from_queue.len(), legacy + 20);
+        // The regular topic is terminated: what it stored is final, and the v4 consumer reads all of it. Its count of
+        // messages in can be greater: the broker counts a message when it takes the send, before storing it, so it
+        // also counts the v4 producer's sends that the termination failed.
+        let counted = messages_in(env, &topic, partitions);
+        let drained = || attached_and_drained(env, &topic, partitions, "v4");
+        wait_for(drained, "the v4 consumer reads the regular topic to its end").await;
+        let from_v4 = env.stop(v4_consumer);
+        let from_queue = text(&receive_all(&queue, from_v4.len() + 20).await);
+        assert_eq!(from_queue.len(), from_v4.len() + 20);
         let read_by_queue: BTreeSet<&String> = from_queue.iter().collect();
         assert!(rust.iter().all(|value| read_by_queue.contains(value)));
         client.close().await.unwrap();
-        (legacy, rust)
+        (counted, from_v4, rust)
     });
     eventually("the v4 producer is refused", || env.output(&v4_producer).contains("TopicTerminated"));
     env.stop_output(v4_producer);
-    assert_eq!(messages_in(env, &topic, partitions), legacy);
-    eventually("the v4 consumer reads the regular topic to its end", || {
-        attached_and_drained(env, &topic, partitions, "v4")
-    });
-    let from_v4 = env.stop(v4_consumer);
-    assert_eq!(from_v4.len(), legacy);
+    assert_eq!(messages_in(env, &topic, partitions), counted);
     let read_by_v4: BTreeSet<&str> = from_v4.iter().map(|m| m.value.as_str()).collect();
     assert!(rust[..20].iter().all(|value| read_by_v4.contains(value.as_str())));
     assert!(rust[20..].iter().all(|value| !read_by_v4.contains(value.as_str())));
