@@ -48,6 +48,15 @@ jobs:
       - run: cargo clippy -p apache-pulsar --no-default-features -- -D warnings
       - run: cargo test --workspace
 
+  # Windows is built, not tested, at first (docs/8-quality.md §4): the crates and the workspace's binaries, without
+  # the tests, which don't build there yet: the integration tests' testcontainers watchdog uses Unix signals.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo build --locked --workspace --all-features
+
   codegen:
     runs-on: ubuntu-latest
     steps:
