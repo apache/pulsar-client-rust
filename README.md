@@ -54,8 +54,9 @@ client.close().await?;
 
 Each release states the version of the
 [Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) it conforms
-to, and which of the specification's optional capabilities it implements: its section of [CHANGELOG.md](CHANGELOG.md)
-has both. The client conforms to version 1.0. It implements the required core, C1 to C15
+to, and which of the specification's optional capabilities it implements, in its
+[release notes](https://github.com/apache/pulsar-client-rust/releases). The client conforms to version 1.0. It
+implements the required core, C1 to C15
 ([*conformance*](https://github.com/apache/pulsar/blob/master/spec/scalable-topics/conformance.md) §2), and these of
 the optional capabilities (§3):
 

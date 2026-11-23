@@ -58,8 +58,8 @@ a layout change. It is written so that it could later grow into a suite every SD
 - **Crate versions:** 0.x until the API settles. 1.0 once the required core is complete and the API has been
   used in practice.
 - **Spec version:** each release states the spec version it conforms to (1.0 to start), and which optional
-  capabilities it implements: in its section of [CHANGELOG.md](../CHANGELOG.md), and for the current code in the
-  README's Conformance section.
+  capabilities it implements: in its [release notes](https://github.com/apache/pulsar-client-rust/releases), and for
+  the current code in the README's Conformance section.
 - **Brokers:** Pulsar 5.0 or later ([1](1-scope.md) §3).
 - **Serialized identifiers:** MessageId and Checkpoint bytes stay readable by every later release
   (*stability* §4.3). The golden-byte tests guard that.
