@@ -23,14 +23,16 @@ A Rust client for [Apache Pulsar](https://pulsar.apache.org) scalable topics, bu
 [Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) on the
 [compio](https://github.com/compio-rs/compio) runtime.
 
-**Status:** milestones 3 to 5. Producers publish to scalable topics, keeping per-key order across segment splits and
+**Status:** the first release, 0.1.0, is being prepared.
+Producers publish to scalable topics, keeping per-key order across segment splits and
 merges, and to regular `persistent://` topics through the migration bridge. Queue consumers read every segment of a
 topic, following its splits and merges, and acknowledge each message. Stream consumers read the segments the topic's
 controller assigns them, each key in order, share segments by entry bucket when they outnumber them, and acknowledge
 cumulatively. Checkpoint consumers read every segment, parents before their children, or as members of a group the
 segments the controller assigns them, and resume from checkpoints the application keeps, in the Java client's bytes.
 All work in the thread-safe, local and blocking APIs, with token and mTLS authentication, directly or through a proxy.
-Producers batch messages by entry bucket and compress them, as Java's do. The design is in
+Producers batch messages by entry bucket and compress them, as Java's do. Messages carry the Java client's schemas:
+bytes, string, the primitive types, key/value, JSON, Avro and Protobuf, and generic records. The design is in
 [DESIGN.md](DESIGN.md), the milestones in [PLAN.md](PLAN.md).
 
 ```rust
@@ -48,6 +50,26 @@ consumer.acknowledge(message.id()).await?;
 client.close().await?;
 ```
 
+## Conformance
+
+Each release states the version of the
+[Scalable Topics client specification](https://github.com/apache/pulsar/tree/master/spec/scalable-topics) it conforms
+to, and which of the specification's optional capabilities it implements, in its
+[release notes](https://github.com/apache/pulsar-client-rust/releases). The client conforms to version 1.0. It
+implements the required core, C1 to C15
+([*conformance*](https://github.com/apache/pulsar/blob/master/spec/scalable-topics/conformance.md) §2), and these of
+the optional capabilities (§3):
+
+| Capability | Implemented |
+|---|---|
+| Entry-bucketing, producer side | Yes: each batch holds one entry bucket's messages, and each entry is stamped with its bucket hashes. |
+| Migration bridge | Yes: `persistent://` topics, partitioned or not, and short topic names. |
+| Chunking, compression, custom batching | Compression: LZ4, ZLIB, ZSTD and Snappy. No chunking, and no custom batching. |
+| Transactions | No. |
+| Namespace subscription | No. |
+| Dead-letter | No. |
+| End-to-end encryption | No. |
+
 ## Layout
 
 | Path | What it is |
@@ -60,6 +82,8 @@ client.close().await?;
 | `xtask` | Repository tasks: protobuf code generation. |
 
 ## Building and testing
+
+Building needs Rust 1.95 or later, and a C compiler for the ZSTD codec.
 
 ```bash
 cargo test --workspace
