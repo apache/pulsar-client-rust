@@ -24,7 +24,9 @@ use apache_pulsar_protocol::connection::{
     State,
 };
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{BaseCommand, CommandScalableTopicLookup, FeatureFlags, ServerError};
+use apache_pulsar_protocol::proto::{
+    AuthData, BaseCommand, CommandAuthChallenge, CommandScalableTopicLookup, FeatureFlags, ServerError,
+};
 use apache_pulsar_testkit::{Link, SimBroker, reply};
 use buffa::EnumValue;
 
@@ -168,6 +170,58 @@ fn auth_refresh_and_challenge_rounds() {
     }
     let events = link.push(&reply::auth_challenge(b"again"));
     assert_eq!(closed_with(&events), Some(&ConnectionError::TooManyAuthRounds));
+}
+
+/// Ten challenge rounds, a refresh, then ten more: the refresh starts the count over, so a connection the broker
+/// refreshes now and then is never failed by the cap. Java's
+/// `ClientCnxAsyncAuthTest.refreshResetsChallengeRoundCounter`.
+#[test]
+fn a_refresh_starts_the_challenge_rounds_over() {
+    let mut link = connected();
+    let answer_rounds = |link: &mut Link| {
+        for round in 1..=MAX_AUTH_CHALLENGE_ROUNDS {
+            let events = link.push(&reply::auth_challenge(b"again"));
+            assert!(
+                matches!(events.as_slice(), [Event::AuthChallenge { refresh: false, .. }]),
+                "round {round}: {events:?}"
+            );
+            link.client.auth_response(b"answer".to_vec());
+        }
+    };
+    answer_rounds(&mut link);
+    let events = link.push(&reply::auth_challenge(AUTH_REFRESH_SENTINEL));
+    assert!(matches!(events.as_slice(), [Event::AuthChallenge { refresh: true, .. }]), "{events:?}");
+    link.client.auth_response(b"new-token".to_vec());
+    answer_rounds(&mut link);
+    assert_eq!(link.client.state(), State::Ready);
+}
+
+/// Only `PulsarAuthRefresh` asks for fresh credentials. `PulsarAuthInit`, an empty payload, an absent one and any
+/// other are challenges, handed to the driver as they came. Java's
+/// `BinaryAuthenticationExchangeTest.isRefreshSentinelMatchesOnlyTheRefreshPayload`.
+#[test]
+fn only_the_refresh_sentinel_asks_for_fresh_credentials() {
+    let classify = |command: &BaseCommand| {
+        let mut link = connected();
+        match link.push(command).as_slice() {
+            [Event::AuthChallenge { refresh, challenge }] => (*refresh, challenge.to_vec()),
+            events => panic!("one challenge expected: {events:?}"),
+        }
+    };
+    let challenge = |challenge: CommandAuthChallenge| BaseCommand {
+        r#type: Type::AUTH_CHALLENGE.into(),
+        authChallenge: challenge.into(),
+        ..Default::default()
+    };
+    assert_eq!(classify(&reply::auth_challenge(AUTH_REFRESH_SENTINEL)), (true, AUTH_REFRESH_SENTINEL.to_vec()));
+    // Java's `AuthData.INIT_AUTH_DATA`.
+    assert_eq!(classify(&reply::auth_challenge(b"PulsarAuthInit")), (false, b"PulsarAuthInit".to_vec()));
+    assert_eq!(classify(&reply::auth_challenge(b"")), (false, vec![]));
+    assert_eq!(classify(&reply::auth_challenge(b"challenge")), (false, b"challenge".to_vec()));
+    // Auth data without its bytes, and no auth data at all.
+    let without_bytes = CommandAuthChallenge { challenge: AuthData::default().into(), ..Default::default() };
+    assert_eq!(classify(&challenge(without_bytes)), (false, vec![]));
+    assert_eq!(classify(&challenge(CommandAuthChallenge::default())), (false, vec![]));
 }
 
 #[test]

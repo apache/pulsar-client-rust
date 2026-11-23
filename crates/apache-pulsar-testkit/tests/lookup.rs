@@ -103,6 +103,10 @@ fn service_urls() {
         vec![hp("a:6651"), hp("b:7000"), apache_pulsar_protocol::lookup::HostPort { host: "::1".into(), port: 6000 }]
     );
     assert!(ServiceUrl::parse("http://a:8080").is_err());
+    // A web service URL over TLS is refused, the reason naming the scheme to use. Java's
+    // `PulsarClientBuilderV5Test.testRejectsHttpsWithGuidance`.
+    let error = ServiceUrl::parse("https://a:8443").unwrap_err();
+    assert!(error.reason.contains("pulsar+ssl://"), "{error}");
     assert!(ServiceUrl::parse("pulsar://a:x").is_err());
     assert!(ServiceUrl::parse("pulsar://").is_err());
 }

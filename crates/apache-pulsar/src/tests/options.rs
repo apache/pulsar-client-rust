@@ -90,6 +90,11 @@ fn the_builder_refuses_incomplete_or_contradictory_options() {
 
     let error = error_of(local::PulsarClient::builder().service_url("http://broker:8080").into_config());
     assert_eq!(error.kind(), ErrorKind::InvalidServiceUrl, "{error}");
+    // An empty or blank URL fails the build too. Java's `PulsarClientBuilderV5Test.testRejectsNullAndBlank`.
+    for url in ["", "   "] {
+        let error = error_of(futures_executor::block_on(local::PulsarClient::builder().service_url(url).build()));
+        assert_eq!(error.kind(), ErrorKind::InvalidServiceUrl, "{url:?}: {error}");
+    }
 
     let tls = TlsAuthentication::from_pem(Vec::new(), Vec::new());
     let error =
