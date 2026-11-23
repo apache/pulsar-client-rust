@@ -53,11 +53,38 @@ client.close().await?;
 | Path | What it is |
 |---|---|
 | `crates/apache-pulsar` | The client: producers, Queue, Stream and Checkpoint consumers, layout watches, connections, the pool, lookup, authentication, TLS, the memory limit, and the thread-safe, local and blocking APIs. |
+| `crates/apache-pulsar/examples` | Runnable examples: a producer, the Queue, Stream and Checkpoint consumers, the local and blocking APIs, schemas, TLS and token authentication, and pipelined sends. |
 | `crates/apache-pulsar-protocol` | The sans-IO protocol core: generated protobuf code, framing, the connection, producer and consumer state machines, entry decoding, layouts and routing, message ids. Internal; not a stable API. |
 | `crates/apache-pulsar-testkit` | The simulated broker and cluster, and the deterministic tests of the protocol state machines. Not published. |
 | `checks/` | Milestone 0 checks: compio behavior, and the handshake against a real broker. |
 | `tools/java-vectors` | Generates test vectors from the Java client. |
 | `xtask` | Repository tasks: protobuf code generation. |
+
+## Examples
+
+`crates/apache-pulsar/examples` has one example for each part of the API. They run against a broker on this machine,
+or the one `PULSAR_URL` names. Start a standalone broker that advertises `localhost`, and once it is up, which takes
+a few seconds, run one:
+
+```bash
+docker run -d --rm --name pulsar -p 6650:6650 -p 8080:8080 apachepulsar/pulsar:5.0.1 bash -c "echo advertisedAddress=localhost >> conf/standalone.conf && exec bin/pulsar standalone"
+```
+
+```bash
+cargo run --example producer
+```
+
+| Example | What it shows |
+|---|---|
+| `producer` | Keyed messages with properties, a flush and a close, on the default API from a Tokio runtime. |
+| `queue_consumer` | A Shared subscription on every segment: each message acknowledged, one negatively and delivered again. |
+| `stream_consumer` | Segments the controller assigns, each key in order, and cumulative acknowledgments. |
+| `checkpoint_consumer` | No subscription: a checkpoint kept in a file, and a second run that reads on from it. |
+| `local` | The local API: a client per thread, each on its own compio event loop. |
+| `blocking` | The blocking API, without an async runtime. |
+| `schemas` | JSON, Avro and key/value schemas for a struct, and generic records. |
+| `authentication` | TLS with a trusted CA, and a token, a token file or a client certificate. |
+| `pipelining` | Many sends in flight, in order, with `buffered`, `FuturesOrdered` and `join_all`. |
 
 ## Building and testing
 
