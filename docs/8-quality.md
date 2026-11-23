@@ -80,7 +80,7 @@ a layout change. It is written so that it could later grow into a suite every SD
 
 Releases follow the ASF process: a signed source release, a vote on dev@, and then publishing to crates.io from
 the voted source. Every source file carries the ASF license header, and the repository has `LICENSE` and
-`NOTICE` files.
+`NOTICE` files. The steps, and the scripts in `build-support/` they use, are in [RELEASE.md](../RELEASE.md).
 
 ## 6. Performance
 
