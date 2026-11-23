@@ -155,6 +155,7 @@ dependencies = [
  "buffa-types",
  "bytes",
  "compio",
+ "futures",
  "futures-channel",
  "futures-executor",
  "futures-util",
@@ -169,6 +170,7 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

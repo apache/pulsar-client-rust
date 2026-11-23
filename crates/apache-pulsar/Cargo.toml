@@ -65,6 +65,8 @@ apache-avro = { version = "0.23", features = ["derive"] }
 apache-pulsar-testkit = { path = "../apache-pulsar-testkit" }
 base64 = "0.22"
 buffa-types = { version = "=0.9.2", features = ["reflect"] }
+# The examples' combinators, and the runtime the default API's examples run on: its futures run on any executor.
+futures = "0.3"
 jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 libtest-mimic = "0.8"
 prost-types = "0.14"
@@ -72,6 +74,7 @@ rcgen = "0.14"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 testcontainers = { version = "0.28", features = ["blocking", "watchdog"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # The compression codecs, each behind a feature, all on by default (docs/3-protocol.md §6). ZSTD binds the C
 # `libzstd`, so building it needs a C compiler.
@@ -88,6 +91,11 @@ avro = ["dep:apache-avro", "dep:serde"]
 # prost's.
 protobuf = ["dep:buffa-descriptor", "dep:base64"]
 prost = ["protobuf", "dep:prost"]
+
+# The JSON and Avro schemas, and the struct deriving apache-avro's `AvroSchema`.
+[[example]]
+name = "schemas"
+required-features = ["json", "avro"]
 
 # Against a broker and a proxy in Docker. Not run by `cargo test`: `cargo test -p apache-pulsar --test integration`.
 [[test]]
