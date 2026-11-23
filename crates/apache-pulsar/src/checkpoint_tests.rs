@@ -23,7 +23,9 @@
 use std::time::Duration;
 
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{MessageMetadata, ServerError};
+use apache_pulsar_protocol::proto::{FeatureFlags, MessageMetadata, ServerError};
+use apache_pulsar_testkit::LookupAnswer;
+use apache_pulsar_testkit::scalable::World;
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 
@@ -72,6 +74,12 @@ fn resumes_from_a_checkpoint() {
         let first = consumer.receive_batch(4, Duration::from_secs(60)).await.unwrap();
         let checkpoint = consumer.checkpoint().await.unwrap();
         consumer.close().await.unwrap();
+        // Closing again is fine, and sends nothing more (C14).
+        consumer.close().await.unwrap();
+        assert_eq!(server.received(Type::CLOSE_CONSUMER), 2);
+        assert_eq!(consumer.receive().await.unwrap_err().kind(), ErrorKind::AlreadyClosed);
+        assert_eq!(consumer.receive_timeout(Duration::ZERO).await.unwrap_err().kind(), ErrorKind::AlreadyClosed);
+        assert_eq!(consumer.receive_batch(1, Duration::ZERO).await.unwrap_err().kind(), ErrorKind::AlreadyClosed);
         assert_eq!(consumer.checkpoint().await.unwrap_err().kind(), ErrorKind::AlreadyClosed);
         // Restored from its bytes, as an application keeps it.
         let resumed = reader(&client, Checkpoint::from_bytes(&checkpoint.to_bytes()).unwrap()).await;
@@ -100,6 +108,27 @@ fn a_latest_consumer_reads_what_comes_after_it_and_its_checkpoint_says_so() {
         let restored = reader(&client, at_start).await;
         assert_eq!(restored.receive().await.unwrap().value().unwrap(), "new");
         assert!(restored.receive_timeout(Duration::from_millis(50)).await.unwrap().is_none());
+        client.close().await.unwrap();
+    });
+}
+
+/// Checkpoint consumers have no subscription on the brokers: two from the earliest position don't share the messages,
+/// each reads every one, on every segment. Java's `V5MultipleConsumersTest.testCheckpointConsumersEachSeeFullStream`.
+#[test]
+fn consumers_from_the_earliest_position_each_read_every_message() {
+    run(async {
+        let server = WorldServer::start(world(2)).await;
+        let sent: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
+        for (i, value) in sent.iter().enumerate() {
+            publish(&server, i as u64 % 2, value);
+        }
+        let client = local_client(&server).await;
+        let a = reader(&client, Checkpoint::earliest()).await;
+        let b = reader(&client, Checkpoint::earliest()).await;
+        for consumer in [&a, &b] {
+            let got = consumer.receive_batch(sent.len(), Duration::from_secs(60)).await.unwrap();
+            assert_eq!(sorted(values(&got)), sent);
+        }
         client.close().await.unwrap();
     });
 }
@@ -198,6 +227,37 @@ fn a_refused_reader_fails_the_create_and_closes_the_rest() {
         wait_until("the other reader is closed", || server.received(Type::CLOSE_CONSUMER) == 1).await;
         let error = client.new_checkpoint_consumer(Schema::string()).create().await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
+        client.close().await.unwrap();
+    });
+}
+
+/// With auto-creation off, a create on a topic that doesn't exist fails with NotFound. Java's
+/// `V5ScalableTopicAutoCreateTest.testNoAutoCreateWhenNamespaceDisallows`.
+#[test]
+fn a_missing_topic_is_not_found() {
+    run(async {
+        let mut world = World::default();
+        world.auto_create = false;
+        let server = WorldServer::start(world).await;
+        let client = local_client(&server).await;
+        let error = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).create().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+        client.close().await.unwrap();
+    });
+}
+
+/// A broker that doesn't advertise scalable topics is refused: the create fails before it asks the broker for the
+/// topic's layout (C15).
+#[test]
+fn a_broker_without_scalable_topics_is_refused() {
+    run(async {
+        let mut world = world(1);
+        world.features = FeatureFlags { supports_scalable_topics: Some(false), ..Default::default() };
+        let server = WorldServer::start(world).await;
+        let client = local_client(&server).await;
+        let error = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).create().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnsupportedBroker, "{error}");
+        assert_eq!((server.received(Type::SCALABLE_TOPIC_LOOKUP), server.received(Type::SUBSCRIBE)), (0, 0));
         client.close().await.unwrap();
     });
 }
@@ -403,6 +463,26 @@ fn a_refused_registration_fails_the_create() {
         let create = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).consumer_group(GROUP).create();
         assert_eq!(create.await.unwrap_err().kind(), ErrorKind::Authorization);
         assert_eq!(server.received(Type::SUBSCRIBE), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// A lookup of the topic the broker refuses fails the create, alone or in a group, with the broker's category, before
+/// the topic's layout is asked for. Java's `V5AuthErrorTest.testLookupNotAuthorized`.
+#[test]
+fn a_refused_lookup_fails_the_create() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        server.with(|w| {
+            w.lookup = LookupAnswer::Fail { error: ServerError::AuthorizationError, message: "not you".into() }
+        });
+        let client = local_client(&server).await;
+        let alone = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).create();
+        assert_eq!(alone.await.unwrap_err().kind(), ErrorKind::Authorization);
+        let member = client.new_checkpoint_consumer(Schema::string()).topic(TOPIC).consumer_group(GROUP).create();
+        assert_eq!(member.await.unwrap_err().kind(), ErrorKind::Authorization);
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_LOOKUP), 0);
+        assert_eq!((server.received(Type::SCALABLE_TOPIC_SUBSCRIBE), server.received(Type::SUBSCRIBE)), (0, 0));
         client.close().await.unwrap();
     });
 }
