@@ -29,7 +29,7 @@ comes in three APIs: thread-safe, whose futures run on any runtime; local, for a
 themselves; and blocking.
 
 The [API documentation](https://docs.rs/apache-pulsar) has the examples. The
-[release notes](https://github.com/apache/pulsar-client-rust/blob/main/CHANGELOG.md) say which version of the
+[release notes](https://github.com/apache/pulsar-client-rust/releases) say which version of the
 specification each release conforms to, and which of its optional capabilities it implements.
 
 ## Requirements
