@@ -176,20 +176,22 @@ covered.
 The schemas land in six pull requests: the primitive types and C11's typed error; key/value; generic records, with
 each message decoded by the schema of its version; JSON and Avro; Protobuf's native type; Java V5's Protobuf type.
 
-Schemas so far: bytes, string, the primitive types, key/value, generic records, JSON, Avro and Protobuf's native type,
-named and encoded as Java's, with a public `SchemaInfo` and `SchemaType`. JSON, Avro and Protobuf are features, on by
-default, through `serde`, apache-avro, buffa's descriptors and prost. The simulated cluster keeps a schema history per
-topic, as the broker does, and serves a schema by version. C11 holds there and against a 5.0.1 broker: a schema of
-another type than the topic's fails with `IncompatibleSchema` for a Shared producer's sends, an exclusive producer's
-create, and each kind of consumer's subscribe; the first consumer of a new topic registers its schema; and a topic
-with messages but no schema refuses a schema. Java reads the values of each schema that Rust sends, and Rust those
-Java sends, typed and as generic records. Generic and Avro consumers fetch the schema of each version they meet, and
-decode each message with its own: against 5.0.1, Java's V5 evolution test holds across the two clients, a second Avro
-version registering after a split and both clients reading the first version's records with it. For Protobuf's native
-type, Rust declares the descriptors Java declares for the same message, and each client reads the other's messages,
-typed and generic; Java V5's `Schema.protobuf`, type `PROTOBUF`, comes next. Key/value is Java's inline encoding; its
-separated one, with the key in the message's key, comes later. Java V5's `autoProduceBytes()` and
-`generic(SchemaInfo)`, which the spec's standard set doesn't name, aren't planned yet.
+The schemas are done: bytes, string, the primitive types, key/value, generic records, JSON, Avro, and Java's two
+Protobuf schemas, named and encoded as Java's, with a public `SchemaInfo` and `SchemaType`. JSON, Avro and Protobuf
+are features, on by default, through `serde`, apache-avro, buffa's descriptors and prost. The simulated cluster keeps
+a schema history per topic, as the broker does, and serves a schema by version. C11 holds there and against a 5.0.1
+broker: a schema of another type than the topic's fails with `IncompatibleSchema` for a Shared producer's sends, an
+exclusive producer's create, and each kind of consumer's subscribe; the first consumer of a new topic registers its
+schema; and a topic with messages but no schema refuses a schema. Java reads the values of each schema that Rust
+sends, and Rust those Java sends, typed and as generic records. Generic and Avro consumers fetch the schema of each
+version they meet, and decode each message with its own: against 5.0.1, Java's V5 evolution test holds across the two
+clients, a second Avro version registering after a split and both clients reading the first version's records with it.
+For Protobuf, Rust declares what Java declares for the same message: its descriptors for `PROTOBUF_NATIVE`, and for
+Java V5's `Schema.protobuf`, type `PROTOBUF`, the same description in Avro, so that Rust's producers join the version
+Java's registered. Neither client reads `PROTOBUF` as generic records, whose definition doesn't say how Protobuf
+encodes the message (J22). Key/value is Java's inline encoding; its separated one, with the key in the message's key,
+comes later. Java V5's `autoProduceBytes()` and `generic(SchemaInfo)`, which the spec's standard set doesn't name,
+aren't planned yet.
 
 The migration bridge's end-to-end tests run against 5.0.1, on partitioned and non-partitioned topics, with Java v4
 clients running alongside (`tests/integration/bridge.rs`):

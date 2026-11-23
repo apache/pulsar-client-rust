@@ -279,14 +279,25 @@ Built-in schemas come in this order:
    - Generic records of either are `serde_json`'s and apache-avro's values, with Java V5's `fields()` and
      `field(name)`;
 5. Protobuf's native type: `Schema::protobuf_native()` for a buffa type and `Schema::prost_native(descriptors)` for a
-   prost type, Java's `PROTOBUF_NATIVE` (v4's `Schema.PROTOBUF_NATIVE`; Java V5's factory has none). Two features,
-   on by default: `protobuf`, which reads descriptors with buffa's and takes buffa's types, and `prost`, prost's.
+   prost type, Java's `PROTOBUF_NATIVE` (v4's `Schema.PROTOBUF_NATIVE`; Java V5's factory has none,
+   [J22](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). Two features, on by default: `protobuf`,
+   which reads descriptors with buffa's and takes buffa's types, and `prost`, prost's.
    - The broker is told the descriptors of the message's file and of those it imports, as Java tells it, and checks
      a new version's against them. A buffa type brings its descriptors (buffa-build's `generate_reflection`); a
      prost type is given the `FileDescriptorSet` it was generated from, and its `prost::Name`.
    - Generic records of it are buffa's dynamic messages, read with the descriptors their version declares, with
      Java V5's `fields()` and `field(name)`;
-6. Java V5's `Schema.protobuf`, type `PROTOBUF`, which declares an Avro-described record, for the same types.
+6. Java V5's Protobuf type: `Schema::protobuf()` for a buffa type and `Schema::prost(descriptors)` for a prost type,
+   Java V5's `Schema.protobuf(Class)`, type `PROTOBUF`, behind the same features, with the same descriptors.
+   - The broker is told Avro's description of the message, as Java tells it: what avro-protobuf makes of the
+     descriptors, a record for each message, written as Avro writes it, with `PROTOBUF_NATIVE`'s properties. The
+     broker compares two definitions as Avro schemas, so a Rust producer joins the version a Java producer
+     registered.
+   - Where Java's description fails, so do `protobuf()` and `prost()`, with `InvalidConfiguration`: for a group, or
+     a default that Avro can't hold, a `bytes` field's or a float's infinity or NaN.
+   - Generic records of it fail to decode: the definition describes the message in Avro, not how Protobuf encodes
+     it, and Java's own `autoConsume()` can't subscribe to such a topic
+     ([J22](../DESIGN.md#java-client-and-broker-fixes-to-propose-upstream)). `PROTOBUF_NATIVE` has them.
 
 ## 9. Lifetime, close and drop
 

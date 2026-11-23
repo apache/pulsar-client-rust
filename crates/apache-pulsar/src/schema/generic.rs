@@ -128,9 +128,10 @@ impl Schema<GenericRecord> {
     /// message's [`value`](crate::Message::value), and the next message of that version fetches again.
     ///
     /// The broker doesn't check this schema against the topic's, so it reads any topic, and registers none. It
-    /// decodes the primitive types, key/value, and with their features JSON, Avro and Protobuf's `PROTOBUF_NATIVE`;
-    /// values of Java V5's `PROTOBUF` fail to decode, as this client doesn't read them yet. Producers don't take it:
-    /// they fail to create with [`ErrorKind::InvalidConfiguration`], as Java v4's do.
+    /// decodes the primitive types, key/value, and with their features JSON, Avro and Protobuf's `PROTOBUF_NATIVE`.
+    /// Values of Java V5's `PROTOBUF` fail to decode: its definition describes the message in Avro, not how Protobuf
+    /// encodes it, and Java's own `autoConsume()` can't read them either. Producers don't take it: they fail to
+    /// create with [`ErrorKind::InvalidConfiguration`], as Java v4's do.
     pub fn auto_consume() -> Self {
         let definitions = Definitions::default();
         Self {
@@ -171,10 +172,7 @@ fn decode_value(definitions: &Definitions, data: &[u8], writer: &SchemaInfo) -> 
         SchemaType::Avro => avro(definitions, data, writer)?,
         SchemaType::ProtobufNative => protobuf_native(definitions, data, writer)?,
         _ => {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("generic records of {name} schemas aren't supported yet"),
-            ));
+            return Err(Error::new(ErrorKind::Other, format!("generic records of {name} schemas aren't supported")));
         }
     })
 }

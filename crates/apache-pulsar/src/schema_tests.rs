@@ -499,13 +499,7 @@ fn protobuf_messages_reach_a_consumer() {
     run(async {
         let schema = Schema::<Timestamp>::protobuf_native();
         round_trip(schema.clone(), Timestamp { seconds: 5, nanos: 7, ..Default::default() }).await;
-        let definition: serde_json::Value = serde_json::from_slice(schema.info().definition()).unwrap();
-        let set = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            definition["fileDescriptorSet"].as_str().unwrap(),
-        )
-        .unwrap();
-        let prost = Schema::<prost_types::Timestamp>::prost_native(&set).unwrap();
+        let prost = Schema::<prost_types::Timestamp>::prost_native(&timestamp_descriptors()).unwrap();
         round_trip(prost.clone(), prost_types::Timestamp { seconds: 6, nanos: 8 }).await;
 
         let server = WorldServer::start(world(1)).await;
@@ -520,4 +514,38 @@ fn protobuf_messages_reach_a_consumer() {
         assert_eq!(schema_fetches(&server), 1);
         client.close().await.unwrap();
     });
+}
+
+/// Java's V5 round-trip test, for Protobuf: a message of `Schema.protobuf`, described in Avro, reaches a consumer of
+/// its schema, which registered it, of a buffa type and of a prost type. A generic consumer receives it, and can't read
+/// it, as Java's can't (`DESIGN.md`'s J22).
+#[cfg(feature = "prost")]
+#[test]
+fn protobuf_messages_described_in_avro_reach_a_consumer() {
+    use buffa_types::google::protobuf::Timestamp;
+
+    run(async {
+        round_trip(Schema::<Timestamp>::protobuf().unwrap(), Timestamp { seconds: 5, nanos: 7, ..Default::default() })
+            .await;
+        let prost = Schema::<prost_types::Timestamp>::prost(&timestamp_descriptors()).unwrap();
+        round_trip(prost.clone(), prost_types::Timestamp { seconds: 6, nanos: 8 }).await;
+
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(prost).topic(TOPIC).create().await.unwrap();
+        producer.send(prost_types::Timestamp { seconds: 9, nanos: 0 }).await.unwrap();
+        let consumer = queue(&client, Schema::auto_consume(), "generic").await.unwrap();
+        let error = consumer.receive().await.unwrap().value().unwrap_err();
+        assert!(error.to_string().contains("generic records of PROTOBUF schemas aren't supported"), "{error}");
+        client.close().await.unwrap();
+    });
+}
+
+/// The descriptors of `google.protobuf.Timestamp`, as prost-build writes them: buffa's.
+#[cfg(feature = "prost")]
+fn timestamp_descriptors() -> Vec<u8> {
+    let schema = Schema::<buffa_types::google::protobuf::Timestamp>::protobuf_native();
+    let definition: serde_json::Value = serde_json::from_slice(schema.info().definition()).unwrap();
+    let set = definition["fileDescriptorSet"].as_str().unwrap();
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, set).unwrap()
 }
