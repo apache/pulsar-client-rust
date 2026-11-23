@@ -24,7 +24,9 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{KeyValue, MessageMetadata, ServerError};
+use apache_pulsar_protocol::proto::{FeatureFlags, KeyValue, MessageMetadata, ServerError};
+use apache_pulsar_testkit::LookupAnswer;
+use apache_pulsar_testkit::scalable::World;
 use bytes::Bytes;
 use futures_util::future::Either;
 use futures_util::{FutureExt, StreamExt};
@@ -209,6 +211,86 @@ fn a_dropped_receive_loses_no_message() {
         drop(batch);
         publish(&server, 0, "d");
         assert_eq!(values(&consumer.receive_batch(2, Duration::from_secs(60)).await.unwrap()), ["c", "d"]);
+        client.close().await.unwrap();
+    });
+}
+
+/// Receives waiting at once are answered in the order they were first polled: a newer one, with a timeout or not, or
+/// a batch receive, takes no message before an older one. Java's
+/// `V5ReceiveQueueTest.olderPendingReceiveIsServedBeforeANewerOne`, `olderPendingReceiveIsServedBeforeANewerTimedOne`
+/// and `receiveMultiDoesNotOvertakeAnOlderPendingReceive`.
+#[test]
+fn waiting_receives_are_answered_in_the_order_they_were_polled() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let consumer = consumer(&client).await;
+        // Two receives.
+        let mut older = Box::pin(consumer.receive());
+        assert!((&mut older).now_or_never().is_none());
+        let mut newer = Box::pin(consumer.receive());
+        assert!((&mut newer).now_or_never().is_none());
+        publish(&server, 0, "a");
+        publish(&server, 0, "b");
+        assert_eq!(older.await.unwrap().value().unwrap(), "a");
+        assert_eq!(newer.await.unwrap().value().unwrap(), "b");
+        // A receive, then one with a timeout.
+        let mut older = Box::pin(consumer.receive());
+        assert!((&mut older).now_or_never().is_none());
+        let mut timed = Box::pin(consumer.receive_timeout(Duration::from_secs(60)));
+        assert!((&mut timed).now_or_never().is_none());
+        publish(&server, 0, "c");
+        publish(&server, 0, "d");
+        assert_eq!(older.await.unwrap().value().unwrap(), "c");
+        assert_eq!(timed.await.unwrap().unwrap().value().unwrap(), "d");
+        // A receive, then a batch receive.
+        let mut older = Box::pin(consumer.receive());
+        assert!((&mut older).now_or_never().is_none());
+        let mut batch = Box::pin(consumer.receive_batch(2, Duration::from_secs(60)));
+        assert!((&mut batch).now_or_never().is_none());
+        for value in ["e", "f", "g"] {
+            publish(&server, 0, value);
+        }
+        assert_eq!(older.await.unwrap().value().unwrap(), "e");
+        assert_eq!(values(&batch.await.unwrap()), ["f", "g"]);
+        client.close().await.unwrap();
+    });
+}
+
+/// The broker pushes what the receiver queue's permits allow, and gets as many again each time the application took
+/// half of them, by a batch receive or by receives with a timeout: reading resumes. Java's
+/// `V5ReceiveQueueTest.resumeViaReceiveMultiDrain` and `resumeViaTimedReceiveDrain`, whose receive queue is the
+/// segments' permits here.
+#[test]
+fn taking_half_the_receiver_queue_grants_as_many_permits_again() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let consumer = client
+            .new_queue_consumer(Schema::string())
+            .topic(TOPIC)
+            .subscription_name(SUB)
+            .subscription_initial_position(SubscriptionInitialPosition::Earliest)
+            .receiver_queue_size(4)
+            .subscribe()
+            .await
+            .unwrap();
+        let flows = || -> Vec<u32> {
+            server.world.borrow().received(Type::FLOW).iter().map(|c| c.flow.messagePermits).collect()
+        };
+        for i in 0..8 {
+            publish(&server, 0, &format!("m{i}"));
+        }
+        assert_eq!(values(&consumer.receive_batch(2, Duration::from_secs(60)).await.unwrap()), ["m0", "m1"]);
+        wait_until("the batch receive's permits go out", || flows() == [4, 2]).await;
+        for value in ["m2", "m3"] {
+            let message = consumer.receive_timeout(Duration::from_secs(60)).await.unwrap().unwrap();
+            assert_eq!(message.value().unwrap(), value);
+        }
+        wait_until("the timed receives' permits go out", || flows() == [4, 2, 2]).await;
+        // The broker pushed the rest on those permits.
+        let rest = consumer.receive_batch(4, Duration::from_secs(60)).await.unwrap();
+        assert_eq!(values(&rest), ["m4", "m5", "m6", "m7"]);
         client.close().await.unwrap();
     });
 }
@@ -401,6 +483,57 @@ fn a_refused_subscribe_fails_with_the_brokers_error_and_closes_the_rest() {
         assert_eq!(error.kind(), ErrorKind::Authorization, "{error}");
         wait_until("the other segment's consumer is closed", || server.received(Type::CLOSE_CONSUMER) == 1).await;
         assert_eq!(consumers(&server, 1), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// A lookup of the topic the broker refuses fails the subscribe with the broker's category, before the topic's layout
+/// is asked for. Java's `V5AuthErrorTest.testLookupNotAuthorized`.
+#[test]
+fn a_refused_lookup_fails_the_subscribe() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        server.with(|w| {
+            w.lookup = LookupAnswer::Fail { error: ServerError::AuthorizationError, message: "not you".into() }
+        });
+        let client = local_client(&server).await;
+        let subscribe = client.new_queue_consumer(Schema::bytes()).topic(TOPIC).subscription_name(SUB).subscribe();
+        let error = subscribe.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authorization, "{error}");
+        assert_eq!((server.received(Type::SCALABLE_TOPIC_LOOKUP), server.received(Type::SUBSCRIBE)), (0, 0));
+        client.close().await.unwrap();
+    });
+}
+
+/// With auto-creation off, a subscribe to a topic that doesn't exist fails with NotFound. Java's
+/// `V5ScalableTopicAutoCreateTest.testNoAutoCreateWhenNamespaceDisallows`.
+#[test]
+fn a_missing_topic_is_not_found() {
+    run(async {
+        let mut world = World::default();
+        world.auto_create = false;
+        let server = WorldServer::start(world).await;
+        let client = local_client(&server).await;
+        let subscribe = client.new_queue_consumer(Schema::bytes()).topic(TOPIC).subscription_name(SUB).subscribe();
+        let error = subscribe.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+        client.close().await.unwrap();
+    });
+}
+
+/// A broker that doesn't advertise scalable topics is refused: the subscribe fails before it asks the broker for the
+/// topic's layout (C15).
+#[test]
+fn a_broker_without_scalable_topics_is_refused() {
+    run(async {
+        let mut world = world(1);
+        world.features = FeatureFlags { supports_scalable_topics: Some(false), ..Default::default() };
+        let server = WorldServer::start(world).await;
+        let client = local_client(&server).await;
+        let subscribe = client.new_queue_consumer(Schema::bytes()).topic(TOPIC).subscription_name(SUB).subscribe();
+        let error = subscribe.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnsupportedBroker, "{error}");
+        assert_eq!((server.received(Type::SCALABLE_TOPIC_LOOKUP), server.received(Type::SUBSCRIBE)), (0, 0));
         client.close().await.unwrap();
     });
 }

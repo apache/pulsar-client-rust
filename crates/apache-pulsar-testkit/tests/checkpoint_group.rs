@@ -119,10 +119,15 @@ fn members_of_a_group_share_the_segments() {
     assert_eq!(h.members[a].consumer.segments().collect::<Vec<_>>(), [0, 2]);
 }
 
-/// With more members than segments, the segment goes to one member, and the others idle: a reader can't share it.
+/// With more members than segments, the segment goes whole to one member, and the others idle: a reader can't share
+/// it. The segment's four entry buckets would let the controller share it among the members of a Stream group: their
+/// registration as Checkpoint consumers keeps it whole. Java's
+/// `V5CheckpointConsumerGroupTest.testMembersOutnumberingSegmentsDeliverEachMessageOnce`.
 #[test]
 fn members_outnumbering_the_segments_deliver_each_message_once() {
-    let mut h = GroupHarness::new(world(1), TOPIC, GROUP);
+    let mut world = world(1);
+    world.set_buckets(TOPIC, 0, 4);
+    let mut h = GroupHarness::new(world, TOPIC, GROUP);
     let members: Vec<usize> = ["member-0", "member-1", "member-2"]
         .iter()
         .zip(["reader-a", "reader-b", "reader-c"])
@@ -133,6 +138,8 @@ fn members_outnumbering_the_segments_deliver_each_message_once() {
     let got: Vec<Vec<String>> = members.iter().map(|m| h.take_values(*m)).collect();
 
     assert!(members.iter().all(|m| h.members[*m].subscribed == Some(Ok(()))));
+    // Whole, to the first member by name.
+    assert_eq!(h.world.assigned(TOPIC, GROUP, "member-0"), [(0, false)]);
     assert_eq!(got.iter().map(Vec::len).collect::<Vec<_>>(), [100, 0, 0]);
     assert_eq!(got[0].iter().cloned().collect::<BTreeSet<_>>(), sent);
     assert_eq!(h.world.consumer_count(TOPIC, 0, "reader-a"), 1);
