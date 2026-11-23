@@ -17,9 +17,11 @@
 
 //! The Stream consumer against the simulated cluster and its controller. Ported scenarios from Java's
 //! `V5StreamConsumerBasicTest`, `V5StreamConsumerDagReplayTest`, `V5StreamConsumerOrderingTest`,
-//! `V5StreamConsumerAutoReconnectTest`, `V5StreamConsumerAckWatermarkTest` and the Stream consumer's case of
+//! `V5StreamConsumerAutoReconnectTest`, `V5StreamConsumerAckWatermarkTest` and `V5EntryBucketDispatchTest`, the
+//! Stream consumer's cases of `V5MultipleConsumersTest`, `V5MultiBrokerScalableTopicTest` (on one broker) and
 //! `ScalableTopicLegacySegmentTest`, and members that share segments.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use apache_pulsar_protocol::consumer::ConsumerOptions;
@@ -262,6 +264,43 @@ fn an_empty_segment_does_not_let_its_children_ahead_of_its_parent() {
     assert_eq!(assigned, [lower, upper, high]);
 }
 
+/// Java's `V5StreamConsumerOrderingTest.testPerKeyOrderAcrossAnEmptySegment` as Java runs it: the member subscribes
+/// before the publishes and the splits, so the splits' children get the subscription at their start, and the empty
+/// child is drained as it seals, while the root still has backlog. Its children wait for the root all the same, and
+/// each key keeps its order. In `an_empty_segment_does_not_let_its_children_ahead_of_its_parent` the empty child has
+/// no subscription until it is assigned, so only this test fails with a controller that checks a segment's parent and
+/// not the ancestors beyond it.
+#[test]
+fn keys_keep_their_order_across_an_empty_segment() {
+    let mut h = StreamHarness::new(world(1), TOPIC);
+    let solo = h.join("solo", options());
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for k in 0..16 {
+        let (key, value) = (format!("key-{k}"), format!("key-{k}-gen0"));
+        publish(&mut h.world, 0, &key, &value);
+        sent.entry(key).or_default().push(value);
+    }
+    let (low, high) = h.world.split(TOPIC, 0);
+    let (lower, upper) = h.world.split(TOPIC, low);
+    let grandchildren = [(lower, 0, 0x3fff), (upper, 0x4000, 0x7fff), (high, 0x8000, 0xffff)];
+    for k in 0..16 {
+        let (key, value) = (format!("key-{k}"), format!("key-{k}-gen2"));
+        publish(&mut h.world, route(&key, &grandchildren), &key, &value);
+        sent.entry(key).or_default().push(value);
+    }
+    assert!([lower, upper, high].iter().all(|&s| h.world.backlog(TOPIC, s, SUB) > 0));
+    // The empty child is drained, but its children wait for the root, as its sibling does: only the root is assignable.
+    assert_eq!(h.world.assigned(TOPIC, SUB, "solo"), [(0, false)]);
+    let first = h.take(solo);
+    assert_eq!(first.len(), 16);
+    assert!([low, lower, upper, high].iter().all(|&s| h.world.consumer_count(TOPIC, s, SUB) == 0));
+    h.ack(solo, &first[15].id);
+    let assigned: Vec<u64> = h.world.assigned(TOPIC, SUB, "solo").into_iter().map(|(s, _)| s).collect();
+    assert_eq!(assigned, [lower, upper, high]);
+    let second = h.take(solo);
+    assert_eq!(by_key(&[first, second].concat()), sent);
+}
+
 /// Java's `testSealedBacklogNotRedeliveredAfterFirstConsumerDrains`.
 #[test]
 fn a_new_member_gets_nothing_acknowledged_again() {
@@ -341,6 +380,74 @@ fn past_the_grace_period_the_group_rebalances() {
     assert_eq!(h.members[bob].consumer.segments().count(), 1);
 }
 
+/// Publishes `count` messages, keyed `k-0`, `k-1`, … and valued `{batch}-0`, `{batch}-1`, …, each to the segment its
+/// key goes to. Each member then takes what it has, and acknowledges the last of it. Checks that each message goes to
+/// one of them, once, and that each gets some. Returns what each took.
+fn take_a_batch(h: &mut StreamHarness, members: [usize; 2], batch: &str, count: usize) -> [Vec<ReceivedMessage>; 2] {
+    let mut sent: Vec<String> = (0..count).map(|i| format!("{batch}-{i}")).collect();
+    for (i, value) in sent.iter().enumerate() {
+        let key = format!("k-{i}");
+        let segment = h.world.route(TOPIC, &key);
+        publish(&mut h.world, segment, &key, value);
+    }
+    let taken = members.map(|member| {
+        let taken = h.take(member);
+        if let Some(last) = taken.last() {
+            h.ack(member, &last.id);
+        }
+        taken
+    });
+    assert!(taken.iter().all(|got| !got.is_empty()), "each member gets some");
+    let mut got: Vec<String> = taken.iter().flat_map(|got| values(got)).collect();
+    got.sort();
+    sent.sort();
+    assert_eq!(got, sent, "each message once");
+    taken
+}
+
+/// Java's `V5MultipleConsumersTest.testStreamConsumersSplitSegmentsAcrossConsumers`, and on one broker
+/// `V5MultiBrokerScalableTopicTest.testStreamConsumerControllerCoordinationAcrossBrokers`: two members split four
+/// segments, each takes the messages of its own, and each message goes to one of them, once.
+#[test]
+fn members_split_the_segments_and_each_message_goes_to_one() {
+    let mut h = StreamHarness::new(world(4), TOPIC);
+    let alice = h.join("alice", options());
+    let bob = h.join("bob", options());
+    h.advance(Duration::from_millis(200));
+    assert_eq!(h.members[bob].subscribed, Some(Ok(())));
+    let taken = take_a_batch(&mut h, [alice, bob], "v", 100);
+    for (member, got) in [alice, bob].into_iter().zip(&taken) {
+        let segments: Vec<u64> = h.members[member].consumer.segments().collect();
+        assert_eq!(segments.len(), 2);
+        assert!(got.iter().all(|m| segments.contains(&(m.id.segment_id as u64))), "from its own segments");
+    }
+    assert!((0..4).all(|segment| h.world.backlog(TOPIC, segment, SUB) == 0));
+}
+
+/// Java's `V5MultipleConsumersTest.testStreamConsumerReconnectWithinGraceKeepsAssignment`: a member that closes leaves
+/// the group at once, and the other takes its segments. Back under its name, it gets the same ones again, since the
+/// controller orders the members by name: each member takes the same keys as before.
+#[test]
+fn a_member_back_under_its_name_takes_the_same_keys_again() {
+    let mut h = StreamHarness::new(world(4), TOPIC);
+    let alice = h.join("alice", options());
+    let bob = h.join("bob", options());
+    h.advance(Duration::from_millis(200));
+    let segments = |h: &StreamHarness, member: usize| h.members[member].consumer.segments().collect::<Vec<_>>();
+    let before = (segments(&h, alice), segments(&h, bob));
+    let keys = |got: &[ReceivedMessage]| got.iter().map(|m| m.key.clone().unwrap()).collect::<BTreeSet<_>>();
+    let first = take_a_batch(&mut h, [alice, bob], "first", 80).map(|got| keys(&got));
+    h.close(alice);
+    assert!(h.members[alice].closed);
+    assert_eq!(segments(&h, bob), [0, 1, 2, 3], "Bob takes Alice's segments");
+    let alice = h.join("alice", options());
+    h.advance(Duration::from_millis(200));
+    assert_eq!(h.members[alice].subscribed, Some(Ok(())));
+    assert_eq!((segments(&h, alice), segments(&h, bob)), before);
+    let second = take_a_batch(&mut h, [alice, bob], "second", 80).map(|got| keys(&got));
+    assert_eq!(second, first);
+}
+
 /// Java's `V5StreamConsumerAckWatermarkTest`: once the broker rewinds the subscription and delivers everything again,
 /// the application's ack of a position it acknowledged before goes out again.
 #[test]
@@ -376,7 +483,9 @@ fn by_key(messages: &[ReceivedMessage]) -> std::collections::BTreeMap<String, Ve
 
 /// More members than segments: the controller shares the segment by entry bucket (*key-shared* §4). The first member
 /// drains its Exclusive consumer before it subscribes again `Key_Shared`, and the second waits for that; then each
-/// key goes to one member only, and each member acknowledges its own messages, one by one.
+/// key goes to one member only, and each member acknowledges its own messages, one by one. Once the second leaves,
+/// the first has the segment whole again, and a third joining shares it again: Java's
+/// `V5EntryBucketDispatchTest.testConsumerRejoiningAfterLeaveDoesNotWedgeRelease`.
 #[test]
 fn members_beyond_the_segments_share_them_by_bucket() {
     let mut world = world(1);
@@ -446,6 +555,129 @@ fn members_beyond_the_segments_share_them_by_bucket() {
     h.advance(Duration::from_millis(200));
     assert_eq!(exclusive(&h), before + 1);
     assert_eq!(h.members[alice].consumer.segments().count(), 1);
+
+    // Carol joins. Alice acknowledged everything: her Exclusive consumer goes at once, and both attach Key_Shared.
+    let carol = h.join("carol", options());
+    h.advance(Duration::from_millis(200));
+    assert_eq!(h.members[carol].subscribed, Some(Ok(())));
+    assert_eq!(h.world.consumer_count(TOPIC, 0, SUB), 2);
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for i in 0..40 {
+        let (key, value) = (format!("k{}", i % 10), format!("again-{i}"));
+        publish(&mut h.world, 0, &key, &value);
+        sent.entry(key).or_default().push(value);
+    }
+    let (got_alice, got_carol) = (h.take(alice), h.take(carol));
+    assert!(!got_alice.is_empty() && !got_carol.is_empty());
+    let mut got = by_key(&got_alice);
+    for (key, values) in by_key(&got_carol) {
+        assert!(got.insert(key, values).is_none(), "a key goes to one member");
+    }
+    assert_eq!(got, sent);
+    h.ack(alice, &got_alice.last().unwrap().id);
+    h.ack(carol, &got_carol.last().unwrap().id);
+    assert_eq!(h.world.backlog(TOPIC, 0, SUB), 0);
+}
+
+/// Java's `V5EntryBucketDispatchTest.testConsumerJoiningMidTrafficPreservesPerKeyOrder`: a second member joins while
+/// the first takes keyed traffic, acknowledging as it goes. The first member's Exclusive consumer gives nothing more,
+/// while the traffic goes on, until the member acknowledged what it took; then the two share the segment by bucket.
+/// For each key, what the first member took, then what the second took, is what was sent.
+#[test]
+fn a_member_joining_mid_traffic_keeps_each_key_in_order() {
+    let mut world = world(1);
+    world.set_buckets(TOPIC, 0, 4);
+    let mut h = StreamHarness::new(world, TOPIC);
+    let alice = h.join("alice", options());
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut round = |h: &mut StreamHarness, i: usize| {
+        for k in 0..16 {
+            let (key, value) = (format!("key-{k}"), format!("key-{k}-{i}"));
+            publish(&mut h.world, 0, &key, &value);
+            sent.entry(key).or_default().push(value);
+        }
+    };
+    let mut got_alice = Vec::new();
+    for i in 0..13 {
+        round(&mut h, i);
+        let taken = h.take(alice);
+        h.ack(alice, &taken.last().unwrap().id);
+        got_alice.extend(taken);
+    }
+    // Bob joins while Alice holds the round she took, and the next one comes.
+    round(&mut h, 13);
+    got_alice.extend(h.take(alice));
+    let bob = h.join("bob", options());
+    round(&mut h, 14);
+    h.advance(Duration::from_millis(200));
+    assert!(h.take(alice).is_empty(), "Alice's Exclusive consumer drains");
+    assert_eq!(h.members[bob].subscribed, None);
+    h.ack(alice, &got_alice.last().unwrap().id);
+    h.advance(Duration::from_millis(500));
+    assert_eq!(h.members[bob].subscribed, Some(Ok(())));
+    let mut got_bob = Vec::new();
+    for i in 15..40 {
+        round(&mut h, i);
+        for (member, got) in [(alice, &mut got_alice), (bob, &mut got_bob)] {
+            let taken = h.take(member);
+            if let Some(last) = taken.last() {
+                h.ack(member, &last.id);
+            }
+            got.extend(taken);
+        }
+    }
+    assert_eq!(h.world.backlog(TOPIC, 0, SUB), 0);
+    assert!(!got_bob.is_empty());
+    let mut got = by_key(&got_alice);
+    for (key, values) in by_key(&got_bob) {
+        got.entry(key).or_default().extend(values);
+    }
+    assert_eq!(got, sent);
+}
+
+/// Java's `V5EntryBucketDispatchTest.testSegmentReleaseWithPendingAcksHandsOffCleanly`: a member holds what it took
+/// from two segments when a second member joins and gets one of them. The first member's consumer of that segment
+/// gives nothing more, and closes once the member's late cumulative ack reaches it; only then does the second attach.
+/// Nothing comes twice, and each key has the first member's messages, then the second's.
+#[test]
+fn a_segment_moves_once_what_was_taken_from_it_is_acknowledged() {
+    let mut h = StreamHarness::new(world(2), TOPIC);
+    let alice = h.join("alice", options());
+    let mut sent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut round = |h: &mut StreamHarness, i: usize| {
+        for k in 0..16 {
+            let (key, value) = (format!("key-{k}"), format!("key-{k}-{i}"));
+            let segment = h.world.route(TOPIC, &key);
+            publish(&mut h.world, segment, &key, &value);
+            sent.entry(key).or_default().push(value);
+        }
+    };
+    for i in 0..10 {
+        round(&mut h, i);
+    }
+    let held = h.take(alice);
+    let last = held.last().unwrap().id.clone();
+    assert_eq!((held.len(), last.positions.len()), (160, 2), "from both segments");
+    let bob = h.join("bob", options());
+    assert_eq!(h.world.assigned(TOPIC, SUB, "bob"), [(1, false)]);
+    // Alice lets go of segment 1, but her consumer stays while she holds its messages: Bob waits.
+    h.advance(Duration::from_millis(200));
+    assert_eq!(h.members[alice].consumer.segments().collect::<Vec<_>>(), [0]);
+    assert_eq!((h.world.consumer_count(TOPIC, 1, SUB), h.members[bob].subscribed.clone()), (1, None));
+    h.ack(alice, &last);
+    assert_eq!(h.world.backlog(TOPIC, 1, SUB), 0, "the ack reached the consumer let go of");
+    h.advance(Duration::from_millis(500));
+    assert_eq!(h.members[bob].subscribed, Some(Ok(())));
+    for i in 10..20 {
+        round(&mut h, i);
+    }
+    let (got_alice, got_bob) = (h.take(alice), h.take(bob));
+    assert!(!got_bob.is_empty() && got_bob.iter().all(|m| m.id.segment_id == 1));
+    let mut got = by_key(&[held, got_alice].concat());
+    for (key, values) in by_key(&got_bob) {
+        got.entry(key).or_default().extend(values);
+    }
+    assert_eq!(got, sent);
 }
 
 /// With fewer buckets than members, the members left over get nothing, until one leaves.

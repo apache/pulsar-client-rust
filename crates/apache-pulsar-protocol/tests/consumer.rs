@@ -577,6 +577,28 @@ fn a_new_registration_takes_the_same_cumulative_ack_again() {
     assert_eq!(cumulative_acks(&t.actions()), [(5, vec![])]);
 }
 
+/// Java's `V5CumulativeAckTest.testRetryingAnAckIssuedWhileDisconnectedAdvancesTheCursor`: a cumulative ack made once
+/// the connection is lost waits for the next subscription, and goes out on it first, before the permits that let the
+/// broker deliver again what it covers. Made again, it adds nothing.
+#[test]
+fn a_cumulative_ack_made_while_disconnected_goes_first_on_the_next_subscription() {
+    let mut t = Test::subscribed(ConsumerOptions { ack_group_time: Duration::ZERO, ..exclusive() });
+    t.deliver(1, single(5));
+    t.take(1);
+    t.consumer.on_disconnected(1, t.now);
+    t.consumer.acknowledge_cumulative(&id(5, -1, 0), t.now);
+    assert!(t.actions().is_empty(), "no subscription to send it on");
+    t.advance(Duration::from_millis(200));
+    assert_eq!(t.actions(), [Action::Connect { generation: 2 }]);
+    t.consumer.on_subscribed(2, 8);
+    let actions = t.actions();
+    assert_eq!(cumulative_acks(&actions[..1]), [(5, vec![])]);
+    assert_eq!(commands(&actions)[0].ack.consumer_id, 8, "on the new subscription");
+    assert_eq!(actions[1..], [Action::Send(Box::new(permits(8, 4)))]);
+    t.consumer.acknowledge_cumulative(&id(5, -1, 0), t.now);
+    assert!(t.actions().is_empty());
+}
+
 #[test]
 fn a_cumulative_ack_made_while_subscribing_goes_first() {
     let mut t = Test::new(exclusive());
