@@ -172,6 +172,7 @@ fn rejects_malformed_bytes() {
 #[test]
 fn ids_hash_and_order_as_they_compare() {
     use std::collections::{BTreeSet, HashSet};
+    use std::hash::{BuildHasher, RandomState};
     let entry = |batch_index, batch_size| EntryId { ledger_id: 1, entry_id: 2, partition: -1, batch_index, batch_size };
     // The batch size is carried, not compared: the same entry in a set once.
     let entries: HashSet<EntryId> = [entry(0, 1), entry(0, 5), entry(1, 5)].into_iter().collect();
@@ -184,6 +185,15 @@ fn ids_hash_and_order_as_they_compare() {
             .into_iter()
             .collect();
     assert_eq!(ids.len(), 2);
+    // The position vector is carried, not compared: ids differing only there are equal, and hash alike. Java's
+    // `MessageIdV5Test.testEqualsIgnoresPositionVector`.
+    let mut one = MessageId::new(7, entry(-1, 0));
+    one.positions.insert(0, entry(-1, 0));
+    let mut other = one.clone();
+    other.positions.insert(1, EntryId { ledger_id: 5, entry_id: 6, ..entry(-1, 0) });
+    assert_eq!(one, other);
+    let state = RandomState::new();
+    assert_eq!(state.hash_one(&one), state.hash_one(&other));
 }
 
 #[test]

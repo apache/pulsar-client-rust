@@ -21,11 +21,12 @@
 //! the producer task, its layout watch, registrations, pushes, timers, the memory limit, the two client models,
 //! and the send-order promise of the rustdoc.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -45,7 +46,11 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::{FuturesOrdered, StreamExt};
 
 use crate::error::ErrorKind;
-use crate::{BatchingPolicy, CompressionPolicy, CompressionType, ProducerAccessMode, PulsarClient, Schema, local};
+use crate::memory::PER_MESSAGE_OVERHEAD;
+use crate::{
+    BatchingPolicy, CompressionPolicy, CompressionType, ProducerAccessMode, PulsarClient, Schema,
+    SubscriptionInitialPosition, local,
+};
 
 pub(crate) const TOPIC: &str = "topic://acme/orders/events";
 
@@ -54,6 +59,8 @@ pub(crate) struct WorldServer {
     address: HostPort,
     pub(crate) world: Rc<RefCell<World>>,
     wakers: Rc<RefCell<HashMap<ConnId, Waker>>>,
+    /// While set, what the world sends waits: [`WorldServer::hold_output`].
+    held: Rc<Cell<bool>>,
     _task: JoinHandle<()>,
 }
 
@@ -65,17 +72,18 @@ impl WorldServer {
         world.lookup = LookupAnswer::Connect { broker: address.clone(), proxy: false };
         let world = Rc::new(RefCell::new(world));
         let wakers: Rc<RefCell<HashMap<ConnId, Waker>>> = Rc::default();
+        let held: Rc<Cell<bool>> = Rc::default();
         let task = {
-            let (world, wakers) = (world.clone(), wakers.clone());
+            let (world, wakers, held) = (world.clone(), wakers.clone(), held.clone());
             compio::runtime::spawn(async move {
                 let mut connections = Vec::new();
                 loop {
                     let Ok((tcp, _)) = listener.accept().await else { return };
-                    connections.push(compio::runtime::spawn(serve(tcp, world.clone(), wakers.clone())));
+                    connections.push(compio::runtime::spawn(serve(tcp, world.clone(), wakers.clone(), held.clone())));
                 }
             })
         };
-        Self { address, world, wakers, _task: task }
+        Self { address, world, wakers, held, _task: task }
     }
 
     pub(crate) fn url(&self) -> String {
@@ -94,10 +102,23 @@ impl WorldServer {
     pub(crate) fn received(&self, kind: Type) -> usize {
         self.world.borrow().received(kind).len()
     }
+
+    /// Holds what the world sends, on every connection, or lets it go: a broker slow to answer. The world still
+    /// takes what the clients write meanwhile.
+    pub(crate) fn hold_output(&self, hold: bool) {
+        self.held.set(hold);
+        self.with(|_| ());
+    }
 }
 
-/// Serves one connection: what the client writes goes to the world, what the world has for it goes out.
-async fn serve(tcp: TcpStream, world: Rc<RefCell<World>>, wakers: Rc<RefCell<HashMap<ConnId, Waker>>>) {
+/// Serves one connection: what the client writes goes to the world, what the world has for it goes out, unless
+/// `held`.
+async fn serve(
+    tcp: TcpStream,
+    world: Rc<RefCell<World>>,
+    wakers: Rc<RefCell<HashMap<ConnId, Waker>>>,
+    held: Rc<Cell<bool>>,
+) {
     let conn = world.borrow_mut().connect();
     let mut stream = Box::pin(AsyncStream::new(tcp));
     let mut read_buf = vec![0; 64 * 1024];
@@ -128,7 +149,7 @@ async fn serve(tcp: TcpStream, world: Rc<RefCell<World>>, wakers: Rc<RefCell<Has
                 wakers.borrow_mut().remove(&conn);
                 return Poll::Ready(());
             }
-            if outgoing.is_none() {
+            if outgoing.is_none() && !held.get() {
                 let bytes = world.borrow_mut().output(conn);
                 outgoing = (!bytes.is_empty()).then_some(bytes);
             }
@@ -292,6 +313,28 @@ fn keys_keep_their_order_across_a_split_during_traffic() {
     });
 }
 
+/// Java: `V5LayoutChangeDuringCreateTest.testProducerRoutesToChildrenOfSplitBeforeCreate`. The producers of a topic
+/// on one loop share its watch: one created after the watch applied a split starts from the watch's layout, and its
+/// first keyed send goes to a child, without a producer on the sealed parent.
+#[test]
+fn a_producer_created_after_a_split_sends_to_the_children() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        // Its create opens the loop's watch of the topic. It never sends.
+        let _first = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        let watch = client.watches().open(&client, TOPIC).await.unwrap();
+        let (low, high) = server.with(|w| w.split(TOPIC, 0));
+        wait_until("the watch applies the split", || watch.current().epoch() == 1).await;
+        let second = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        let sent = second.new_message().key("k").value("first".to_string()).send().await.unwrap();
+        let segment = MessageIdSegment::of(&sent) as u64;
+        assert!([low, high].contains(&segment), "sent to {segment}");
+        assert_eq!(server.received(Type::PRODUCER), 1, "its only producer is on the child");
+        client.close().await.unwrap();
+    });
+}
+
 #[test]
 fn a_missing_topic_is_not_found() {
     run(async {
@@ -434,6 +477,34 @@ fn closing_the_client_closes_its_producers() {
     });
 }
 
+/// Java: `closingTheClientWaitsForAProducerThatIsAlreadyClosing`. A producer's close is under way, the broker's
+/// answer held, when the client closes: the client's close waits for the producer's, and closes no connection
+/// meanwhile.
+#[test]
+fn closing_the_client_waits_for_a_producer_already_closing() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap();
+        producer.send(b"a".to_vec()).await.unwrap();
+        server.hold_output(true);
+        let producer_closed = producer.close();
+        futures_util::pin_mut!(producer_closed);
+        // The producer starts closing: the broker gets its close, and holds the answer.
+        assert!(producer_closed.as_mut().now_or_never().is_none());
+        wait_until("the broker has the producer's close", || server.received(Type::CLOSE_PRODUCER) == 1).await;
+        let connections = server.world.borrow().open_connections();
+        let client_closed = client.close();
+        futures_util::pin_mut!(client_closed);
+        let waited = compio::time::timeout(Duration::from_millis(200), &mut client_closed).await;
+        assert!(waited.is_err(), "the client's close waits for the producer's");
+        assert_eq!(server.world.borrow().open_connections(), connections, "no connection closed meanwhile");
+        server.hold_output(false);
+        client_closed.await.unwrap();
+        producer_closed.now_or_never().expect("the producer's close completes first").unwrap();
+    });
+}
+
 #[test]
 fn a_lost_connection_writes_unacknowledged_messages_again() {
     run(async {
@@ -544,6 +615,99 @@ fn thread_safe_producers_spread_over_the_loops() {
         }
     });
     close.join().unwrap().unwrap();
+}
+
+/// Java's `V5ConcurrentProducersConsumersTest`: on the thread-safe client, four producers send from threads of their
+/// own while three Queue consumers of one subscription receive and acknowledge on theirs, on a topic of four
+/// segments. Every message is received once, and every consumer gets some.
+#[test]
+fn concurrent_producers_and_consumers_get_every_message_once() {
+    const PRODUCERS: usize = 4;
+    const MESSAGES: usize = 100;
+    const SUB: &str = "workers";
+
+    /// Producer `p`'s messages, each with a key of its own.
+    async fn produce(client: &PulsarClient, p: usize) {
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        for i in 0..MESSAGES {
+            producer.new_message().key(format!("k-{p}-{i}")).value(format!("p{p}-m{i}")).send().await.unwrap();
+        }
+        producer.close().await.unwrap();
+    }
+
+    /// Receives and acknowledges until the consumers have every message between them, as `received` counts them.
+    async fn consume(consumer: &crate::QueueConsumer<String>, received: &AtomicUsize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut mine = Vec::new();
+        while received.load(Ordering::Acquire) < PRODUCERS * MESSAGES {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for the messages");
+            if let Some(message) = consumer.receive_timeout(Duration::from_millis(10)).await.unwrap() {
+                consumer.acknowledge(message.id()).await.unwrap();
+                mine.push(message.value().unwrap());
+                received.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        mine
+    }
+
+    let rt = compio::runtime::Runtime::new().unwrap();
+    let (server, url) = rt.block_on(async {
+        let server = WorldServer::start(world(4)).await;
+        let url = server.url();
+        (server, url)
+    });
+    // The server runs on this thread's runtime, polled while the test waits on it.
+    let worker = std::thread::spawn(move || {
+        futures_executor::block_on(async {
+            let client = PulsarClient::builder().service_url(url).event_loops(2).build().await.unwrap();
+            // All subscribed before anything is sent.
+            let mut consumers = Vec::new();
+            for _ in 0..3 {
+                let builder = client.new_queue_consumer(Schema::string()).topic(TOPIC).subscription_name(SUB);
+                let builder = builder.subscription_initial_position(SubscriptionInitialPosition::Earliest);
+                consumers.push(builder.subscribe().await.unwrap());
+            }
+            let received = AtomicUsize::new(0);
+            let got: Vec<Vec<String>> = std::thread::scope(|threads| {
+                for p in 0..PRODUCERS {
+                    let client = &client;
+                    threads.spawn(move || futures_executor::block_on(produce(client, p)));
+                }
+                let receivers: Vec<_> = consumers
+                    .iter()
+                    .map(|consumer| {
+                        let received = &received;
+                        threads.spawn(move || futures_executor::block_on(consume(consumer, received)))
+                    })
+                    .collect();
+                receivers.into_iter().map(|receiver| receiver.join().unwrap()).collect()
+            });
+            // A close sends the acks still waiting.
+            for consumer in &consumers {
+                consumer.close().await.unwrap();
+            }
+            client.close().await.unwrap();
+            got
+        })
+    });
+    rt.block_on(async {
+        while !worker.is_finished() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let got = worker.join().unwrap();
+    let counts: Vec<usize> = got.iter().map(Vec::len).collect();
+    assert!(counts.iter().all(|&count| count > 0), "a consumer got nothing: {counts:?}");
+    let mut received: Vec<String> = got.into_iter().flatten().collect();
+    received.sort();
+    let mut sent: Vec<String> = (0..PRODUCERS).flat_map(|p| (0..MESSAGES).map(move |i| format!("p{p}-m{i}"))).collect();
+    sent.sort();
+    assert_eq!(received, sent);
+    let world = server.world.borrow();
+    for segment in 0..4 {
+        assert!(!world.stored_in(TOPIC, segment).is_empty(), "segment {segment} got nothing");
+        assert_eq!(world.backlog(TOPIC, segment, SUB), 0, "segment {segment} has messages not acknowledged");
+    }
 }
 
 #[test]
@@ -802,6 +966,90 @@ fn sends_wait_for_room_at_the_memory_limit() {
     });
 }
 
+/// Java: `cancelledSendsGiveTheirReservationBackOnceDropped`. Unlike Java's, a send dropped after its first poll isn't
+/// recalled: its message is stored, and keeps its room under the memory limit until its receipt comes, then gives it
+/// back.
+#[test]
+fn dropped_sends_keep_their_room_until_they_complete() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client
+            .new_producer(Schema::bytes())
+            .topic(TOPIC)
+            .batching_policy(BatchingPolicy::disabled())
+            .create()
+            .await
+            .unwrap();
+        producer.send(vec![0; 100]).await.unwrap();
+        server.with(|w| w.hold_receipts = true);
+        for _ in 0..10 {
+            // Queued at its first poll, then dropped.
+            assert!(producer.send(vec![0; 100]).now_or_never().is_none(), "the receipts are held");
+        }
+        let room = 10 * (100 + PER_MESSAGE_OVERHEAD);
+        assert_eq!(client.memory().used(), room);
+        wait_until("the dropped sends are stored", || server.world.borrow().messages(TOPIC).len() == 11).await;
+        assert_eq!(client.memory().used(), room, "their room goes back with their receipts");
+        server.with(|w| {
+            w.hold_receipts = false;
+            w.release_receipts();
+        });
+        wait_until("the memory is released", || client.memory().used() == 0).await;
+        producer.send(vec![0; 100]).await.unwrap();
+        assert_eq!(client.memory().used(), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// Java: `retriesAcrossASegmentSplitKeepTheAccountingBalanced`. The segment splits while sends are in flight on it,
+/// and more wait for room at the memory limit: those in flight are written again to its children, every send goes
+/// through, and the memory comes back.
+#[test]
+fn sends_waiting_for_room_go_through_a_split_and_give_it_back() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client =
+            local::PulsarClient::builder().service_url(server.url()).memory_limit(8 * 1024).build().await.unwrap();
+        let producer = client
+            .new_producer(Schema::bytes())
+            .topic(TOPIC)
+            .batching_policy(BatchingPolicy::disabled())
+            .create()
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            producer.send(vec![7; 1000]).await.unwrap();
+        }
+        // The broker holds what is written next. About 2 KiB each: a handful find room, and are in flight on the
+        // parent; the rest wait.
+        server.with(|w| w.hold_sends = true);
+        let mut sends = futures_util::stream::iter(0..200).map(|_| producer.send(vec![7; 1000])).buffered(64);
+        assert!(sends.next().now_or_never().is_none(), "the sends are held");
+        assert!(client.memory().used() > 8 * 1024, "the limit is reached");
+        let in_flight = (client.memory().used() / (1000 + PER_MESSAGE_OVERHEAD)) as usize;
+        wait_until("the sends with room are written", || server.received(Type::SEND) == 20 + in_flight).await;
+        server.with(|w| {
+            w.split(TOPIC, 0);
+            w.hold_sends = false;
+            w.release_sends();
+        });
+        let mut segments = BTreeSet::new();
+        let drained = compio::time::timeout(Duration::from_secs(10), async {
+            while let Some(sent) = sends.next().await {
+                segments.insert(MessageIdSegment::of(&sent.unwrap()));
+            }
+        });
+        drained.await.expect("the sends did not go through");
+        // The sends from the hold on are all on the children; the parent has what came before.
+        assert_eq!(segments, BTreeSet::from([1, 2]));
+        assert_eq!(server.world.borrow().stored_in(TOPIC, 0).len(), 20);
+        assert_eq!(server.world.borrow().messages(TOPIC).len(), 220);
+        wait_until("the memory is released", || client.memory().used() == 0).await;
+        client.close().await.unwrap();
+    });
+}
+
 /// Every field of a message, and of the producer, reaches the wire as Java writes it.
 #[test]
 fn every_message_field_reaches_the_wire() {
@@ -905,6 +1153,33 @@ fn a_message_above_the_brokers_limit_fails() {
         assert_eq!(error.kind(), ErrorKind::MessageTooLarge, "{error}");
         producer.send(b"fine".to_vec()).await.unwrap();
         assert_eq!(client.memory().used(), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// Java: `V5AuthErrorTest.testLookupNotAuthorized`, the producer's part, and the exclusive producer of its
+/// `testProduceNotAuthorized`. A lookup the broker refuses fails the create, with the broker's category: the topic's,
+/// which the layout watch starts with, and a segment's, which an exclusive producer registers on at create.
+#[test]
+fn a_refused_lookup_fails_create() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let refused = || LookupAnswer::Fail {
+            error: apache_pulsar_protocol::proto::ServerError::AuthorizationError,
+            message: "not you".into(),
+        };
+        let allowed = server.with(|w| std::mem::replace(&mut w.lookup, refused()));
+        let client = local_client(&server).await;
+        let error = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authorization, "{error}");
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_LOOKUP), 0, "the watch opened no session");
+        // With the topic's watch open, only the segment is looked up.
+        server.with(|w| w.lookup = allowed);
+        let _shared = client.new_producer(Schema::bytes()).topic(TOPIC).create().await.unwrap();
+        server.with(|w| w.lookup = refused());
+        let exclusive = client.new_producer(Schema::bytes()).topic(TOPIC).access_mode(ProducerAccessMode::Exclusive);
+        let error = exclusive.create().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authorization, "{error}");
         client.close().await.unwrap();
     });
 }

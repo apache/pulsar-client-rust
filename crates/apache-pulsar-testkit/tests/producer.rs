@@ -71,6 +71,20 @@ fn values_in(harness: &Harness, segment: u64) -> Vec<String> {
     harness.world.stored_in(TOPIC, segment).iter().map(|s| String::from_utf8(s.value.to_vec()).unwrap()).collect()
 }
 
+/// How many entries were written to the producers of `segment`, whether the world stored them, holds them or
+/// ignored them.
+fn sends_to(harness: &Harness, segment: u64) -> usize {
+    let name = format!("p-seg-{segment}");
+    let producers: Vec<u64> = harness
+        .world
+        .received(Type::PRODUCER)
+        .iter()
+        .filter(|c| c.producer.producer_name.as_deref() == Some(name.as_str()))
+        .map(|c| c.producer.producer_id)
+        .collect();
+    harness.world.received(Type::SEND).iter().filter(|c| producers.contains(&c.send.producer_id)).count()
+}
+
 #[test]
 fn sends_a_stamped_batch_of_one_per_message() {
     let mut h = Harness::new(world(1), TOPIC, options());
@@ -187,6 +201,38 @@ fn only_the_keys_of_a_retiring_segment_are_held() {
         ["a1", "a2"]
     );
     assert_eq!(h.segment_of(a1), h.segment_of(a2));
+}
+
+/// Java: `aLayoutAppliedWhileReleasingStopsTheRestOfTheBatch`. a1 and a2 are in flight on segment 0 when it is
+/// terminated, and a3 is held behind them. Segment 0 splits: the three are written to its child, which splits too
+/// while they are in flight there. They reach the grandchild, in order.
+#[test]
+fn messages_moved_to_a_child_that_splits_reach_the_grandchild_in_order() {
+    let mut h = Harness::new(world(1), TOPIC, options());
+    // A key of segment 0, of its lower child, and of that child's lower child.
+    let a = key_in(0, 0x3fff, 0);
+    h.send(Some(&a), "a0");
+    h.world.hold_sends = true;
+    let a1 = h.send(Some(&a), "a1");
+    let a2 = h.send(Some(&a), "a2");
+    h.world.terminate(TOPIC, 0);
+    // The producer registers again, is refused, and parks a1 and a2.
+    h.run_until(Duration::from_secs(5), |h| h.registrations[&0] == 2);
+    let a3 = h.send(Some(&a), "a3");
+    assert_eq!(h.producer.sends_parked_or_held(), 3, "a1 and a2 parked, a3 held");
+    let (child, _) = h.world.split(TOPIC, 0);
+    h.pump();
+    assert_eq!(sends_to(&h, child), 3, "a1, a2 and a3 are in flight on the child");
+    let (grandchild, _) = h.world.split(TOPIC, child);
+    h.pump();
+    // What was written to the closed producers of segment 0 and of the child is ignored.
+    h.world.hold_sends = false;
+    h.world.release_sends();
+    h.run_until(Duration::from_secs(5), |h| h.producer.outstanding() == 0);
+    assert_eq!(values_in(&h, 0), ["a0"]);
+    assert!(values_in(&h, child).is_empty());
+    assert_eq!(values_in(&h, grandchild), ["a1", "a2", "a3"]);
+    assert_eq!([a1, a2, a3].map(|s| h.segment_of(s)), [grandchild; 3]);
 }
 
 /// Java: `V5ProducerLayoutChangeOrderingTest`, on the simulated broker: many keys, a split mid-stream, every key in
