@@ -23,6 +23,7 @@
 //! the Java client stored is read with the Rust consumer, both Java clients run in the broker container.
 
 mod bridge;
+mod conformance;
 mod env;
 mod schemas;
 
@@ -48,8 +49,6 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("missing_credentials_are_refused", missing_credentials_are_refused),
     ("a_java_consumer_reads_what_was_produced", a_java_consumer_reads_what_was_produced),
     ("a_java_consumer_reads_rust_batches", a_java_consumer_reads_rust_batches),
-    ("keys_keep_their_order_across_a_split", keys_keep_their_order_across_a_split),
-    ("a_partitioned_topic_routes_like_v4", a_partitioned_topic_routes_like_v4),
     ("a_short_name_is_a_regular_topic", a_short_name_is_a_regular_topic),
     ("exclusive_producers_conflict_at_create", exclusive_producers_conflict_at_create),
     ("exclusive_with_fencing_fences_the_older_producer", exclusive_with_fencing_fences_the_older_producer),
@@ -59,7 +58,6 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("a_queue_consumer_reads_compressed_java_batches", a_queue_consumer_reads_compressed_java_batches),
     ("a_payload_reads_back_with_each_codec", a_payload_reads_back_with_each_codec),
     ("a_java_consumer_reads_rust_compressed_batches", a_java_consumer_reads_rust_compressed_batches),
-    ("a_split_during_consumption_loses_no_message", a_split_during_consumption_loses_no_message),
     ("a_latest_consumer_gets_what_the_children_stored_first", a_latest_consumer_gets_what_the_children_stored_first),
     ("queue_consumers_share_a_subscription", queue_consumers_share_a_subscription),
     ("a_negative_ack_brings_a_message_back", a_negative_ack_brings_a_message_back),
@@ -83,10 +81,6 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("a_checkpoint_consumer_resumes_across_a_split", a_checkpoint_consumer_resumes_across_a_split),
     ("a_latest_checkpoint_consumer_reads_a_later_split", a_latest_checkpoint_consumer_reads_a_later_split),
     ("a_checkpoint_consumer_skips_a_deleted_segment", a_checkpoint_consumer_skips_a_deleted_segment),
-    (
-        "a_checkpoint_round_trips_with_java_across_layout_changes",
-        a_checkpoint_round_trips_with_java_across_layout_changes,
-    ),
     ("checkpoint_group_members_share_the_segments", checkpoint_group_members_share_the_segments),
     ("a_checkpoint_group_member_reads_the_sealed_backlog", a_checkpoint_group_member_reads_the_sealed_backlog),
 ];
@@ -95,31 +89,27 @@ fn main() {
     let args = Arguments::from_args();
     // Listing the tests needs no environment.
     let env = (!args.list).then(|| Arc::new(Env::start()));
-    let ignored = bridge::IGNORED.iter().map(|test| (test, true));
-    let trials = TESTS
-        .iter()
-        .chain(bridge::TESTS)
-        .chain(schemas::TESTS)
-        .map(|test| (test, false))
-        .chain(ignored)
-        .map(|(&(name, test), ignored)| {
-            let env = env.clone();
-            let trial = Trial::test(name, move || {
-                test(env.as_deref().expect("the environment is started unless listing"));
-                Ok(())
-            });
-            trial.with_ignored_flag(ignored)
-        })
-        .collect();
-    let conclusion = libtest_mimic::run(&args, trials);
-    if conclusion.has_failed()
-        && let Some(env) = &env
-    {
+    let trial = |&(name, test): &(&'static str, fn(&Env)), ignored: bool| {
+        let env = env.clone();
+        let trial = Trial::test(name, move || {
+            test(env.as_deref().expect("the environment is started unless listing"));
+            Ok(())
+        });
+        trial.with_ignored_flag(ignored)
+    };
+    let tests = TESTS.iter().chain(bridge::TESTS).chain(schemas::TESTS).chain(conformance::TESTS);
+    let trials = tests.map(|test| trial(test, false)).chain(bridge::IGNORED.iter().map(|test| trial(test, true)));
+    let conclusion = libtest_mimic::run(&args, trials.collect());
+    // The tests that take the broker down run once the others are done, one at a time.
+    let exclusive = conformance::EXCLUSIVE.iter().map(|test| trial(test, false)).collect();
+    let then = libtest_mimic::run(&Arguments { test_threads: Some(1), ..args.clone() }, exclusive);
+    let failed = conclusion.has_failed() || then.has_failed();
+    if failed && let Some(env) = &env {
         env.print_logs();
     }
     // Remove the containers before exiting: `exit` runs no destructors.
     drop(env);
-    conclusion.exit();
+    std::process::exit(if failed { 101 } else { 0 });
 }
 
 fn run<F: std::future::Future>(f: F) -> F::Output {
