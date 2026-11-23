@@ -206,8 +206,10 @@ pub enum ErrorKind {
 - What the spec retries (*error-model* §3), the client retries: a lost connection, a broker that isn't ready, a
   segment that is gone. A failure it keeps retrying ends as a `Timeout`, with the last failure in its message; a
   message that moved from a sealed segment to its successors ten times fails with `TopicTerminated`. What the spec
-  surfaces comes back at once, wherever it happens: credentials the broker refuses fail a lookup, and the
-  registration of a segment's producer or consumer, without a retry. An authentication provider that fails is an
+  surfaces comes back at once: credentials the broker refuses fail a lookup, a create, a subscribe, and a producer's
+  first registration on a segment, without a retry. A producer already registered on a segment retries them as it
+  retries the lost connection, so that its messages wait, within their send timeout, for a provider with fresh ones;
+  a running consumer subscribes the segment again after a backoff. An authentication provider that fails is an
   `Authentication` failure, whatever its own error's kind, as in Java V5.
 - The spec's `Interrupted` has no Rust counterpart, since Rust threads are not interrupted.
 - An async operation never fails before its future exists: every failure comes out of the future

@@ -570,6 +570,12 @@ impl Producer {
                     now,
                 );
             }
+            // Credentials refused as a registered segment's producer registers again: retried, as the lost connection
+            // was, so that its messages wait, within their send timeout, for a provider with fresh ones. A first
+            // registration fails with them, as a lookup does.
+            RegisterError::Server { error: ServerError::AuthenticationError, .. } if s.registered_once => {
+                return self.retry_later(segment, now);
+            }
             RegisterError::Server { error, message } if !retriable(error) => SendError::Server { error, message },
             RegisterError::Server { error, message } => {
                 if s.registered_once || now < s.first_deadline {
