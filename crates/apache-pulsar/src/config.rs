@@ -30,6 +30,15 @@ use crate::auth::Authentication;
 use crate::error::{Error, ErrorKind, Result};
 use crate::memory::MemoryLimit;
 
+/// The longest duration the client waits. A longer one, as `Duration::MAX`, counts as a year: as good as forever, and
+/// short enough for every timer and event loop to take (macOS's refuses a wait of 68 years or more).
+pub(crate) const LONGEST: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// `duration`, at most [`LONGEST`].
+pub(crate) fn bounded(duration: Duration) -> Duration {
+    duration.min(LONGEST)
+}
+
 /// Marks a builder for the thread-safe client.
 #[derive(Debug, Clone, Copy)]
 pub enum ThreadSafe {}
@@ -198,9 +207,9 @@ impl<Api> ClientBuilder<Api> {
             service,
             authentication: self.authentication,
             tls,
-            connect_timeout: self.connect_timeout,
-            operation_timeout: self.operation_timeout,
-            keepalive_interval: self.keepalive_interval,
+            connect_timeout: bounded(self.connect_timeout),
+            operation_timeout: bounded(self.operation_timeout),
+            keepalive_interval: bounded(self.keepalive_interval),
             memory: Arc::new(MemoryLimit::new(self.memory_limit)),
         })
     }

@@ -175,6 +175,12 @@ fn not_connected<E>(_: E) -> Error {
     Error::new(ErrorKind::NotConnected, "the connection closed")
 }
 
+/// The authentication provider couldn't supply credentials: an authentication failure, whatever the provider's own
+/// error says, as Java V5 reports it.
+fn provider_failed(error: Error) -> Error {
+    Error::with_source(ErrorKind::Authentication, format!("the authentication provider failed: {error}"), error)
+}
+
 /// Connects to `address` and completes the handshake within the connect timeout.
 pub(crate) async fn open(address: BrokerAddress, config: &ClientConfig) -> Result<ConnHandle> {
     let started = Instant::now();
@@ -189,7 +195,8 @@ pub(crate) async fn open(address: BrokerAddress, config: &ClientConfig) -> Resul
         Some(auth) => {
             let data = compio::time::timeout(timeout.saturating_sub(started.elapsed()), auth.auth_data())
                 .await
-                .map_err(|_| Error::new(ErrorKind::Timeout, "the authentication provider did not answer in time"))??;
+                .map_err(|_| Error::new(ErrorKind::Timeout, "the authentication provider did not answer in time"))?
+                .map_err(provider_failed)?;
             (Some(auth.method_name().to_string()), Some(data))
         }
         None => (None, None),

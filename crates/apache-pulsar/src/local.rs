@@ -130,8 +130,8 @@ impl PulsarClient {
         crate::CheckpointConsumerBuilder::new_local(self.clone(), schema)
     }
 
-    /// Closes the producers and consumers, then every connection. Later operations fail with [`ErrorKind::AlreadyClosed`]. Can
-    /// be called again.
+    /// Closes the producers and consumers, then every connection. Later operations fail with
+    /// [`ErrorKind::AlreadyClosed`]. Can be called again. Doesn't fail.
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.replace(true) {
             return Ok(());
@@ -262,7 +262,14 @@ impl PulsarClient {
 }
 
 impl ClientBuilder<Local> {
-    /// Creates the client. Must be called inside a compio runtime, which the client's tasks then run on.
+    /// Creates the client. Must be called inside a compio runtime, which the client's tasks then run on. It connects
+    /// to no broker yet: the first producer or consumer does.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidServiceUrl`](ErrorKind::InvalidServiceUrl): the service URL doesn't parse.
+    /// - [`InvalidConfiguration`](ErrorKind::InvalidConfiguration): the service URL is missing, a TLS file can't be
+    ///   read or holds no valid certificate or key, or TLS authentication is set without a `pulsar+ssl://` URL.
     pub async fn build(self) -> Result<PulsarClient> {
         Ok(PulsarClient::from_config(self.into_config()?))
     }

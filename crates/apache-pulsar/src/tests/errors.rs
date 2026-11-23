@@ -39,11 +39,16 @@ fn broker_error_codes_map_to_kinds() {
         (ProducerBusy, ErrorKind::ProducerBusy),
         (ProducerFenced, ErrorKind::ProducerFenced),
         (ConsumerBusy, ErrorKind::ConsumerBusy),
+        // Key_Shared ranges that overlap another consumer's, as Java V5 maps it.
+        (ConsumerAssignError, ErrorKind::ConsumerBusy),
         (IncompatibleSchema, ErrorKind::IncompatibleSchema),
         (TopicTerminatedError, ErrorKind::TopicTerminated),
         (TransactionConflict, ErrorKind::TransactionConflict),
+        (InvalidTxnStatus, ErrorKind::TransactionConflict),
+        (TransactionNotFound, ErrorKind::TransactionConflict),
         (ServiceNotReady, ErrorKind::NotConnected),
         (TooManyRequests, ErrorKind::NotConnected),
+        (InvalidTopicName, ErrorKind::InvalidConfiguration),
         (PersistenceError, ErrorKind::Other),
     ];
     for (code, kind) in cases {
@@ -114,4 +119,57 @@ fn the_brokers_refusal_is_found_in_an_error() {
     assert!(matches!(registration, RegisterError::Server { error: ServerError::ProducerBusy, .. }), "{registration:?}");
     let registration = RegisterError::from(Error::closed());
     assert!(matches!(&registration, RegisterError::Unavailable(m) if m.contains("closed")), "{registration:?}");
+}
+
+/// A broker that refuses the handshake with credentials it rejects has refused the registration the connection was
+/// for, which isn't retried; a refusal the client retries, as a lookup does, stays a failure to connect. Credentials
+/// the provider couldn't supply count as rejected.
+#[test]
+fn a_refused_handshake_is_the_brokers_refusal_unless_it_is_retried() {
+    use apache_pulsar_protocol::producer::RegisterError;
+
+    let refused = |code| Error::from(ConnectionError::Refused { error: EnumValue::Known(code), message: "no".into() });
+    assert_eq!(
+        refused(ServerError::AuthenticationError).server_error(),
+        Some((ServerError::AuthenticationError, "no".into()))
+    );
+    assert_eq!(
+        refused(ServerError::AuthorizationError).server_error(),
+        Some((ServerError::AuthorizationError, "no".into()))
+    );
+    assert_eq!(refused(ServerError::ServiceNotReady).server_error(), None);
+    assert_eq!(refused(ServerError::UnknownError).server_error(), None);
+    assert!(matches!(RegisterError::from(refused(ServerError::UnknownError)), RegisterError::Unavailable(_)));
+
+    let rejected = RegisterError::from(Error::from(ConnectionError::Authentication("expired".into())));
+    let expected = RegisterError::Server {
+        error: ServerError::AuthenticationError,
+        message: "authentication failed: expired".into(),
+    };
+    assert_eq!(rejected, expected);
+}
+
+/// A Shared producer registers on a segment with its first message there. A segment's broker that refuses the
+/// credentials fails that send with the refusal, at once, not with a timeout once the retries run out.
+#[test]
+fn a_segment_broker_refusing_the_credentials_fails_the_send() {
+    use crate::Schema;
+    use crate::producer_tests::{TOPIC, WorldServer, local_client, world};
+    use apache_pulsar_testkit::{LookupAnswer, SimBroker};
+
+    super::run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        let producer = client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap();
+        let refusing = super::SimServer::start(None, |_| {
+            let mut broker = SimBroker::new();
+            broker.refuse = Some(ServerError::AuthenticationError);
+            super::Behavior { broker, close_after: None, push_after_connect: vec![] }
+        })
+        .await;
+        server.with(|world| world.lookup = LookupAnswer::Connect { broker: refusing.address.clone(), proxy: false });
+        let error = producer.send("refused".into()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authentication, "{error}");
+        client.close().await.unwrap();
+    });
 }

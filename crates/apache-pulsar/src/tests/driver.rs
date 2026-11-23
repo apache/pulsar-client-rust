@@ -129,6 +129,28 @@ fn the_connect_timeout_covers_the_authentication_provider() {
     });
 }
 
+/// A provider that can't supply credentials fails the connection with an authentication failure, whatever its own
+/// error's kind, which comes as the source: not retried, as the provider's kind here would be.
+#[test]
+fn a_failing_authentication_provider_is_an_authentication_failure() {
+    run(async {
+        let server = SimServer::start(None, self_serving).await;
+        let provider = || async { Err(crate::Error::new(ErrorKind::Connect, "the token service is down")) };
+        let client = local::PulsarClient::builder()
+            .service_url(server.service_url("pulsar"))
+            .authentication(Token::from_fn(provider))
+            .build()
+            .await
+            .unwrap();
+        let error = client.lookup(TOPIC).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authentication, "{error}");
+        let source = std::error::Error::source(&error).map(ToString::to_string);
+        assert_eq!(source.as_deref(), Some("Connect: the token service is down"));
+        assert!(server.received(Type::CONNECT).is_empty());
+        client.close().await.unwrap();
+    });
+}
+
 #[test]
 fn a_request_the_broker_does_not_support_fails_at_once() {
     run(async {

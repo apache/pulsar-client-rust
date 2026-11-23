@@ -30,7 +30,7 @@ use futures_util::Stream;
 
 use super::stream_task::{Request, Task};
 use super::writers::{self, Delivered, Writers};
-use super::{Message, Settings, SubscriptionInitialPosition, consumer_closed, consumer_options, invalid};
+use super::{Message, Settings, SubscriptionInitialPosition, consumer_closed, consumer_options, deadline, invalid};
 use crate::client::{LoopSlot, PulsarClient};
 use crate::config::{Blocking, Local, ThreadSafe};
 use crate::error::Result;
@@ -141,6 +141,24 @@ impl<T: 'static> StreamConsumerBuilder<T, ThreadSafe> {
 
     /// Subscribes, on the client's least loaded event loop: registers with the topic's controller, and subscribes to
     /// every segment it assigns.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidConfiguration`](crate::ErrorKind::InvalidConfiguration): the topic or the subscription name is
+    ///   missing or malformed, or the schema is a key/value schema with a part of [`Schema::auto_consume`], which reads
+    ///   key/value messages whole.
+    /// - [`NotFound`](crate::ErrorKind::NotFound): the topic doesn't exist, and the broker doesn't create it.
+    /// - [`Authentication`](crate::ErrorKind::Authentication), [`Authorization`](crate::ErrorKind::Authorization) and
+    ///   [`UnsupportedBroker`](crate::ErrorKind::UnsupportedBroker), from the brokers.
+    /// - [`IncompatibleSchema`](crate::ErrorKind::IncompatibleSchema): the schema isn't compatible with the topic's.
+    /// - [`ConsumerBusy`](crate::ErrorKind::ConsumerBusy): the subscription doesn't take the consumer, as when a
+    ///   consumer of another kind holds it.
+    /// - [`Timeout`](crate::ErrorKind::Timeout): no layout, no answer from the controller, or an assigned segment not
+    ///   subscribed, within the operation timeout; [`Connect`](crate::ErrorKind::Connect): the broker that serves the
+    ///   topic can't be reached.
+    /// - [`Other`](crate::ErrorKind::Other): the controller refused the consumer, as a 5.0.1 broker does for a regular
+    ///   `persistent://` topic until the topic migrates.
+    /// - [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed): the client is closed.
     pub async fn subscribe(self) -> Result<StreamConsumer<T>> {
         let ApiClient::ThreadSafe(client) = &self.client else { unreachable!() };
         let (topic, name, options) = self.options(client.operation_timeout())?;
@@ -159,6 +177,10 @@ impl<T: 'static> StreamConsumerBuilder<T, Blocking> {
     }
 
     /// Subscribes, on the client's least loaded event loop, and blocks until every assigned segment is subscribed.
+    ///
+    /// # Errors
+    ///
+    /// As the thread-safe API's `subscribe`, above.
     pub fn subscribe(self) -> Result<crate::blocking::StreamConsumer<T>> {
         let builder = StreamConsumerBuilder::<T, ThreadSafe> {
             client: self.client,
@@ -177,6 +199,10 @@ impl<T: 'static> StreamConsumerBuilder<T, Local> {
 
     /// Subscribes, on the local client's loop: registers with the topic's controller, and subscribes to every segment
     /// it assigns.
+    ///
+    /// # Errors
+    ///
+    /// As the thread-safe API's `subscribe`, above.
     pub async fn subscribe(self) -> Result<StreamConsumer<T, Local>> {
         let ApiClient::Local(client) = &self.client else { unreachable!() };
         let (topic, name, options) = self.options(client.operation_timeout())?;
@@ -308,7 +334,8 @@ impl<T: 'static, Api> StreamConsumer<T, Api> {
         &self.shared.consumer_name
     }
 
-    /// The next message. Fails only once the consumer is closed.
+    /// The next message. Fails only with [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed), once the consumer is
+    /// closed.
     ///
     /// Receives are answered in the order they are first polled. A receive dropped before it completes loses no
     /// message: the next receive gets it.
@@ -317,19 +344,21 @@ impl<T: 'static, Api> StreamConsumer<T, Api> {
         Ok(self.message(messages.pop().expect("a receive without a deadline gets its message")))
     }
 
-    /// The next message, or `None` if none comes within `timeout`.
+    /// The next message, or `None` if none comes within `timeout`. Fails only with
+    /// [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed), once the consumer is closed.
     pub async fn receive_timeout(&self, timeout: Duration) -> Result<Option<Message<T>>> {
-        let messages = self.shared.receive(1, Some(Instant::now() + timeout)).await?;
+        let messages = self.shared.receive(1, Some(deadline(timeout))).await?;
         Ok(messages.into_iter().next().map(|message| self.message(message)))
     }
 
     /// Up to `max` messages: as soon as there are `max`, or once `timeout` passes with those there are, none
-    /// included.
+    /// included. Fails with [`InvalidConfiguration`](crate::ErrorKind::InvalidConfiguration) if `max` is 0, and with
+    /// [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed) once the consumer is closed.
     pub async fn receive_batch(&self, max: usize, timeout: Duration) -> Result<Vec<Message<T>>> {
         if max == 0 {
             return Err(invalid("a batch receive takes at least one message"));
         }
-        let messages = self.shared.receive(max, Some(Instant::now() + timeout)).await?;
+        let messages = self.shared.receive(max, Some(deadline(timeout))).await?;
         Ok(messages.into_iter().map(|message| self.message(message)).collect())
     }
 
@@ -341,18 +370,18 @@ impl<T: 'static, Api> StreamConsumer<T, Api> {
     }
 
     /// Acknowledges the message and every message received before it, from every part of the topic (*client-api*
-    /// §4.1). The ack goes out with the others of its group; the broker doesn't confirm it. Fails only once the
-    /// consumer is closed.
+    /// §4.1). The ack goes out with the others of its group; the broker doesn't confirm it. Fails only with
+    /// [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed), once the consumer is closed.
     pub async fn acknowledge_cumulative(&self, id: &MessageId) -> Result<()> {
         let (reply, done) = oneshot::channel();
         self.shared.link.requests.unbounded_send(Request::Ack { id: id.0.clone(), reply }).map_err(consumer_closed)?;
         done.await.map_err(consumer_closed)?
     }
 
-    /// Closes the consumer: sends the acks waiting, closes every segment's consumer, and leaves the controller's
-    /// group, which rebalances at once. The receives waiting fail with
+    /// Closes the consumer: sends the acks waiting, closes every segment's consumer, and leaves the controller's group,
+    /// which rebalances at once. The receives waiting fail with
     /// [`ErrorKind::AlreadyClosed`](crate::ErrorKind::AlreadyClosed), and the messages not acknowledged go to the
-    /// subscription's other consumers. Can be called again.
+    /// subscription's other consumers. Can be called again. Doesn't fail.
     pub async fn close(&self) -> Result<()> {
         let (reply, done) = oneshot::channel();
         if self.shared.link.requests.unbounded_send(Request::Close { reply: Some(reply) }).is_err() {

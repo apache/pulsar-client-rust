@@ -203,7 +203,7 @@ pub enum ErrorKind {
     NotFound, Authentication, Authorization, Timeout, AlreadyClosed,
     ProducerBusy, ProducerFenced, ConsumerBusy, IncompatibleSchema, TopicTerminated,
     Connect, NotConnected, ProducerQueueFull, MemoryBufferFull, MessageTooLarge, TransactionConflict,
-    Crypto, InvalidConfiguration, InvalidServiceUrl, UnsupportedBroker,
+    Crypto, InvalidConfiguration, InvalidServiceUrl, UnsupportedBroker, Other,
 }
 ```
 
@@ -215,9 +215,26 @@ pub enum ErrorKind {
 - `MessageTooLarge` is the failure of a message larger than the broker's `max_message_size`. It fails alone,
   and the producer stays usable. The spec has no category for it, and Java V5 raises a plain
   `PulsarClientException` ([spec gap 12](../DESIGN.md#spec-gaps-to-raise-upstream)).
+- `Other` is a failure outside the categories, which the spec leaves room for, since it asks for `NotFound` to be
+  distinct from a generic failure: a value the schema can't encode or a payload it can't decode, an answer from a
+  broker the client can't read, a broker error code with no category of its own, an event loop that can't start.
+- Broker error codes map to kinds as Java V5 maps the exceptions they become (`V5ExceptionMappings`):
+  `ConsumerAssignError`, Key_Shared ranges that overlap another consumer's, is `ConsumerBusy`, and a transaction's
+  `InvalidTxnStatus` and `TransactionNotFound` are `TransactionConflict`. `InvalidTopicName`, which Java leaves
+  without a category, is `InvalidConfiguration`.
+- What the spec retries (*error-model* §3), the client retries: a lost connection, a broker that isn't ready, a
+  segment that is gone. A failure it keeps retrying ends as a `Timeout`, with the last failure in its message; a
+  message that moved from a sealed segment to its successors ten times fails with `TopicTerminated`. What the spec
+  surfaces comes back at once: credentials the broker refuses fail a lookup, a create, a subscribe, and a producer's
+  first registration on a segment, without a retry. A producer already registered on a segment retries them as it
+  retries the lost connection, so that its messages wait, within their send timeout, for a provider with fresh ones;
+  a running consumer subscribes the segment again after a backoff. An authentication provider that fails is an
+  `Authentication` failure, whatever its own error's kind, as in Java V5.
 - The spec's `Interrupted` has no Rust counterpart, since Rust threads are not interrupted.
 - An async operation never fails before its future exists: every failure comes out of the future
-  (*error-model* §1). Nothing in the public API panics on bad input; that is an `InvalidConfiguration` error.
+  (*error-model* §1). Nothing in the public API panics on bad input; that is an `InvalidConfiguration` error. A
+  duration longer than a year, as `Duration::MAX`, counts as a year, which every timer takes.
+- Each operation's rustdoc lists the kinds it fails with.
 
 ## 7. Message identifiers and checkpoints
 

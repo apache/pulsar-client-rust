@@ -31,7 +31,7 @@ use apache_pulsar_protocol::proto;
 use futures_channel::{mpsc, oneshot};
 
 use crate::client::{LoopSlot, PulsarClient};
-use crate::config::{Blocking, Local, ThreadSafe};
+use crate::config::{Blocking, Local, ThreadSafe, bounded};
 use crate::error::{Error, ErrorKind, Result};
 use crate::local;
 use crate::memory::{MemoryLimit, PER_MESSAGE_OVERHEAD};
@@ -111,7 +111,7 @@ impl BatchingPolicy {
         self.enabled.then_some(Batching {
             max_messages: self.max_messages,
             max_bytes: self.max_size,
-            max_delay: self.max_publish_delay,
+            max_delay: bounded(self.max_publish_delay),
         })
     }
 }
@@ -246,7 +246,7 @@ impl<T: 'static, Api> ProducerBuilder<T, Api> {
     /// How long a message may wait to be stored once it is on its way to a broker; [`Duration::ZERO`] for no
     /// limit. 30 s by default. A message that times out fails alone: the producer stays usable.
     pub fn send_timeout(mut self, timeout: Duration) -> Self {
-        self.settings.send_timeout = (!timeout.is_zero()).then_some(timeout);
+        self.settings.send_timeout = (!timeout.is_zero()).then_some(bounded(timeout));
         self
     }
 
@@ -309,7 +309,23 @@ impl<T: 'static> ProducerBuilder<T, ThreadSafe> {
         Self { client: ApiClient::ThreadSafe(client), schema, settings: Settings::default(), _api: PhantomData }
     }
 
-    /// Creates the producer, on the client's least loaded event loop.
+    /// Creates the producer, on the client's least loaded event loop, once the topic's layout is known. A Shared
+    /// producer registers on each segment with the first message routed there; an exclusive one registers on every
+    /// segment now.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidConfiguration`](ErrorKind::InvalidConfiguration): the topic is missing or malformed, the schema is
+    ///   one only consumers decode with ([`Schema::auto_consume`]), or this build leaves the codec out.
+    /// - [`NotFound`](ErrorKind::NotFound): the topic doesn't exist, and the broker doesn't create it.
+    /// - [`Authentication`](ErrorKind::Authentication), [`Authorization`](ErrorKind::Authorization) and
+    ///   [`UnsupportedBroker`](ErrorKind::UnsupportedBroker), from the broker that serves the topic.
+    /// - [`ProducerBusy`](ErrorKind::ProducerBusy), [`ProducerFenced`](ErrorKind::ProducerFenced) and
+    ///   [`IncompatibleSchema`](ErrorKind::IncompatibleSchema), under an exclusive access mode. A Shared producer
+    ///   meets them in its sends.
+    /// - [`Timeout`](ErrorKind::Timeout): no layout, or for an exclusive producer no segment's broker, within the
+    ///   operation timeout; [`Connect`](ErrorKind::Connect): the broker that serves the topic can't be reached.
+    /// - [`AlreadyClosed`](ErrorKind::AlreadyClosed): the client is closed.
     pub async fn create(self) -> Result<Producer<T>> {
         let ApiClient::ThreadSafe(client) = &self.client else { unreachable!() };
         let topic = normalize_topic(self.settings.topic.as_deref())?;
@@ -327,6 +343,10 @@ impl<T: 'static> ProducerBuilder<T, Blocking> {
     }
 
     /// Creates the producer, on the client's least loaded event loop, and blocks until it is ready.
+    ///
+    /// # Errors
+    ///
+    /// As the thread-safe API's `create`, above.
     pub fn create(self) -> Result<crate::blocking::Producer<T>> {
         let builder = ProducerBuilder::<T, ThreadSafe> {
             client: self.client,
@@ -344,6 +364,10 @@ impl<T: 'static> ProducerBuilder<T, Local> {
     }
 
     /// Creates the producer, on the local client's loop.
+    ///
+    /// # Errors
+    ///
+    /// As the thread-safe API's `create`, above.
     pub async fn create(self) -> Result<Producer<T, Local>> {
         let ApiClient::Local(client) = &self.client else { unreachable!() };
         let topic = normalize_topic(self.settings.topic.as_deref())?;
@@ -476,13 +500,18 @@ impl<T: 'static, Api> Producer<T, Api> {
         MessageBuilder { producer: self, value: None, message: OutgoingMessage::default() }
     }
 
-    /// Sends a message with only a value. See [`MessageBuilder::send`].
+    /// Sends a message with only a value. See [`MessageBuilder::send`], which fails the same ways.
     pub async fn send(&self, value: T) -> Result<MessageId> {
         self.new_message().value(value).send().await
     }
 
     /// Waits for every message sent before the call to be stored, and fails if one of them failed. The open batches
     /// go out at once, without waiting out the batching delay.
+    ///
+    /// # Errors
+    ///
+    /// The first failure among those messages, as their sends have it ([`MessageBuilder::send`]), or
+    /// [`AlreadyClosed`](ErrorKind::AlreadyClosed) once the producer is closed.
     pub async fn flush(&self) -> Result<()> {
         let (reply, done) = oneshot::channel();
         self.shared.link.requests.unbounded_send(Request::Flush { reply }).map_err(producer_closed)?;
@@ -492,7 +521,7 @@ impl<T: 'static, Api> Producer<T, Api> {
     /// Closes the producer: waits for the messages the brokers already have, fails those still waiting, in an open
     /// batch or for a layout, a connection or a segment's producer, with [`ErrorKind::AlreadyClosed`], and closes every
     /// segment's producer. Later sends fail. Can be called again. Call [`Producer::flush`] first to publish
-    /// everything.
+    /// everything. Doesn't fail.
     pub async fn close(&self) -> Result<()> {
         let (reply, done) = oneshot::channel();
         if self.shared.link.requests.unbounded_send(Request::Close { reply: Some(reply) }).is_err() {
@@ -554,7 +583,8 @@ impl<T: 'static, Api> MessageBuilder<'_, T, Api> {
 
     /// Delivers the message to consumers no sooner than `delay` from now.
     pub fn deliver_after(mut self, delay: Duration) -> Self {
-        self.message.deliver_at = Some(now_millis() as i64 + delay.as_millis() as i64);
+        // As late as the field holds, for a longer delay.
+        self.message.deliver_at = Some(i64::try_from(u128::from(now_millis()) + delay.as_millis()).unwrap_or(i64::MAX));
         self
     }
 
@@ -572,15 +602,36 @@ impl<T: 'static, Api> MessageBuilder<'_, T, Api> {
 
     /// Sends the message, and completes with its id once it is stored.
     ///
-    /// The message is queued when the future is first polled, so sends are published in the order their futures
-    /// are first polled, which is call order for code that awaits each one or drives them with `buffered`,
-    /// `FuturesOrdered` or `join_all`. Spawning each send as a task of its own gives no order. Dropping the future
-    /// after its first poll doesn't recall the message: it may still be published. The producer's send timeout
-    /// bounds how long a message waits.
+    /// The message is queued when the future is first polled, so sends are published in the order their futures are
+    /// first polled, which is call order for code that awaits each one or drives them with `buffered`, `FuturesOrdered`
+    /// or `join_all`. Spawning each send as a task of its own gives no order. Dropping the future after its first poll
+    /// doesn't recall the message: it may still be published. The producer's send timeout bounds how long a message
+    /// waits.
     ///
-    /// With batching, on by default, the message waits up to the batching delay (1 ms by default) for others to
-    /// join its batch. A loop that awaits each send pays that delay for every message: pipeline the sends, as above,
-    /// or call [`Producer::flush`], or turn batching off ([`ProducerBuilder::batching_policy`]).
+    /// With batching, on by default, the message waits up to the batching delay (1 ms by default) for others to join
+    /// its batch. A loop that awaits each send pays that delay for every message: pipeline the sends, as above, or call
+    /// [`Producer::flush`], or turn batching off ([`ProducerBuilder::batching_policy`]).
+    ///
+    /// # Errors
+    ///
+    /// A failed send fails that message only: the producer stays usable, unless it is closed.
+    ///
+    /// - [`InvalidConfiguration`](ErrorKind::InvalidConfiguration): the message has no value.
+    /// - [`Other`](ErrorKind::Other): the schema can't encode the value.
+    /// - [`MemoryBufferFull`](ErrorKind::MemoryBufferFull): the client's memory limit is reached, and the producer
+    ///   doesn't wait for room ([`ProducerBuilder::block_if_queue_full`]).
+    /// - [`MessageTooLarge`](ErrorKind::MessageTooLarge): the message is larger than the broker takes.
+    /// - [`Timeout`](ErrorKind::Timeout): the message wasn't stored within the send timeout, or no broker took the
+    ///   producer of its segment within the operation timeout.
+    /// - [`IncompatibleSchema`](ErrorKind::IncompatibleSchema), [`ProducerBusy`](ErrorKind::ProducerBusy),
+    ///   [`Authentication`](ErrorKind::Authentication) or [`Authorization`](ErrorKind::Authorization): the broker of
+    ///   the message's segment refused the producer, which a Shared producer registers with its first message there.
+    ///   The next message routed there tries again.
+    /// - [`ProducerFenced`](ErrorKind::ProducerFenced): a newer exclusive producer took the topic.
+    /// - [`TopicTerminated`](ErrorKind::TopicTerminated): the message moved from a sealed segment to its successors ten
+    ///   times without being stored.
+    /// - [`AlreadyClosed`](ErrorKind::AlreadyClosed): the producer is closed, or closed before a broker had the
+    ///   message.
     pub async fn send(self) -> Result<MessageId> {
         self.producer.dispatch(self.value, self.message, false).await
     }

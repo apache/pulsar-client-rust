@@ -318,6 +318,13 @@ fn sequence_ids_start_after_the_initial_or_the_brokers_last() {
     let mut second = Harness::new(first.world, TOPIC, options());
     second.send(None, "next");
     assert_eq!(second.world.stored_in(TOPIC, 0).last().unwrap().sequence_id, 3);
+
+    // The id after the largest initial one: an id is a `u64` on the wire.
+    let mut opts = options();
+    opts.initial_sequence_id = Some(i64::MAX);
+    let mut h = Harness::new(world(1), TOPIC, opts);
+    h.send(None, "a");
+    assert_eq!(h.world.stored_in(TOPIC, 0)[0].sequence_id, 1 << 63);
 }
 
 #[test]

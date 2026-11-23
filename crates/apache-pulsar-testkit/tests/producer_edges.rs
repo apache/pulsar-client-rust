@@ -269,6 +269,41 @@ fn registration_failures() {
     assert_eq!(t.producer.oldest_outstanding(), Some(waits));
 }
 
+/// Credentials refused as a registered segment's producer registers again, after a lost connection: retried, as the
+/// connection was, and its messages wait for a provider with fresh ones. A first registration fails with them.
+#[test]
+fn refused_credentials_are_retried_once_registered() {
+    let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
+    t.send(keyless());
+    let generation = Test::connects(&t.actions())[0].1;
+    t.register(0, generation, 7);
+    t.receipt(0, generation, 0, Some(1));
+    t.producer.on_disconnected(0, generation, t.now);
+    t.actions();
+    let waiting = t.send(keyless());
+    t.advance(Duration::from_secs(1));
+    let generation = Test::connects(&t.actions())[0].1;
+    let refused = RegisterError::Server { error: ServerError::AuthenticationError, message: "expired".into() };
+    t.producer.on_register_failed(0, generation, refused.clone(), t.now);
+    assert!(Test::done(&t.actions()).is_empty(), "the message waits");
+    t.advance(Duration::from_secs(1));
+    let generation = Test::connects(&t.actions())[0].1;
+    t.register(0, generation, 8);
+    assert_eq!(Test::sent(&t.actions()), [(0, 1)]);
+    t.receipt(0, generation, 1, Some(2));
+    assert!(matches!(&Test::done(&t.actions())[..], [(send, Ok(_))] if *send == waiting));
+
+    // A first registration fails with them.
+    let mut t = Test::new(ProducerAccessMode::Shared, one_segment());
+    let refused_send = t.send(keyless());
+    let generation = Test::connects(&t.actions())[0].1;
+    t.producer.on_register_failed(0, generation, refused, t.now);
+    let done = Test::done(&t.actions());
+    assert!(
+        matches!(&done[..], [(send, Err(SendError::Server { error: ServerError::AuthenticationError, .. }))] if *send == refused_send)
+    );
+}
+
 #[test]
 fn a_message_is_parked_at_most_ten_times() {
     let mut t = Test::new(ProducerAccessMode::Shared, one_segment());

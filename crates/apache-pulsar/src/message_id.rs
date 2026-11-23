@@ -48,7 +48,8 @@ impl MessageId {
         self.0.to_bytes()
     }
 
-    /// Restores an id from [`MessageId::to_bytes`], or from bytes the Java client wrote.
+    /// Restores an id from [`MessageId::to_bytes`], or from bytes the Java client wrote. Fails with
+    /// [`InvalidConfiguration`](ErrorKind::InvalidConfiguration) for bytes that aren't an id.
     pub fn from_bytes(bytes: &[u8]) -> Result<MessageId> {
         wire::MessageId::from_bytes(bytes)
             .map(MessageId)

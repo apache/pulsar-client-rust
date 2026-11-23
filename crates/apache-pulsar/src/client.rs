@@ -90,8 +90,8 @@ impl PulsarClient {
         ClientBuilder::default()
     }
 
-    /// Closes the client: every loop closes its connections, then its thread exits. Later operations fail with
-    /// [`ErrorKind::AlreadyClosed`]. Can be called again.
+    /// Closes the client: every loop closes its producers, its consumers and its connections, then its thread exits.
+    /// Later operations fail with [`ErrorKind::AlreadyClosed`]. Can be called again. Doesn't fail.
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -222,7 +222,16 @@ impl LoopStarter {
 }
 
 impl ClientBuilder<ThreadSafe> {
-    /// Starts the event loops and creates the client.
+    /// Starts the event loops and creates the client. It connects to no broker yet: the first producer or consumer
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidServiceUrl`](ErrorKind::InvalidServiceUrl): the service URL doesn't parse.
+    /// - [`InvalidConfiguration`](ErrorKind::InvalidConfiguration): the service URL is missing, a TLS file can't be
+    ///   read or holds no valid certificate or key, TLS authentication is set without a `pulsar+ssl://` URL, or the
+    ///   client has no event loop.
+    /// - [`Other`](ErrorKind::Other): an event loop's thread or runtime can't start.
     pub async fn build(self) -> Result<PulsarClient> {
         self.build_with(LoopStarter::SYSTEM).await
     }
@@ -231,9 +240,10 @@ impl ClientBuilder<ThreadSafe> {
     pub(crate) async fn build_with(self, starter: LoopStarter) -> Result<PulsarClient> {
         let loops = self.event_loops;
         let config = self.into_config()?;
-        let mut handles = Vec::with_capacity(loops);
-        let mut threads = Vec::with_capacity(loops);
-        let mut started = Vec::with_capacity(loops);
+        // Grown loop by loop: a count too large to start fails as the threads run out, with nothing reserved up front.
+        let mut handles = Vec::new();
+        let mut threads = Vec::new();
+        let mut started = Vec::new();
         let config_for_client = config.clone();
         for index in 0..loops {
             let (sender, receiver) = mpsc::unbounded();

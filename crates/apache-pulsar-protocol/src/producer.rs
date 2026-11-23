@@ -537,7 +537,7 @@ impl Producer {
             let last = success.last_sequence_id.unwrap_or(-1);
             s.last_published = last;
             s.last_pushed = s.last_pushed.max(last);
-            s.next_sequence = (last + 1).max(0) as u64;
+            s.next_sequence = next_after(last);
         }
         // The messages that got into a batch got their deadlines then.
         if let Some(timeout) = send_timeout {
@@ -569,6 +569,12 @@ impl Producer {
                     SendError::Server { error: ServerError::TopicTerminatedError, message },
                     now,
                 );
+            }
+            // Credentials refused as a registered segment's producer registers again: retried, as the lost connection
+            // was, so that its messages wait, within their send timeout, for a provider with fresh ones. A first
+            // registration fails with them, as a lookup does.
+            RegisterError::Server { error: ServerError::AuthenticationError, .. } if s.registered_once => {
+                return self.retry_later(segment, now);
             }
             RegisterError::Server { error, message } if !retriable(error) => SendError::Server { error, message },
             RegisterError::Server { error, message } => {
@@ -867,7 +873,7 @@ impl Producer {
         }
         let info = self.layout.segment(id).expect("routed to a segment of the layout");
         let (initial_last, initial_next) = match self.options.initial_sequence_id {
-            Some(initial) => (initial, (initial + 1).max(0) as u64),
+            Some(initial) => (initial, next_after(initial)),
             None => (-1, 0),
         };
         let segment = Segment {
@@ -1283,6 +1289,12 @@ pub(crate) fn retriable(error: ServerError) -> bool {
             | ServerError::UnknownError
             | ServerError::ProducerBlockedQuotaExceededError
     )
+}
+
+/// The sequence id after `last`, the last one used: 0 after none (-1). A `u64`, as on the wire, so the id after
+/// `i64::MAX` doesn't overflow.
+fn next_after(last: i64) -> u64 {
+    u64::try_from(last).map_or(0, |last| last + 1)
 }
 
 fn retirement_delay(check: u32) -> Duration {

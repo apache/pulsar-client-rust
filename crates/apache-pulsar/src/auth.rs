@@ -36,6 +36,9 @@ pub trait Authentication: Send + Sync + 'static {
     fn method_name(&self) -> &str;
 
     /// The data to send in `CONNECT`, and in answer to a refresh challenge. Called again for each.
+    ///
+    /// A failure fails the connection with [`ErrorKind::Authentication`], whatever the error's own kind, which comes
+    /// as its source. The client doesn't retry it.
     fn auth_data(&self) -> AuthFuture;
 
     /// Answers a challenge of a multi-round exchange. Single-round methods answer with fresh data.
@@ -81,7 +84,8 @@ impl Token {
         Self { source: TokenSource::Static(token.into().into()) }
     }
 
-    /// A token fetched by `fetch` whenever a connection is made or the broker asks for a refresh.
+    /// A token fetched by `fetch` whenever a connection is made or the broker asks for a refresh. A failed fetch fails
+    /// the connection with [`ErrorKind::Authentication`], as [`Authentication::auth_data`] says.
     pub fn from_fn<F, Fut>(fetch: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -127,7 +131,9 @@ pub struct TlsAuthentication {
 }
 
 impl TlsAuthentication {
-    /// Reads the certificate chain and private key from PEM files.
+    /// Reads the certificate chain and private key from PEM files. Fails with
+    /// [`InvalidConfiguration`](ErrorKind::InvalidConfiguration) if one can't be read; the client's `build` checks
+    /// what they hold.
     pub fn from_pem_files(chain: impl AsRef<std::path::Path>, key: impl AsRef<std::path::Path>) -> Result<Self> {
         let read = |path: &std::path::Path| {
             std::fs::read(path).map_err(|e| {
