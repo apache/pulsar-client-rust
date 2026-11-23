@@ -587,6 +587,58 @@ fn thread_safe_consumers_receive_on_any_thread() {
     assert_eq!(got, ["m0", "m1", "m2", "m3"]);
 }
 
+/// A duration too long for a deadline, as `Duration::MAX`, counts as a year: nothing panics or hangs. A message
+/// delivered after it waits as long as its metadata holds, not none.
+#[test]
+fn durations_too_long_for_a_deadline_count_as_a_year() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local::PulsarClient::builder()
+            .service_url(server.url())
+            .connect_timeout(Duration::MAX)
+            .operation_timeout(Duration::MAX)
+            .keepalive_interval(Duration::MAX)
+            .build()
+            .await
+            .unwrap();
+        let batching = crate::BatchingPolicy { max_publish_delay: Duration::MAX, ..Default::default() };
+        let producer = client
+            .new_producer(Schema::string())
+            .topic(TOPIC)
+            .send_timeout(Duration::MAX)
+            .batching_policy(batching)
+            .create()
+            .await
+            .unwrap();
+        // The batch waits until the flush.
+        let (sent, flushed) = futures_util::join!(producer.send("now".into()), producer.flush());
+        sent.unwrap();
+        flushed.unwrap();
+        producer.new_message().value("later".into()).deliver_after(Duration::MAX).send().await.unwrap();
+        let delivered_at = server.world.borrow().stored(TOPIC).last().unwrap().metadata.deliver_at_time;
+        assert_eq!(delivered_at, Some(i64::MAX));
+
+        let consumer = client
+            .new_queue_consumer(Schema::string())
+            .topic(TOPIC)
+            .subscription_name(SUB)
+            .subscription_initial_position(SubscriptionInitialPosition::Earliest)
+            .acknowledgment_group_time(Duration::MAX)
+            .negative_ack_redelivery_delay(Duration::MAX)
+            .subscribe()
+            .await
+            .unwrap();
+        let first = consumer.receive_timeout(Duration::MAX).await.unwrap().unwrap();
+        let more = consumer.receive_batch(1, Duration::MAX).await.unwrap();
+        consumer.negative_acknowledge(first.id()).unwrap();
+        consumer.acknowledge(more[0].id()).await.unwrap();
+        // The ack waits for its group until the close sends it.
+        consumer.close().await.unwrap();
+        assert_eq!(backlog(&server, 0), 1);
+        client.close().await.unwrap();
+    });
+}
+
 /// Thread-safe consumers, their messages and their futures can move across threads.
 #[allow(dead_code)]
 fn thread_safe_types_are_send(consumer: &crate::QueueConsumer<String>, id: &crate::MessageId) {

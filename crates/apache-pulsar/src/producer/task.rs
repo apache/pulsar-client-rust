@@ -36,7 +36,9 @@ use apache_pulsar_protocol::connection::IdKind;
 use apache_pulsar_protocol::frame::Frame;
 use apache_pulsar_protocol::producer::{Action, OutgoingMessage, Producer, RegisterError, SendError, SendId};
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{BaseCommand, CommandCloseProducer, CommandProducerSuccess, MessageMetadata};
+use apache_pulsar_protocol::proto::{
+    BaseCommand, CommandCloseProducer, CommandProducerSuccess, MessageMetadata, ServerError,
+};
 use buffa::{EnumValue, MessageView};
 use bytes::Bytes;
 use futures_channel::{mpsc, oneshot};
@@ -466,11 +468,16 @@ async fn register(
     Ok((link, pushes, success))
 }
 
-/// Why a producer couldn't register: the broker's refusal, or no broker to ask.
+/// Why a producer or a consumer couldn't register: the broker's refusal, or no broker to ask. Credentials the broker
+/// refused, or the provider couldn't supply, count as the broker's `AuthenticationError`, which isn't retried, as a
+/// lookup doesn't retry them.
 impl From<Error> for RegisterError {
     fn from(error: Error) -> Self {
         match error.server_error() {
             Some((error, message)) => RegisterError::Server { error, message },
+            None if error.kind() == ErrorKind::Authentication => {
+                RegisterError::Server { error: ServerError::AuthenticationError, message: error.message().to_string() }
+            }
             None => RegisterError::Unavailable(error.to_string()),
         }
     }

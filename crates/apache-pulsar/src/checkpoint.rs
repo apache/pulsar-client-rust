@@ -47,7 +47,8 @@ impl Checkpoint {
         self.0.to_bytes()
     }
 
-    /// Restores a checkpoint from [`Checkpoint::to_bytes`], or from bytes the Java client wrote.
+    /// Restores a checkpoint from [`Checkpoint::to_bytes`], or from bytes the Java client wrote. Fails with
+    /// [`InvalidConfiguration`](ErrorKind::InvalidConfiguration) for bytes that aren't a checkpoint.
     pub fn from_bytes(bytes: &[u8]) -> Result<Checkpoint> {
         wire::Checkpoint::from_bytes(bytes)
             .map(Checkpoint)

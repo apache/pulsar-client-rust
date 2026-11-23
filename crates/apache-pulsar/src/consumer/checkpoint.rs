@@ -31,7 +31,7 @@ use futures_util::Stream;
 
 use super::stream::random_name;
 use super::task::Machine;
-use super::{Link, Message, Request, consumer_closed, invalid};
+use super::{Link, Message, Request, consumer_closed, deadline, invalid};
 use crate::checkpoint::Checkpoint;
 use crate::client::{LoopSlot, PulsarClient};
 use crate::config::{Blocking, Local, ThreadSafe};
@@ -166,6 +166,21 @@ impl<T: 'static> CheckpointConsumerBuilder<T, ThreadSafe> {
 
     /// Creates the consumer, on the client's least loaded event loop, with a reader on every segment of the topic, or,
     /// in a group, on every segment the topic's controller assigns it.
+    ///
+    /// # Errors
+    ///
+    /// - [`InvalidConfiguration`](crate::ErrorKind::InvalidConfiguration): the topic is missing or malformed, or the
+    ///   schema is a key/value schema with a part of [`Schema::auto_consume`], which reads key/value messages whole.
+    /// - [`NotFound`](crate::ErrorKind::NotFound): the topic doesn't exist, and the broker doesn't create it.
+    /// - [`Authentication`](crate::ErrorKind::Authentication), [`Authorization`](crate::ErrorKind::Authorization) and
+    ///   [`UnsupportedBroker`](crate::ErrorKind::UnsupportedBroker), from the brokers.
+    /// - [`IncompatibleSchema`](crate::ErrorKind::IncompatibleSchema): the schema isn't compatible with the topic's.
+    /// - [`Timeout`](crate::ErrorKind::Timeout): no layout, no answer from the controller, or a segment's reader not
+    ///   subscribed, within the operation timeout; [`Connect`](crate::ErrorKind::Connect): the broker that serves the
+    ///   topic can't be reached.
+    /// - [`Other`](crate::ErrorKind::Other): the controller refused a member of a group, as a 5.0.1 broker does for a
+    ///   regular `persistent://` topic until the topic migrates.
+    /// - [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed): the client is closed.
     pub async fn create(mut self) -> Result<CheckpointConsumer<T>> {
         let ApiClient::ThreadSafe(client) = &self.client else { unreachable!() };
         let client = client.clone();
@@ -185,6 +200,10 @@ impl<T: 'static> CheckpointConsumerBuilder<T, Blocking> {
 
     /// Creates the consumer, on the client's least loaded event loop, and blocks until every segment's reader is
     /// subscribed.
+    ///
+    /// # Errors
+    ///
+    /// As the thread-safe API's `create`, above.
     pub fn create(self) -> Result<crate::blocking::CheckpointConsumer<T>> {
         let builder = CheckpointConsumerBuilder::<T, ThreadSafe> {
             client: self.client,
@@ -203,6 +222,10 @@ impl<T: 'static> CheckpointConsumerBuilder<T, Local> {
 
     /// Creates the consumer, on the local client's loop, with a reader on every segment of the topic, or, in a group,
     /// on every segment the topic's controller assigns it.
+    ///
+    /// # Errors
+    ///
+    /// As the thread-safe API's `create`, above.
     pub async fn create(mut self) -> Result<CheckpointConsumer<T, Local>> {
         let ApiClient::Local(client) = &self.client else { unreachable!() };
         let client = client.clone();
@@ -282,7 +305,8 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
         self.shared.consumer_name.as_deref()
     }
 
-    /// The next message. Fails only once the consumer is closed.
+    /// The next message. Fails only with [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed), once the consumer is
+    /// closed.
     ///
     /// Receives are answered in the order they are first polled. A receive dropped before it completes loses no
     /// message: the next receive gets it, and checkpoints taken meanwhile don't count it as received.
@@ -291,19 +315,21 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
         Ok(self.message(messages.pop().expect("a receive without a deadline gets its message")))
     }
 
-    /// The next message, or `None` if none comes within `timeout`.
+    /// The next message, or `None` if none comes within `timeout`. Fails only with
+    /// [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed), once the consumer is closed.
     pub async fn receive_timeout(&self, timeout: Duration) -> Result<Option<Message<T>>> {
-        let messages = self.shared.link.receive(1, Some(Instant::now() + timeout)).await?;
+        let messages = self.shared.link.receive(1, Some(deadline(timeout))).await?;
         Ok(messages.into_iter().next().map(|message| self.message(message)))
     }
 
     /// Up to `max` messages: as soon as there are `max`, or once `timeout` passes with those there are, none
-    /// included.
+    /// included. Fails with [`InvalidConfiguration`](crate::ErrorKind::InvalidConfiguration) if `max` is 0, and with
+    /// [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed) once the consumer is closed.
     pub async fn receive_batch(&self, max: usize, timeout: Duration) -> Result<Vec<Message<T>>> {
         if max == 0 {
             return Err(invalid("a batch receive takes at least one message"));
         }
-        let messages = self.shared.link.receive(max, Some(Instant::now() + timeout)).await?;
+        let messages = self.shared.link.receive(max, Some(deadline(timeout))).await?;
         Ok(messages.into_iter().map(|message| self.message(message)).collect())
     }
 
@@ -315,8 +341,8 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
     }
 
     /// Where the application is: for each segment, the last message a receive returned, or where the segment's
-    /// reading starts. A consumer created at it reads on from there. It asks nothing of the brokers. Fails only once
-    /// the consumer is closed.
+    /// reading starts. A consumer created at it reads on from there. It asks nothing of the brokers. Fails only with
+    /// [`AlreadyClosed`](crate::ErrorKind::AlreadyClosed), once the consumer is closed.
     pub async fn checkpoint(&self) -> Result<Checkpoint> {
         let (reply, checkpoint) = oneshot::channel();
         self.shared.link.requests.unbounded_send(Request::Checkpoint { reply }).map_err(consumer_closed)?;
@@ -324,7 +350,7 @@ impl<T: 'static, Api> CheckpointConsumer<T, Api> {
     }
 
     /// Closes the consumer: closes every segment's reader, and leaves the group. The receives waiting fail with
-    /// [`ErrorKind::AlreadyClosed`](crate::ErrorKind::AlreadyClosed). Can be called again.
+    /// [`ErrorKind::AlreadyClosed`](crate::ErrorKind::AlreadyClosed). Can be called again. Doesn't fail.
     pub async fn close(&self) -> Result<()> {
         self.shared.link.close().await
     }

@@ -40,7 +40,7 @@ use apache_pulsar_protocol::assignment::AssignmentSession;
 use apache_pulsar_protocol::connection::IdKind;
 use apache_pulsar_protocol::entry::ReceivedMessage;
 use apache_pulsar_protocol::frame::Frame;
-use apache_pulsar_protocol::lookup::{BrokerAddress, parse_broker_url};
+use apache_pulsar_protocol::lookup::{BrokerAddress, LookupError, parse_broker_url};
 use apache_pulsar_protocol::message_id::MessageId;
 use apache_pulsar_protocol::producer::RegisterError;
 use apache_pulsar_protocol::proto::base_command::Type;
@@ -54,7 +54,7 @@ use futures_util::{Stream, StreamExt};
 use super::task::{Link, Linked, close_command, subscribe, subscribe_error};
 use super::writers::{Delivered, Writers};
 use crate::conn::{ConnHandle, Push};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::local;
 
 /// What a Stream consumer's handle asks of its task.
@@ -542,7 +542,8 @@ async fn controller(client: &local::PulsarClient, topic: &str) -> Result<BrokerA
     let service = client.service();
     let watch = client.watches().open(client, topic).await?;
     match watch.current().controller(service.tls) {
-        Some(url) => Ok(BrokerAddress::direct(parse_broker_url(url).map_err(Error::from)?)),
+        // A URL from the broker, not the application's: one that doesn't parse is a malformed answer.
+        Some(url) => Ok(BrokerAddress::direct(parse_broker_url(url).map_err(LookupError::from)?)),
         None => Ok(BrokerAddress::direct(service.hosts[0].clone())),
     }
 }
