@@ -16,11 +16,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The performance baseline (docs/8-quality.md §6): this client's `perf` against Java's `pulsar-perf`, which drives the
-# V5 client for a `topic://` topic. Each run has a standalone broker of its own, and its client runs in a container of
-# its own on the broker's Docker network, so that both clients take the same path to the broker. Both are bounded by a
-# 64 MiB client memory limit, the only bound a V5 producer has. `perf` drives the thread-safe client, with one event
-# loop, from a thread of its own, as `pulsar-perf` sends from a thread of its own.
+# The performance baseline (docs/8-quality.md §6): this client's `pulsar-perf` against Java's `pulsar-perf`, which
+# drives the V5 client for a `topic://` topic. Each run has a standalone broker of its own, and its client runs in a
+# container of its own on the broker's Docker network, so that both clients take the same path to the broker. Both are
+# bounded by a 64 MiB client memory limit, the only bound a V5 producer has. This client's drives the thread-safe
+# client, with one event loop, from a thread of its own, as Java's sends from a thread of its own.
 #
 #   tools/perf/baseline.sh            all the runs, each client in turn
 #   tools/perf/baseline.sh latency    the runs whose name holds `latency`
@@ -44,10 +44,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# `perf` for Linux, built in the official Rust image, with its target and registry cached in volumes.
+# This client's `pulsar-perf` for Linux, built in the official Rust image, with its target and registry cached in
+# volumes.
 docker run --rm -v "$ROOT:/src:ro" -v apr-perf-target:/target -v apr-perf-registry:/usr/local/cargo/registry \
-    -e CARGO_TARGET_DIR=/target -w /src "$RUST_IMAGE" cargo build --release --locked -p perf
-docker run --rm -v apr-perf-target:/target -v "$BIN:/out" "$RUST_IMAGE" cp /target/release/perf /out/perf
+    -e CARGO_TARGET_DIR=/target -w /src "$RUST_IMAGE" cargo build --release --locked -p pulsar-perf
+docker run --rm -v apr-perf-target:/target -v "$BIN:/out" "$RUST_IMAGE" cp /target/release/pulsar-perf /out/pulsar-perf
 
 docker network create "$NET" >/dev/null
 
@@ -82,7 +83,7 @@ summary() {
 }
 
 rust() {
-    docker run --rm --network "$NET" -v "$BIN:/perf:ro" "$RUST_IMAGE" /perf/perf "$@" 2>&1 | summary
+    docker run --rm --network "$NET" -v "$BIN:/perf:ro" "$RUST_IMAGE" /perf/pulsar-perf "$@" 2>&1 | summary
 }
 
 java() {
@@ -116,8 +117,8 @@ produce() {
 }
 
 # A Queue consumer of each client reading `$2` messages of 1 KiB from the earliest, on a broker of its own, which
-# `perf` fills first. This client's twice: on the thread-safe client, whose receives and acks each cross to its loop's
-# thread, and on the local client, on the thread receiving.
+# this client's `pulsar-perf` fills first. This client's twice: on the thread-safe client, whose receives and acks
+# each cross to its loop's thread, and on the local client, on the thread receiving.
 consume() {
     local name=$1 messages=$2 client topic
     [[ -z "$FILTER" || "$name" == *"$FILTER"* ]] || return 0

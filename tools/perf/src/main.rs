@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `perf`: the producer's and the Queue consumer's throughput and latency against a broker (docs/8-quality.md §6).
+//! `pulsar-perf`: the producer's and the Queue consumer's throughput and latency against a broker (docs/8-quality.md
+//! §6).
 //!
 //! Its options and its summary lines are those of Java's `pulsar-perf produce` and `pulsar-perf consume`, so that the
 //! two clients compare line for line on the same broker:
 //!
 //! ```text
-//! perf produce -u pulsar://localhost:6650 -s 1024 -m 1000000 -r 5000000 topic://public/default/perf
-//! perf consume -u pulsar://localhost:6650 -m 1000000 topic://public/default/perf
+//! pulsar-perf produce -u pulsar://localhost:6650 -s 1024 -m 1000000 -r 5000000 topic://public/default/perf
+//! pulsar-perf consume -u pulsar://localhost:6650 -m 1000000 topic://public/default/perf
 //! ```
 
 use std::pin::pin;
@@ -42,7 +43,7 @@ use hdrhistogram::Histogram;
 const PER_MESSAGE_OVERHEAD: u64 = 1024;
 
 #[derive(Parser)]
-#[command(about = "Throughput and latency of the producer and the Queue consumer, as pulsar-perf measures them")]
+#[command(about = "Throughput and latency of the producer and the Queue consumer, as Java's pulsar-perf measures them")]
 struct Args {
     #[command(subcommand)]
     command: Command,

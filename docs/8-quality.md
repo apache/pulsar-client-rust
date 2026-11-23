@@ -91,10 +91,10 @@ a layout change. It is written so that it could later grow into a suite every SD
 - `cargo-deny` for licenses (ASF third-party policy) and advisories.
 - Apache RAT for the ASF license header on every file but those `.rat-excludes` lists.
 - Integration tests against the broker container.
-- Test coverage, measured with `cargo llvm-cov` on a pinned compiler, without the generated protobuf code. The
-  job lists the lines and regions no test runs, such as the error branch of a `?`, and fails a pull request whose
-  line coverage is below its base's. A drop needs a test for what the change added, or a reason in the pull
-  request for leaving the line unreached.
+- Test coverage, measured with `cargo llvm-cov` on a pinned compiler, without the generated protobuf code or
+  `tools/perf`. The job lists the lines and regions no test runs, such as the error branch of a `?`, and fails a pull
+  request whose line coverage is below its base's. A drop needs a test for what the change added, or a reason in the
+  pull request for leaving the line unreached.
 
 ## 5. Releases
 
@@ -109,11 +109,12 @@ Two harnesses measure the client, and a recorded baseline is what later rounds c
 - **Micro-benchmarks**, with criterion: `cargo bench -p apache-pulsar-protocol`. The producer's state machine routes,
   batches, encodes and matches the receipts of 1000 keyed messages, sans IO, batched or not; each codec compresses a
   batch of 1000 small JSON messages, and the consumer decompresses it and splits it into its messages.
-- **End to end**, `tools/perf`: `perf produce` and `perf consume`, the producer's and the Queue consumer's throughput
-  and latency against a broker. Its options, its payloads and its summary lines are those of Java's `pulsar-perf`,
-  which drives the V5 client for a `topic://` topic, so that the two compare line for line. `tools/perf/baseline.sh`
-  runs both, each in a container of its own on the broker's Docker network, against a standalone broker of its own for
-  each run, both bounded by a 64 MiB client memory limit, the only bound a V5 producer has.
+- **End to end**, `tools/perf`: this client's `pulsar-perf`, which `cargo build --release` builds. `pulsar-perf produce`
+  and `pulsar-perf consume` measure the producer's and the Queue consumer's throughput and latency against a broker.
+  Their options, their payloads and their summary lines are those of Java's `pulsar-perf`, which drives the V5 client
+  for a `topic://` topic, so that the two compare line for line. `tools/perf/baseline.sh` runs both, each in a
+  container of its own on the broker's Docker network, against a standalone broker of its own for each run, both
+  bounded by a 64 MiB client memory limit, the only bound a V5 producer has.
 
 Still to measure: loop counts, with producers spread over the thread-safe client's loops, and pulsar-rs, which has no
 scalable topics, so `persistent://` topics through the migration bridge, from a harness on tokio. An OpenMessaging
@@ -165,11 +166,11 @@ reaches, 1 KiB messages of uppercase letters, batches of up to 1 ms, one segment
 
 What it shows:
 
-- **The client side is bound by its CPU, the producer and `perf` driving it.** In a separate 1 KiB run, sampled with
-  `docker stats`, this client used 150–180% of a core, its loop's thread and the one making the load, for about 500k
-  msg/s, and 100% on the local client, both on one thread, for about 400k. Java's used under one core for about 990k,
-  and the broker had room every time. The state machine takes under 0.3 µs of a message, the micro-benchmarks say,
-  out of about 3 µs of CPU in all, `perf`'s share included: the next round looks for where the rest goes.
+- **The client side is bound by its CPU, the producer and `pulsar-perf` driving it.** In a separate 1 KiB run, sampled
+  with `docker stats`, this client used 150–180% of a core, its loop's thread and the one making the load, for about
+  500k msg/s, and 100% on the local client, both on one thread, for about 400k. Java's used under one core for about
+  990k, and the broker had room every time. The state machine takes under 0.3 µs of a message, the micro-benchmarks
+  say, out of about 3 µs of CPU in all, `pulsar-perf`'s share included: the next round looks for where the rest goes.
 - **Large messages are bound by the broker:** at 10 KiB both clients store about 1 GB/s.
 - **At a fixed rate, the latencies match**, this client's a little lower.
 - **The thread-safe consumer's receives and acks each cross to its loop's thread**, so a loop receiving and

@@ -30,6 +30,7 @@ default-members = [
     "crates/apache-pulsar",
     "crates/apache-pulsar-protocol",
     "crates/apache-pulsar-testkit",
+    "tools/perf",
 ]
 
 [workspace.package]

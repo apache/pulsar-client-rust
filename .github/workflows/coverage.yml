@@ -59,13 +59,16 @@ jobs:
       # `cargo test` could assert. One added later stays out the same way, instead of arriving at 0% and failing
       # this job for a change that could not have caused the drop.
       #
+      # tools/perf is a default member, so that `cargo build --release` builds `pulsar-perf`, but it is a binary
+      # of the same kind: it is left out of the report instead.
+      #
       # The generated protobuf code is left out of the report: there is far more of it than code written by hand,
       # most of it for commands the client does not use yet, and the total would measure little else.
       - name: Run the tests under cargo-llvm-cov
         run: >
           cargo llvm-cov --locked
           --json --output-path target/coverage.json
-          --ignore-filename-regex '/apache-pulsar-protocol/src/proto/'
+          --ignore-filename-regex '/apache-pulsar-protocol/src/proto/|/tools/perf/'
       - name: Summarize
         id: summary
         run: python3 .github/scripts/coverage-summary.py target/coverage.json

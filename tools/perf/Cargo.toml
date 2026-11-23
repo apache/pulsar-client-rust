@@ -16,8 +16,8 @@
 # under the License.
 
 [package]
-name = "perf"
-description = "Throughput and latency of the producer and the Queue consumer against a broker, as pulsar-perf measures them"
+name = "pulsar-perf"
+description = "Throughput and latency of the producer and the Queue consumer against a broker, as Java's pulsar-perf does"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
