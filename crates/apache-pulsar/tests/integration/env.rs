@@ -22,6 +22,7 @@
 //! because the broker advertises them in its lookup answers (`broker.conf`), so only one environment runs on a
 //! host at a time.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -48,8 +49,9 @@ const JAVA_TOOLS_CLASSPATH: [&str; 4] = [
     "com.google.protobuf-protobuf-java-4.36.2.jar",
 ];
 /// The Java test tools, by file name.
-const JAVA_TOOLS: [(&str, &[u8]); 2] = [
+const JAVA_TOOLS: [(&str, &[u8]); 3] = [
     ("CheckpointTool.java", include_bytes!("CheckpointTool.java")),
+    ("RoutingTool.java", include_bytes!("RoutingTool.java")),
     ("SchemaTool.java", include_bytes!("SchemaTool.java")),
 ];
 const NETWORK: &str = "apr-it-net";
@@ -297,6 +299,32 @@ impl Env {
     /// tool prints it: its name, type, definition and properties, a line each.
     pub fn java_schema_info(&self, kind: &str, message: &str) -> String {
         self.java(&["SchemaTool", "info", kind, message])
+    }
+
+    /// Publishes a message for each of `keys` to `topic` with the Java client's V5 producer, as the admin, and returns
+    /// the segment the producer sent each key to.
+    pub fn java_route(&self, topic: &str, keys: &[String]) -> BTreeMap<String, u64> {
+        let args: Vec<&str> = ["RoutingTool", topic].into_iter().chain(keys.iter().map(String::as_str)).collect();
+        let output = self.java(&args);
+        let routed = output.lines().filter_map(|line| line.strip_prefix("routed ")).map(|line| {
+            let (key, id) = line.split_once(' ').expect("a key and a message id");
+            let segment = id.split_once("segment=").and_then(|(_, rest)| rest.split(',').next()?.parse().ok());
+            (key.to_string(), segment.unwrap_or_else(|| panic!("no segment in {id}")))
+        });
+        routed.collect()
+    }
+
+    /// Kills the broker, as a crash would, starts it again, and returns once it serves again. Every client connection
+    /// drops, the proxy's to the broker included. The broker keeps what it stored; the Java clients running in the
+    /// background ([`Env::v4_consumer`], [`Env::v4_producer`]) are gone.
+    pub fn restart_broker(&self) {
+        self.broker.stop_with_timeout(Some(0)).unwrap();
+        self.broker.start().unwrap();
+        let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+        while let Err(error) = self.try_admin(&["brokers", "healthcheck"]) {
+            assert!(std::time::Instant::now() < deadline, "the broker did not come back: {error}");
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     /// Runs one of the Java test tools in the broker container, with its arguments, and returns what it printed.
