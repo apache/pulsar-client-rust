@@ -304,6 +304,19 @@ fn refused_credentials_are_retried_once_registered() {
     );
 }
 
+/// Java: `V5AuthErrorTest.testProduceNotAuthorized`, its exclusive producer. An exclusive producer registers on every
+/// segment at create: a segment refusing it for authorization fails the create with the refusal, and the producer
+/// closes. A shared producer's messages fail instead (`registration_failures`).
+#[test]
+fn an_exclusive_create_refused_for_authorization_fails() {
+    let mut t = Test::new(ProducerAccessMode::Exclusive, one_segment());
+    let generation = Test::connects(&t.actions())[0].1;
+    let denied = RegisterError::Server { error: ServerError::AuthorizationError, message: "no".into() };
+    t.producer.on_register_failed(0, generation, denied, t.now);
+    let refused = SendError::Server { error: ServerError::AuthorizationError, message: "no".into() };
+    assert_eq!(t.actions(), [Action::Created(Err(refused)), Action::Closed]);
+}
+
 #[test]
 fn a_message_is_parked_at_most_ten_times() {
     let mut t = Test::new(ProducerAccessMode::Shared, one_segment());

@@ -78,6 +78,27 @@ fn legacy_layout_routes_like_v4_partitions() {
     }
 }
 
+/// A legacy segment active beside a managed one: keys still route by hash range. Only a layout whose active
+/// segments are all legacy routes them like v4 partitions. Java's
+/// `SegmentRouterTest.testMixedLegacyAndRegularStillUsesHashRouting`.
+#[test]
+fn a_legacy_segment_beside_a_managed_one_routes_by_hash_range() {
+    let legacy = SegmentInfoProto {
+        legacy_topic_name: Some("persistent://acme/orders/events-partition-0".into()),
+        ..info(0, 0, 0x7fff, true)
+    };
+    let layout = layout(vec![legacy, info(1, 0x8000, 0xffff, true)]);
+    // A key in each half whose v4 partition is the other segment.
+    let crossed = |high: bool| {
+        (0..)
+            .map(|i: u32| KeyHash::of(&i.to_be_bytes()))
+            .find(|h| (h.segment_hash() >= 0x8000) == high && h.partition(2) == u32::from(!high))
+            .unwrap()
+    };
+    assert_eq!(layout.route_key(crossed(false)), Ok(0));
+    assert_eq!(layout.route_key(crossed(true)), Ok(1));
+}
+
 /// A layout replaces one of a lower epoch. At the same epoch, only a migrated topic's first layout replaces the
 /// synthetic one, as the 5.0.1 broker gives both epoch 0.
 #[test]
@@ -126,4 +147,18 @@ fn keeps_bucket_splits() {
     let mut segment = info(0, 0, 0xffff, true);
     segment.entry_bucket_splits = vec![0x100, 0x1_0000];
     assert_eq!(layout(vec![segment]).segment(0).unwrap().bucket_splits, [0x100, 0xffff]);
+}
+
+/// The DAG names the controller's `pulsar://` and `pulsar+ssl://` URLs: the layout gives the one for the client's
+/// connections. Java's `ClientSegmentLayoutTest.testControllerBrokerUrlPropagated`.
+#[test]
+fn gives_the_controller_url_for_plain_or_tls_connections() {
+    let dag = ScalableTopicDAG {
+        controller_broker_url: Some("pulsar://controller:6650".into()),
+        controller_broker_url_tls: Some("pulsar+ssl://controller-tls:6651".into()),
+        ..Default::default()
+    };
+    let layout = Layout::from_dag(&dag, "topic://acme/orders/events").unwrap();
+    assert_eq!(layout.controller(false), Some("pulsar://controller:6650"));
+    assert_eq!(layout.controller(true), Some("pulsar+ssl://controller-tls:6651"));
 }
