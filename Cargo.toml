@@ -38,6 +38,9 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/apache/pulsar-client-rust"
 homepage = "https://pulsar.apache.org"
+# The minimum supported Rust version, which is what compio needs (docs/1-scope.md §4). CI checks the published crates
+# with it.
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Without its codecs: apache-pulsar forwards a feature for each, and the testkit takes them all.

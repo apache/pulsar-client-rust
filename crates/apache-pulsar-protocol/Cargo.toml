@@ -23,6 +23,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["pulsar", "protocol", "sans-io", "messaging"]
+categories = ["network-programming"]
+# The tests' vectors from the Java client (over 1 MB) and the benchmarks stay out of the package.
+exclude = ["/tests", "/benches"]
 
 [lints]
 workspace = true

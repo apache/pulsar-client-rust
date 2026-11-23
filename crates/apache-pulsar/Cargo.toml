@@ -23,6 +23,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["pulsar", "messaging", "pubsub", "streaming", "queue"]
+categories = ["network-programming", "asynchronous"]
+# The integration tests need Docker, a broker image and the unpublished testkit: they stay out of the package.
+exclude = ["/tests"]
 
 [lints]
 workspace = true

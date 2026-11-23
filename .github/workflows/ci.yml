@@ -84,6 +84,34 @@ jobs:
       - run: cargo install --locked cargo-deny
       - run: cargo deny check
 
+  # The published crates build with the minimum supported Rust version, the one Cargo.toml states.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the minimum supported Rust version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal && rustup default "$msrv"
+      - run: cargo check --locked -p apache-pulsar -p apache-pulsar-protocol --all-features
+
+  # The crates as the release manager publishes them: packaged from an unpacked source archive, as a release's
+  # source tarball holds the code (RELEASE.md). cargo builds each package, apache-pulsar against the
+  # apache-pulsar-protocol it has just packaged, since that version isn't on crates.io yet.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Unpack a source archive of the commit
+        run: mkdir "$RUNNER_TEMP/src" && git archive HEAD | tar -x -C "$RUNNER_TEMP/src"
+      - name: What the packages hold
+        working-directory: ${{ runner.temp }}/src
+        run: cargo package --list -p apache-pulsar-protocol -p apache-pulsar
+      - name: Package and verify, without uploading
+        working-directory: ${{ runner.temp }}/src
+        run: cargo publish --dry-run --locked -p apache-pulsar-protocol -p apache-pulsar
+
   compio-checks:
     strategy:
       fail-fast: false
