@@ -62,6 +62,20 @@ jobs:
       - name: Generated protobuf code is up to date
         run: cargo run -p xtask -- codegen --check
 
+  # Every file carries the ASF license header, except those .rat-excludes lists (docs/8-quality.md §5). Apache RAT
+  # runs through jbang, as Pulsar's Helm chart runs it, but at 0.16.1: from 0.17, RAT takes Rust sources and shell
+  # scripts for binary files (Apache Tika types .rs as application/rls-services+xml) and skips them. RAT exits 0
+  # whatever it finds, so the step fails unless its summary reports no unknown licenses.
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check license headers with Apache RAT
+        run: |
+          curl -Ls https://sh.jbang.dev | bash -s - run org.apache.rat:apache-rat:0.16.1 -E .rat-excludes -d . 2>&1 \
+            | tee "$RUNNER_TEMP/rat.txt"
+          grep -q '^0 Unknown Licenses$' "$RUNNER_TEMP/rat.txt"
+
   deny:
     runs-on: ubuntu-latest
     steps:
