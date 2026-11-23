@@ -69,6 +69,8 @@ type Decode<T> = Arc<dyn Fn(&[u8], Option<&SchemaInfo>) -> Result<T> + Send + Sy
 /// | `key_value(key, value)` | [`KeyValue<K, V>`] | the key's length, 4 bytes big endian, and bytes, then the value's |
 /// | `json()` (feature `json`) | a record type of `serde` and apache-avro | JSON, described in Avro |
 /// | `avro()` (feature `avro`) | a record type of `serde` and apache-avro | an Avro datum |
+/// | `protobuf()` (feature `protobuf`) | a buffa message type | Protobuf, described in Avro |
+/// | `prost(descriptors)` (feature `prost`) | a prost message type | Protobuf, described in Avro |
 /// | `protobuf_native()` (feature `protobuf`) | a buffa message type | Protobuf, described by its descriptors |
 /// | `prost_native(descriptors)` (feature `prost`) | a prost message type | Protobuf, described by its descriptors |
 /// | `auto_consume()` | [`GenericRecord`] | decoded with the schema each message was written with |

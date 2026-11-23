@@ -286,6 +286,13 @@ impl Env {
         output.lines().filter_map(|line| line.strip_prefix("value ")).map(str::to_string).collect()
     }
 
+    /// Why a Java Queue consumer of `schema` fails to read `count` messages of `topic`, as [`Env::java_consume`] reads
+    /// them: what the Java tool printed.
+    pub fn java_consume_fails(&self, schema: &str, topic: &str, count: usize) -> String {
+        let read = self.try_java(&["SchemaTool", "consume", schema, topic, &count.to_string()]);
+        read.expect_err("the Java consumer read the messages")
+    }
+
     /// The schema Java declares for a Protobuf message, `PROTOBUF` or `PROTOBUF_NATIVE` as `kind` says, as the Java
     /// tool prints it: its name, type, definition and properties, a line each.
     pub fn java_schema_info(&self, kind: &str, message: &str) -> String {
@@ -294,8 +301,15 @@ impl Env {
 
     /// Runs one of the Java test tools in the broker container, with its arguments, and returns what it printed.
     fn java(&self, args: &[&str]) -> String {
+        self.try_java(args).unwrap_or_else(|error| panic!("{args:?} failed:\n{error}"))
+    }
+
+    /// Runs one of the Java test tools as [`Env::java`] does, and returns what it printed, or, if it fails, that and
+    /// what it printed on its error output.
+    fn try_java(&self, args: &[&str]) -> Result<String, String> {
         self.java_tools.get_or_init(|| self.install_java_tools());
-        self.exec(&[&["java", "-cp", "/pulsar/lib/*:/tmp/tools.jar"], args].concat())
+        let (code, stdout, stderr) = self.run(&[&["java", "-cp", "/pulsar/lib/*:/tmp/tools.jar"], args].concat());
+        if code == Some(0) { Ok(stdout) } else { Err(format!("{stdout}{stderr}")) }
     }
 
     /// Compiles the Java test tools against the broker's client jars in a JDK container, and copies them into the
