@@ -19,7 +19,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Release branches too, so that a release candidate is tested where it's tagged (RELEASE.md).
+    branches: [main, "branch-*"]
   pull_request:
 
 permissions:
