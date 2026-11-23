@@ -105,6 +105,15 @@ impl SimServer {
     fn received(&self, kind: Type) -> Vec<BaseCommand> {
         self.log.borrow().iter().filter(|c| c.r#type == EnumValue::Known(kind)).cloned().collect()
     }
+
+    /// What the client answered to the broker's challenges, in order.
+    fn auth_responses(&self) -> Vec<String> {
+        let answer = |command: &BaseCommand| {
+            let data = command.authResponse.as_option().unwrap().response.as_option().unwrap().auth_data.clone();
+            String::from_utf8(data.unwrap()).unwrap()
+        };
+        self.received(Type::AUTH_RESPONSE).iter().map(answer).collect()
+    }
 }
 
 async fn serve<S: AsyncRead + AsyncWrite>(mut stream: S, mut behavior: Behavior, log: Rc<RefCell<Vec<BaseCommand>>>) {
@@ -144,6 +153,17 @@ fn self_serving(address: &HostPort) -> Behavior {
     let mut broker = SimBroker::new();
     broker.default_lookup = LookupAnswer::Connect { broker: address.clone(), proxy: false };
     Behavior { broker, close_after: None, push_after_connect: vec![] }
+}
+
+/// A self-serving broker that challenges the client: with the first of `challenges` once it is connected, and with
+/// each next one once it answered the one before.
+fn challenging(address: &HostPort, challenges: Vec<BaseCommand>) -> Behavior {
+    let mut challenges = challenges.into_iter();
+    let mut behavior =
+        Behavior { push_after_connect: challenges.next().into_iter().collect(), ..self_serving(address) };
+    // The client's answers are the only commands the simulated broker leaves to its responder.
+    behavior.broker.on_command = Some(Box::new(move |_| challenges.next().into_iter().collect()));
+    behavior
 }
 
 /// Waits for `condition`, polling, for up to 10 s: CI machines stall, so tests wait for states, not for times.
@@ -294,15 +314,15 @@ fn keepalive_keeps_an_answering_connection() {
     });
 }
 
+/// A token fetched for `CONNECT`, and again for each refresh the broker asks for: each refresh is answered in band
+/// with the next token, over the one connection, which stays open. Java's
+/// `ClientCnxAsyncAuthTest.refreshRepublishesCredentialWithoutDisconnect`.
 #[test]
 fn token_authentication_and_refresh() {
     run(async {
         let refresh = reply::auth_challenge(AUTH_REFRESH_SENTINEL);
-        let server = SimServer::start(None, move |address| Behavior {
-            push_after_connect: vec![refresh.clone()],
-            ..self_serving(address)
-        })
-        .await;
+        let server =
+            SimServer::start(None, move |address| challenging(address, vec![refresh.clone(), refresh.clone()])).await;
         let fetched = Arc::new(AtomicUsize::new(0));
         let counter = fetched.clone();
         let token = Token::from_fn(move || {
@@ -316,15 +336,15 @@ fn token_authentication_and_refresh() {
             .await
             .unwrap();
         client.lookup(TOPIC).await.unwrap();
-        wait_until("the refresh is answered", || !server.received(Type::AUTH_RESPONSE).is_empty()).await;
+        wait_until("both refreshes are answered", || server.auth_responses().len() >= 2).await;
         let connect = server.received(Type::CONNECT)[0].connect.as_option().unwrap().clone();
         assert_eq!(connect.auth_method_name.as_deref(), Some("token"));
         assert_eq!(connect.auth_data.as_deref(), Some(&b"token-0"[..]));
-        let response = server.received(Type::AUTH_RESPONSE);
-        assert_eq!(response.len(), 1, "the refresh challenge is answered");
-        let data = response[0].authResponse.as_option().unwrap().response.as_option().unwrap().auth_data.clone();
-        assert_eq!(data.as_deref(), Some(&b"token-1"[..]));
-        assert_eq!(fetched.load(Ordering::SeqCst), 2);
+        assert_eq!(server.auth_responses(), ["token-1", "token-2"]);
+        assert_eq!(fetched.load(Ordering::SeqCst), 3);
+        // The connection still serves, so no new one sent a second CONNECT.
+        client.lookup(TOPIC).await.unwrap();
+        assert_eq!(server.received(Type::CONNECT).len(), 1);
         client.close().await.unwrap();
     });
 }
@@ -433,6 +453,51 @@ fn dropping_the_last_client_handle_stops_its_loops() {
         assert!(std::time::Instant::now() < deadline, "loop threads still running after the client was dropped");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Closing the client releases its authentication provider, whose close is its drop: once the thread-safe client's
+/// `close` has stopped its loops, nothing holds the provider, though a handle to the client remains. The local
+/// client's goes with its last handle, once `close` has ended the connections that used it. Java's
+/// `ClientAuthenticationLifecycleTest.closingTheClientClosesAV5NativePlugin`.
+#[test]
+fn closing_the_client_releases_its_authentication_provider() {
+    /// Counts its drops.
+    struct Counted(Arc<AtomicUsize>);
+    impl crate::Authentication for Counted {
+        fn method_name(&self) -> &str {
+            "counted"
+        }
+        fn auth_data(&self) -> crate::auth::AuthFuture {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let builder = PulsarClient::builder().service_url("pulsar://127.0.0.1:1").event_loops(2);
+    let client = futures_executor::block_on(builder.authentication(Counted(drops.clone())).build()).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    futures_executor::block_on(client.close()).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    run(async {
+        let server = SimServer::start(None, self_serving).await;
+        let local = local::PulsarClient::builder()
+            .service_url(server.service_url("pulsar"))
+            .authentication(Counted(drops.clone()))
+            .build()
+            .await
+            .unwrap();
+        local.lookup(TOPIC).await.unwrap();
+        local.close().await.unwrap();
+        drop(local);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    });
 }
 
 #[test]

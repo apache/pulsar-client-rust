@@ -223,6 +223,57 @@ fn challenges_are_answered_by_the_provider() {
     });
 }
 
+/// A refresh is answered by the provider's `auth_data`, and any other challenge by its `challenge`: an empty
+/// payload, an absent one and `PulsarAuthInit` too. Java's `BinaryAuthenticationExchangeTest`'s
+/// `refreshSentinelRoutesToCredentialProviderNotChallengeHandler`,
+/// `emptyChallengeRoutesToChallengeHandlerNotCredentialProvider` and
+/// `initPayloadRoutesToChallengeHandlerNotCredentialProvider`.
+#[test]
+fn only_a_refresh_is_answered_with_fresh_auth_data() {
+    /// Answers `CONNECT` and refreshes with its credential, and a challenge with what it asked.
+    struct TwoAnswers;
+    impl crate::Authentication for TwoAnswers {
+        fn method_name(&self) -> &str {
+            "two-answers"
+        }
+        fn auth_data(&self) -> crate::auth::AuthFuture {
+            Box::pin(async { Ok(b"credential".to_vec()) })
+        }
+        fn challenge(&self, challenge: &[u8]) -> crate::auth::AuthFuture {
+            let answer = [&b"response-to:"[..], challenge].concat();
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    run(async {
+        let absent = BaseCommand {
+            r#type: Type::AUTH_CHALLENGE.into(),
+            authChallenge: apache_pulsar_protocol::proto::CommandAuthChallenge::default().into(),
+            ..Default::default()
+        };
+        let challenges = vec![
+            reply::auth_challenge(AUTH_REFRESH_SENTINEL),
+            reply::auth_challenge(b""),
+            absent,
+            // Java's `AuthData.INIT_AUTH_DATA`.
+            reply::auth_challenge(b"PulsarAuthInit"),
+        ];
+        let server = SimServer::start(None, move |address| challenging(address, challenges.clone())).await;
+        let client = local::PulsarClient::builder()
+            .service_url(server.service_url("pulsar"))
+            .authentication(TwoAnswers)
+            .build()
+            .await
+            .unwrap();
+        let connection = client.connection(&connect_to(&server)).await.unwrap();
+        wait_until("every challenge is answered", || server.auth_responses().len() >= 4).await;
+        let answers = ["credential", "response-to:", "response-to:", "response-to:PulsarAuthInit"];
+        assert_eq!(server.auth_responses(), answers);
+        assert!(!connection.is_closed());
+        client.close().await.unwrap();
+    });
+}
+
 #[test]
 fn a_provider_failing_a_refresh_closes_the_connection() {
     run(async {
@@ -250,6 +301,134 @@ fn a_provider_failing_a_refresh_closes_the_connection() {
         wait_until("the connection closes", || connection.is_closed()).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(server.received(Type::AUTH_RESPONSE).is_empty());
+        client.close().await.unwrap();
+    });
+}
+
+/// A second refresh comes while the provider's answer to the first is still pending: only the second's answer goes
+/// out, and the first's, when it comes, is dropped. Java's `ClientCnxAsyncAuthTest.staleRoundCompletionIsIgnored`.
+#[test]
+fn a_refresh_supersedes_one_still_pending() {
+    /// Answers its call `n` with `token-n`, but call 1, the first refresh's, only once `gate` opens. It counts its
+    /// calls as they are made, whether or not their futures ever run.
+    struct Gated {
+        calls: Arc<AtomicUsize>,
+        gate: std::sync::Mutex<Option<futures_channel::oneshot::Receiver<()>>>,
+    }
+    impl crate::Authentication for Gated {
+        fn method_name(&self) -> &str {
+            "token"
+        }
+        fn auth_data(&self) -> crate::auth::AuthFuture {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let gate = if n == 1 { self.gate.lock().unwrap().take() } else { None };
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                Ok(format!("token-{n}").into_bytes())
+            })
+        }
+    }
+
+    run(async {
+        let refresh = reply::auth_challenge(AUTH_REFRESH_SENTINEL);
+        let server = SimServer::start(None, move |address| Behavior {
+            push_after_connect: vec![refresh.clone(), refresh.clone()],
+            ..self_serving(address)
+        })
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = futures_channel::oneshot::channel();
+        let client = local::PulsarClient::builder()
+            .service_url(server.service_url("pulsar"))
+            .authentication(Gated { calls: calls.clone(), gate: std::sync::Mutex::new(Some(gate)) })
+            .build()
+            .await
+            .unwrap();
+        let connection = client.connection(&connect_to(&server)).await.unwrap();
+        wait_until("a refresh is answered", || !server.auth_responses().is_empty()).await;
+        // The first refresh's answer comes late. A late answer would go out before the lookup's comes back.
+        let _ = release.send(());
+        connection.request(lookup_request(&server)).await.unwrap();
+        assert_eq!(server.auth_responses(), ["token-2"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!connection.is_closed());
+        client.close().await.unwrap();
+    });
+}
+
+/// A provider whose first answer fails is asked again for the next connection, which it then answers: a failed
+/// attempt leaves nothing behind. Java's
+/// `AuthInitializationRetryTest.anImmediatelyFailedInitializationIsRetriedOnTheNextConnection`.
+#[test]
+fn a_provider_that_failed_is_asked_again_for_the_next_connection() {
+    run(async {
+        let server = SimServer::start(None, self_serving).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let token = Token::from_fn(move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(crate::Error::new(ErrorKind::Authentication, "the identity provider is not reachable yet"))
+                } else {
+                    Ok(format!("token-{n}"))
+                }
+            }
+        });
+        let client = local::PulsarClient::builder()
+            .service_url(server.service_url("pulsar"))
+            .authentication(token)
+            .build()
+            .await
+            .unwrap();
+        assert!(client.connection(&connect_to(&server)).await.is_err());
+        let connection = client.connection(&connect_to(&server)).await.unwrap();
+        assert!(!connection.is_closed());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let connect = server.received(Type::CONNECT);
+        assert_eq!(connect.len(), 1, "the failed attempt sent no CONNECT");
+        assert_eq!(connect[0].connect.as_option().unwrap().auth_data.as_deref(), Some(&b"token-1"[..]));
+        client.close().await.unwrap();
+    });
+}
+
+/// The broker closes the socket while the provider is still fetching the credential for `CONNECT`: once it comes,
+/// the connection fails on the closed socket, rather than waiting out the handshake. Java's
+/// `ClientCnxAsyncAuthTest.continuationAfterChannelCloseDoesNotWrite`; Rust learns of the close from the socket, and
+/// may still write the `CONNECT`, which goes nowhere.
+#[test]
+fn a_socket_closed_while_the_credential_is_fetched_fails_the_connection() {
+    run(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed, on_close) = futures_channel::oneshot::channel();
+        // The broker takes the connection and closes it at once.
+        let broker = compio::runtime::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tcp.close().await.unwrap();
+            closed.send(()).unwrap();
+        });
+        let on_close = std::sync::Mutex::new(Some(on_close));
+        let token = Token::from_fn(move || {
+            let on_close = on_close.lock().unwrap().take().unwrap();
+            async move {
+                let _ = on_close.await;
+                Ok("token".to_string())
+            }
+        });
+        let client = local::PulsarClient::builder()
+            .service_url(format!("pulsar://127.0.0.1:{port}"))
+            .authentication(token)
+            .build()
+            .await
+            .unwrap();
+        let address = BrokerAddress::direct(HostPort { host: "127.0.0.1".into(), port });
+        let error = client.connection(&address).await.unwrap_err();
+        // A connection that missed the close would wait out the connect timeout, and fail with `Timeout`.
+        assert_eq!(error.kind(), ErrorKind::Connect, "{error}");
+        broker.await.unwrap();
         client.close().await.unwrap();
     });
 }
