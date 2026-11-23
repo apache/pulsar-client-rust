@@ -27,8 +27,9 @@ use std::time::Duration;
 use apache_pulsar_protocol::hash::KeyHash;
 use apache_pulsar_protocol::lookup::HostPort;
 use apache_pulsar_protocol::proto::base_command::Type;
-use apache_pulsar_protocol::proto::{MessageMetadata, ServerError};
+use apache_pulsar_protocol::proto::{FeatureFlags, MessageMetadata, ServerError};
 use apache_pulsar_testkit::LookupAnswer;
+use apache_pulsar_testkit::scalable::World;
 use bytes::Bytes;
 use futures_util::future::Either;
 use futures_util::{FutureExt, StreamExt};
@@ -125,6 +126,31 @@ fn a_consumer_without_a_name_gets_one() {
             (subscribe.subscription_properties[0].key.as_str(), subscribe.metadata[0].key.as_str()),
             ("team", "host")
         );
+        client.close().await.unwrap();
+    });
+}
+
+/// A consumer subscribing at the latest position gets none of the messages stored before, and the ones stored after.
+/// Java's `V5SubscriptionInitialPositionTest.testStreamConsumerLatestSkipsPriorMessages`.
+#[test]
+fn a_consumer_at_latest_skips_what_was_stored_before() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        let client = local_client(&server).await;
+        for i in 0..5 {
+            publish(&server, 0, "k", &format!("pre-{i}"));
+        }
+        let consumer = client
+            .new_stream_consumer(Schema::string())
+            .topic(TOPIC)
+            .subscription_name(SUB)
+            .subscription_initial_position(SubscriptionInitialPosition::Latest)
+            .subscribe()
+            .await
+            .unwrap();
+        assert_eq!(backlog(&server, 0), 0, "the subscription starts after what was stored");
+        publish(&server, 0, "k", "post");
+        assert_eq!(consumer.receive().await.unwrap().value().unwrap(), "post");
         client.close().await.unwrap();
     });
 }
@@ -231,6 +257,53 @@ fn finds_the_controller_the_layout_names_or_any_broker_behind_a_proxy() {
     });
 }
 
+/// The controller the layout names, on another broker than the service URL's, registers the consumer. Once that
+/// broker drops its connections, the consumer registers with the controller the layout names then, on a third one.
+/// Java's `V5MultiBrokerControllerFailoverTest`, without its split, and the driver's half of
+/// `ClientSegmentLayoutTest.testControllerBrokerUrlPropagated`.
+#[test]
+fn follows_the_controller_the_layout_names_across_brokers() {
+    run(controller_failover(false));
+}
+
+/// The same with a producer of the topic on the client, as in Java's
+/// `V5MultiBrokerControllerFailoverTest.testStreamConsumerFollowsControllerLeaderShutdown`: it holds the loop's layout
+/// watch, which the consumer's registrations share.
+#[test]
+#[ignore = "bug: registering again takes the controller from the layout watch the producer holds, naming the old one"]
+fn follows_the_controller_while_a_producer_holds_the_layout_watch() {
+    run(controller_failover(true));
+}
+
+/// A consumer registered with the controller the layout names on `leader`; the controller moves to `follower`, and
+/// `leader` drops its connections: the consumer registers with `follower`, and keeps receiving. With `producer`, a
+/// producer of the topic on the same client holds the loop's layout watch all along.
+async fn controller_failover(producer: bool) {
+    let server = WorldServer::start(world(1)).await;
+    // Brokers that serve only the topic's controller.
+    let leader = WorldServer::start(world(1)).await;
+    let follower = WorldServer::start(world(1)).await;
+    server.with(|w| w.controller.url = Some(leader.url()));
+    let client = local_client(&server).await;
+    let _producer =
+        if producer { Some(client.new_producer(Schema::string()).topic(TOPIC).create().await.unwrap()) } else { None };
+    let consumer = consumer(&client, "solo").await;
+    let registered = || [&server, &leader, &follower].map(|broker| broker.received(Type::SCALABLE_TOPIC_SUBSCRIBE));
+    assert_eq!(registered(), [0, 1, 0]);
+    // The controller moves to the follower, and the leader's broker drops its connections.
+    server.with(|w| w.controller.url = Some(follower.url()));
+    leader.with(|w| {
+        for conn in w.open_connections() {
+            w.kill(conn);
+        }
+    });
+    wait_until("it registers again", || registered().iter().sum::<usize>() == 2).await;
+    assert_eq!(registered(), [0, 1, 1]);
+    publish(&server, 0, "k", "after");
+    assert_eq!(consumer.receive().await.unwrap().value().unwrap(), "after");
+    client.close().await.unwrap();
+}
+
 /// A refused registration fails the subscribe with the controller's error; a builder missing what it needs fails
 /// before anything is sent.
 #[test]
@@ -248,6 +321,63 @@ fn a_refused_registration_or_a_bad_builder_fails_the_subscribe() {
             assert_eq!(builder.subscribe().await.unwrap_err().kind(), ErrorKind::InvalidConfiguration);
         }
         assert_eq!(server.received(Type::SCALABLE_TOPIC_SUBSCRIBE), 1);
+        client.close().await.unwrap();
+    });
+}
+
+/// The broker refuses the lookup of the topic, made before its layout: the subscribe fails with the broker's error.
+/// Java's `V5AuthErrorTest.testLookupNotAuthorized`, for a Stream consumer.
+#[test]
+fn a_refused_lookup_fails_the_subscribe() {
+    run(async {
+        let server = WorldServer::start(world(1)).await;
+        server.with(|w| {
+            w.lookup = LookupAnswer::Fail { error: ServerError::AuthorizationError, message: "not you".into() }
+        });
+        let client = local_client(&server).await;
+        let subscribe = client.new_stream_consumer(Schema::bytes()).topic(TOPIC).subscription_name(SUB).subscribe();
+        let error = subscribe.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Authorization, "{error}");
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_LOOKUP), 0);
+        client.close().await.unwrap();
+    });
+}
+
+/// A missing topic is not found while the broker may not create it; else the subscribe creates it, with one segment,
+/// which the consumer reads. Java's `V5ScalableTopicAutoCreateTest.testStreamConsumerAutoCreatesScalableTopic`, and
+/// the Stream consumer's part of `V5ScalableTopicAutoCreateTest.testNoAutoCreateWhenNamespaceDisallows`.
+#[test]
+fn a_missing_topic_is_created_or_not_found() {
+    run(async {
+        let mut world = World::default();
+        world.auto_create = false;
+        let server = WorldServer::start(world).await;
+        let client = local_client(&server).await;
+        let subscribe = client.new_stream_consumer(Schema::string()).topic(TOPIC).subscription_name(SUB).subscribe();
+        let error = subscribe.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_SUBSCRIBE), 0);
+        server.with(|w| w.auto_create = true);
+        let consumer = consumer(&client, "first").await;
+        assert_eq!(server.world.borrow().assigned(TOPIC, SUB, "first"), [(0, false)]);
+        publish(&server, 0, "k", "a");
+        assert_eq!(consumer.receive().await.unwrap().value().unwrap(), "a");
+        client.close().await.unwrap();
+    });
+}
+
+/// A broker without scalable topics fails the subscribe, and is sent nothing scalable (C15).
+#[test]
+fn a_broker_without_scalable_topics_is_refused() {
+    run(async {
+        let mut world = world(1);
+        world.features = FeatureFlags { supports_scalable_topics: Some(false), ..Default::default() };
+        let server = WorldServer::start(world).await;
+        let client = local_client(&server).await;
+        let subscribe = client.new_stream_consumer(Schema::bytes()).topic(TOPIC).subscription_name(SUB).subscribe();
+        let error = subscribe.await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnsupportedBroker, "{error}");
+        assert_eq!(server.received(Type::SCALABLE_TOPIC_LOOKUP) + server.received(Type::SCALABLE_TOPIC_SUBSCRIBE), 0);
         client.close().await.unwrap();
     });
 }
