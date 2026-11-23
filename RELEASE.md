@@ -34,7 +34,7 @@ A release is made of:
 | The source release: `apache-pulsar-client-rust-X.Y.Z-src.tar.gz`, its signature `.asc` and its checksum `.sha512` | `pulsar-client-rust-X.Y.Z-candidate-N/` in [dist dev](https://dist.apache.org/repos/dist/dev/pulsar/) during the vote, then `pulsar-client-rust-X.Y.Z/` in [dist release](https://dist.apache.org/repos/dist/release/pulsar/) |
 | The crates `apache-pulsar-protocol` and `apache-pulsar`, published in that order. `apache-pulsar-testkit` isn't published. | [crates.io](https://crates.io/crates/apache-pulsar) |
 | The tags `vX.Y.Z-candidate-N`, then `vX.Y.Z`, on one commit of the branch `branch-X.Y` | This repository |
-| The release notes: what changed, the version of the Scalable Topics client specification the release conforms to, and the optional capabilities it implements ([docs/8-quality.md](docs/8-quality.md) §3) | [CHANGELOG.md](CHANGELOG.md), the GitHub release, and the Pulsar website |
+| The release notes: what changed, the version of the Scalable Topics client specification the release conforms to, and the optional capabilities it implements ([docs/8-quality.md](docs/8-quality.md) §3) | The [GitHub release](https://github.com/apache/pulsar-client-rust/releases), and the Pulsar website |
 
 Versions follow Cargo's semver: while the major version is 0, a new minor version may break the API and a patch
 version doesn't. The two published crates share the workspace's version, and `apache-pulsar` depends on that exact
@@ -75,8 +75,8 @@ On the branch, commit:
 - **The version, in two places in `Cargo.toml`:** `version` in `[workspace.package]`, and the exact requirement
   `version = "=X.Y.Z"` on `apache-pulsar-protocol` in `[workspace.dependencies]`. Then `cargo update --workspace`
   updates `Cargo.lock`. 0.1.0 needs no change.
-- **The release notes:** the release's section of `CHANGELOG.md`, with its date, the specification version, the
-  optional capabilities, and the changes.
+- **The README's Conformance section**, if it isn't right for the release: the version of the specification the
+  release conforms to, and the optional capabilities it implements. The vote links it, and the release notes copy it.
 
 Changes that main needs too go there through a pull request.
 
@@ -125,9 +125,12 @@ Hi everyone,
 This is the Nth release candidate for Apache Pulsar Client Rust, version X.Y.Z:
 the apache-pulsar crate and its protocol core, apache-pulsar-protocol.
 
-It conforms to version 1.0 of the Scalable Topics client specification. The
-release notes, with the optional capabilities it implements:
-https://github.com/apache/pulsar-client-rust/blob/vX.Y.Z-candidate-N/CHANGELOG.md
+It conforms to version 1.0 of the Scalable Topics client specification. Its
+README lists the optional capabilities it implements:
+https://github.com/apache/pulsar-client-rust/blob/vX.Y.Z-candidate-N/README.md#conformance
+
+The changes since the previous release, vP.Q.R:
+https://github.com/apache/pulsar-client-rust/compare/vP.Q.R...vX.Y.Z-candidate-N
 
 *** Please download, test and vote on this release. This vote will stay open
 for at least 72 hours ***
@@ -154,7 +157,8 @@ passes, and not before.
 [ ] -1, Do not approve the release (please provide specific comments)
 ```
 
-`git rev-parse v$VERSION-candidate-$CANDIDATE^{commit}` gives the commit id.
+`git rev-parse v$VERSION-candidate-$CANDIDATE^{commit}` gives the commit id. The first release has no previous one,
+so its vote leaves out the changes.
 
 The vote passes after at least 72 hours with at least three binding +1 votes, from PMC members, and more +1 than -1
 votes. If the candidate has to change, fix the branch, remove the candidate from dist dev (`svn rm`), and go back to
@@ -293,8 +297,10 @@ cargo owner --add <crates.io login> apache-pulsar
 
 ## 8. Announce
 
-- **GitHub:** a [release](https://github.com/apache/pulsar-client-rust/releases/new) from the tag `vX.Y.Z`, with the
-  release's section of `CHANGELOG.md`.
+- **GitHub:** a [release](https://github.com/apache/pulsar-client-rust/releases/new) from the tag `vX.Y.Z`, whose
+  notes are the release notes. They open with the statement, as the README's Conformance section has it at the tag:
+  the specification version, and the table of optional capabilities. Then the changes: *Generate release notes* lists
+  the pull requests merged since the previous release's tag. Then the known limitations, if there are any.
 - **Website:** a pull request to [pulsar-site](https://github.com/apache/pulsar-site) that adds the release to the
   download page and its notes to the client release notes. The announcement links to the download page, so this
   comes first.
@@ -335,5 +341,4 @@ The Pulsar Team
 
 ## 9. Move main on
 
-On main, through a pull request: the next version in both places in `Cargo.toml`, and a new section at the top of
-`CHANGELOG.md`.
+On main, through a pull request: the next version in both places in `Cargo.toml`.
