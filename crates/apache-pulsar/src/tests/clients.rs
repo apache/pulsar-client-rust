@@ -169,6 +169,16 @@ fn a_loop_thread_that_cannot_be_spawned_fails_the_build() {
     assert!(error.to_string().contains("can't start an event loop thread"), "{error}");
 }
 
+/// More loops than threads can start: the build fails as they run out, without reserving room for them all first.
+#[test]
+fn a_loop_count_too_large_to_start_fails_the_build() {
+    use crate::client::LoopStarter;
+    let starter = LoopStarter { spawn: |_, _| Err(std::io::Error::other("no more threads")), ..LoopStarter::SYSTEM };
+    let builder = PulsarClient::builder().service_url("pulsar://127.0.0.1:1").event_loops(usize::MAX);
+    let error = futures_executor::block_on(builder.build_with(starter)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Other, "{error}");
+}
+
 #[test]
 fn a_loop_without_a_runtime_fails_the_build() {
     use crate::client::LoopStarter;

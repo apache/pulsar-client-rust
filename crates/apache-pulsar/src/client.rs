@@ -240,9 +240,10 @@ impl ClientBuilder<ThreadSafe> {
     pub(crate) async fn build_with(self, starter: LoopStarter) -> Result<PulsarClient> {
         let loops = self.event_loops;
         let config = self.into_config()?;
-        let mut handles = Vec::with_capacity(loops);
-        let mut threads = Vec::with_capacity(loops);
-        let mut started = Vec::with_capacity(loops);
+        // Grown loop by loop: a count too large to start fails as the threads run out, with nothing reserved up front.
+        let mut handles = Vec::new();
+        let mut threads = Vec::new();
+        let mut started = Vec::new();
         let config_for_client = config.clone();
         for index in 0..loops {
             let (sender, receiver) = mpsc::unbounded();
