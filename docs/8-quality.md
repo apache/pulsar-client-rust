@@ -62,9 +62,9 @@ The scenarios of the Java V5 tests are ported, not their code:
   classes in `pulsar-broker`. They map to integration tests.
 - The Pulsar Functions, proxy and SASL tests are out of scope.
 
-`tests/PORTING.md` will list each Java test class with its Rust counterpart and status, so coverage can be
-tracked. Many broker tests trigger splits and merges, or look at broker state. Against a container, that needs
-the admin REST API, so the test harness gets a small admin client of its own ([1](1-scope.md) §5).
+[`tests/PORTING.md`](../tests/PORTING.md) lists each Java test class with its Rust counterpart and status, so
+coverage can be tracked. Many broker tests trigger splits and merges, or look at broker state. Against a container,
+that needs the admin REST API, so the test harness gets a small admin client of its own ([1](1-scope.md) §5).
 
 ### 2.2 Conformance
 

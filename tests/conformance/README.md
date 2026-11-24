@@ -245,6 +245,11 @@ broker's cursor; the controller's assignments, rebalances, reconnects and grace 
   `stream_consumers_split_the_segments`, `stream_consumers_share_a_segment_by_bucket`,
   `a_closed_stream_consumer_hands_its_segments_over_at_once`; [`buckets.rs`][it-buckets]
   `keys_keep_their_order_across_a_rebucket`, `more_stream_consumers_than_buckets_get_a_rebucket`.
+- Known gap: once the controller moves to another broker, a Stream consumer whose client holds the topic's layout
+  watch for something else too, a producer say, registers again with the old controller. [`stream_tests.rs`][d-stream]
+  `follows_the_controller_while_a_producer_holds_the_layout_watch` pins it, ignored until it is fixed; alone, the
+  consumer follows the controller (`follows_the_controller_the_layout_names_across_brokers`). From the code, a member
+  of a Checkpoint consumer group (C9), which registers the same way and holds the watch itself, would too.
 
 **C8. The Queue consumer: parallel delivery; individual and negative acks; every active and sealed segment; acks
 routed by segment.**
@@ -313,14 +318,17 @@ inside.**
   [`consumer_tests.rs`][d-consumer] `a_lost_connection_brings_back_what_was_not_acknowledged`,
   `a_consumer_the_broker_closes_subscribes_again`, `closing_the_client_closes_its_consumers_and_fails_their_receives`;
   [`stream_tests.rs`][d-stream] `a_lost_connection_registers_again`; [`checkpoint_tests.rs`][d-checkpoint]
-  `a_lost_connection_resumes_after_what_was_received`.
+  `a_lost_connection_resumes_after_what_was_received`, `resumes_from_a_checkpoint` (closed twice).
 - Broker: `conformance::failover_by_unload`, `conformance::failover_by_broker_restart`.
+- Known gap: a Stream consumer healing itself once its controller moves to another broker, as under C7.
 
 **C15. No scalable-topic command to a broker that doesn't advertise them.**
 - Unit and simulated cluster: [`connection.rs`][tk-connection] `scalable_commands_need_the_broker_feature`,
   `connect_advertises_the_features_the_client_honors`.
-- Driver: [`producer_tests.rs`][d-producer] `a_broker_without_scalable_topics_is_refused`
-  (`UnsupportedBroker`); [`driver.rs`][d-driver] `a_request_the_broker_does_not_support_fails_at_once`.
+- Driver: `a_broker_without_scalable_topics_is_refused` (`UnsupportedBroker`) for the producer and each kind of
+  consumer, in [`producer_tests.rs`][d-producer], [`consumer_tests.rs`][d-consumer], [`stream_tests.rs`][d-stream]
+  and [`checkpoint_tests.rs`][d-checkpoint]; [`driver.rs`][d-driver]
+  `a_request_the_broker_does_not_support_fails_at_once`.
 
 [p-layout]: ../../crates/apache-pulsar-protocol/tests/layout.rs
 [p-routing]: ../../crates/apache-pulsar-protocol/tests/routing_vectors.rs
