@@ -338,25 +338,49 @@ fn failover(env: &Env, failover: Failover) {
     let topic = format!("topic://{path}");
     env.admin(&["scalable-topics", "create", "-s", "2", &path]);
     let (failed_over, producing) = (AtomicBool::new(false), AtomicBool::new(true));
+    // How many sends completed on each segment; and why the topic couldn't fail over, if it couldn't.
+    let (completed, gave_up) = (Mutex::new(BTreeMap::<u64, usize>::new()), OnceLock::<String>::new());
     // The producer's registrations on the two segments, before the unload.
     let registered = OnceLock::new();
     std::thread::scope(|scope| {
         let (start, fail_over) = std::sync::mpsc::channel();
         let (failed_over, namespace, path, registered) = (&failed_over, &namespace, &path, &registered);
+        let (completed, gave_up) = (&completed, &gave_up);
         scope.spawn(move || {
             fail_over.recv().unwrap();
+            // Whether `done` holds within `seconds`, asked every 200 ms.
+            let within = |seconds, done: &mut dyn FnMut() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(seconds);
+                while !done() {
+                    if Instant::now() > deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                true
+            };
+            // The keys go to both segments: the topic fails over once a send to each has completed.
+            if !within(120, &mut || completed.lock().unwrap().len() == 2) {
+                let completed = completed.lock().unwrap().clone();
+                let reason = format!("in 120 s, sends completed on {} of 2 segments: {completed:?}", completed.len());
+                gave_up.set(reason).unwrap();
+                return;
+            }
             match failover {
                 Failover::Unload => {
-                    // The keys go to both segments: wait for the producer on each.
-                    let deadline = Instant::now() + Duration::from_secs(30);
-                    let before = loop {
-                        let before = producers(env, path);
-                        if before.len() == 2 || Instant::now() > deadline {
-                            break before;
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
-                    };
-                    assert_eq!(before.len(), 2, "the producer on each segment: {before:?}");
+                    // The producer's registration on each segment, as the topic's stats list them.
+                    let mut before = BTreeMap::new();
+                    let listed = within(60, &mut || {
+                        before = producers(env, path);
+                        before.len() == 2
+                    });
+                    if !listed {
+                        let completed = completed.lock().unwrap().clone();
+                        let listing = format!("the topic's stats listed its producers as {before:?}");
+                        let reason = format!("sends completed on both segments ({completed:?}), but in 60 s {listing}");
+                        gave_up.set(reason).unwrap();
+                        return;
+                    }
                     registered.set(before).unwrap();
                     env.admin(&["namespaces", "unload", namespace]);
                 }
@@ -399,25 +423,31 @@ fn failover(env: &Env, failover: Failover) {
                     // A send's message is queued when its future is first polled: poll the new one, and take the
                     // ones that completed, without waiting.
                     while let Some(Some(result)) = sends.next().now_or_never() {
-                        result.expect("a send made across the failover");
+                        let id = result.expect("a send made across the failover");
+                        *completed.lock().unwrap().entry(segment_of(&id.to_string())).or_default() += 1;
                     }
                     if i == 20 {
                         start.send(()).unwrap();
                     }
                     after += usize::from(failed_over.load(Ordering::Acquire));
-                    if after == 20 {
+                    if after == 20 || gave_up.get().is_some() {
                         break;
                     }
                     compio::time::sleep(Duration::from_millis(50)).await;
                 }
-                while let Some(result) = sends.next().await {
-                    result.expect("a send made across the failover");
+                // If the topic couldn't fail over, a send may never complete: the case fails without waiting for it.
+                if gave_up.get().is_none() {
+                    while let Some(result) = sends.next().await {
+                        result.expect("a send made across the failover");
+                    }
                 }
                 producing.store(false, Ordering::Release);
             };
             let deadline = Instant::now() + Duration::from_secs(240);
             let reading = |got: &[Message<String>]| {
-                (producing.load(Ordering::Acquire) || firsts(got) < total()) && Instant::now() < deadline
+                (producing.load(Ordering::Acquire) || firsts(got) < total())
+                    && Instant::now() < deadline
+                    && gave_up.get().is_none()
             };
             let wait = Duration::from_secs(1);
             let read_queue = async {
@@ -449,6 +479,9 @@ fn failover(env: &Env, failover: Failover) {
             };
             let ((), from_queue, from_stream, from_checkpoint) =
                 futures_util::join!(produce, read_queue, read_stream, read_checkpoint);
+            if let Some(reason) = gave_up.get() {
+                panic!("the topic couldn't fail over: {reason}");
+            }
             assert!(failed_over.load(Ordering::Acquire), "the failover did not complete");
             if let Some(before) = registered.get() {
                 // The broker did let go of the producer: it is back on both segments, registered again.

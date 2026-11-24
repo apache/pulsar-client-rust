@@ -98,14 +98,15 @@ message once, from segments 0 to 4, and the Stream consumer receives every messa
 
 Both cases run the same clients: a producer whose sends never time out, a Queue consumer, a Stream consumer and a
 Checkpoint consumer, from the earliest position, on a topic of two segments in a namespace of the case's own. The
-producer sends 20 messages over 5 keys, then a message every 50 ms while the topic fails over and 20 more once it is
-back. The consumers receive meanwhile, the Queue and Stream consumers acknowledging. A message may come twice after a
-failover; what counts is the first time each comes. *Passes* when no send fails, and each consumer receives every
-message, the Stream and the Checkpoint consumers each key's in order.
+producer sends a message every 50 ms, over 5 keys. Once 20 are sent and a send to each segment has completed, the topic
+fails over; the producer sends 20 more once it is back. The consumers receive meanwhile, the Queue and Stream consumers
+acknowledging. A message may come twice after a failover; what counts is the first time each comes. *Passes* when no
+send fails, and each consumer receives every message, the Stream and the Checkpoint consumers each key's in order.
 
-**`failover-by-unload`** (C14, C7, C8, C9). The namespace is unloaded (`namespaces unload`): the broker closes the
-topic's producers and consumers and gives the topic up, as when its ownership moves to another broker. *Passes* as
-above, and the topic's stats show the producer registered again on both segments, each with a new `connectedSince`.
+**`failover-by-unload`** (C14, C7, C8, C9). Once the topic's stats list the producer on both segments, the namespace is
+unloaded (`namespaces unload`): the broker closes the topic's producers and consumers and gives the topic up, as when
+its ownership moves to another broker. *Passes* as above, and the topic's stats show the producer registered again on
+both segments, each with a new `connectedSince`.
 *This client:* `conformance::failover_by_unload`.
 
 **`failover-by-broker-restart`** (C14, C7, C8, C9). The broker is killed, every connection dropping, and started
