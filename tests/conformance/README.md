@@ -242,7 +242,9 @@ broker's cursor; the controller's assignments, rebalances, reconnects and grace 
 - Driver: [`stream_tests.rs`][d-stream].
 - Broker: `conformance::cumulative_ack_across_segments`, `conformance::split_and_merge_under_load`, the failover cases;
   [`main.rs`][it-main] `a_stream_consumer_reads_sealed_backlog_first_in_key_order`,
-  `stream_consumers_share_a_segment_by_bucket`, `a_closed_stream_consumer_hands_its_segments_over_at_once`.
+  `stream_consumers_split_the_segments`, `stream_consumers_share_a_segment_by_bucket`,
+  `a_closed_stream_consumer_hands_its_segments_over_at_once`; [`buckets.rs`][it-buckets]
+  `keys_keep_their_order_across_a_rebucket`, `more_stream_consumers_than_buckets_get_a_rebucket`.
 
 **C8. The Queue consumer: parallel delivery; individual and negative acks; every active and sealed segment; acks
 routed by segment.**
@@ -282,8 +284,9 @@ restore.**
 
 **C12. Auto-creation honored; a missing topic surfaced as `NotFound`.**
 - Driver: [`producer_tests.rs`][d-producer] `a_missing_topic_is_not_found`.
-- Broker: [`main.rs`][it-main] `a_missing_topic_is_not_found_without_auto_creation`; most broker tests use topics they
-  never create, which the broker creates.
+- Broker: [`main.rs`][it-main] `a_missing_topic_is_not_found_without_auto_creation` (a producer and each kind of
+  consumer), `a_stream_consumer_creates_a_missing_topic`; most broker tests use topics they never create, which the
+  broker creates.
 
 **C13. Typed error categories; asynchronous operations fail through their futures; transient failures retried
 inside.**
@@ -350,4 +353,5 @@ inside.**
 [d-schema]: ../../crates/apache-pulsar/src/schema_tests.rs
 [it-main]: ../../crates/apache-pulsar/tests/integration/main.rs
 [it-bridge]: ../../crates/apache-pulsar/tests/integration/bridge.rs
+[it-buckets]: ../../crates/apache-pulsar/tests/integration/buckets.rs
 [it-schemas]: ../../crates/apache-pulsar/tests/integration/schemas.rs

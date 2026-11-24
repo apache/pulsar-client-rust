@@ -45,6 +45,7 @@ pub(super) const TESTS: &[(&str, fn(&Env))] = &[
     ("a_producer_keeps_key_order_across_a_migration", a_producer_keeps_key_order_across_a_migration),
     ("consumers_follow_a_migration", consumers_follow_a_migration),
     ("a_migrated_topic_is_read_legacy_segments_first", a_migrated_topic_is_read_legacy_segments_first),
+    ("a_migrated_topic_is_reached_by_its_scalable_name", a_migrated_topic_is_reached_by_its_scalable_name),
     ("v4_and_rust_clients_across_a_forced_migration", v4_and_rust_clients_across_a_forced_migration),
 ];
 
@@ -437,6 +438,32 @@ fn a_migrated_topic_is_read_legacy_segments_first(env: &Env) {
         assert_eq!(drain(&member).await, sent.into_values().flatten().collect::<BTreeSet<_>>());
         client.close().await.unwrap();
     });
+}
+
+/// Java's `ScalableTopicMigrationPermissionsTest.testMigratedTopicIsAccessibleThroughItsScalableName`, without the
+/// permissions: once a topic migrates, a producer and a Queue consumer opened by its `topic://` name write and read it,
+/// what was stored before the migration included.
+fn a_migrated_topic_is_reached_by_its_scalable_name(env: &Env) {
+    for partitions in [0, 2] {
+        let (topic, path) = regular_topic(env, "scalable-name", partitions);
+        run(async {
+            let client = proxy_client(env).build().await.unwrap();
+            let before = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+            let mut sent = BTreeMap::new();
+            publish_keyed(&before, "pre", 10, &mut sent).await;
+            before.close().await.unwrap();
+            env.admin(&["scalable-topics", "migrate", &path]);
+            let scalable = format!("topic://{path}");
+            let producer = client.new_producer(Schema::string()).topic(&scalable).create().await.unwrap();
+            publish_keyed(&producer, "post", 10, &mut sent).await;
+            let queue =
+                queue_consumer(&client, Schema::string(), &scalable, SubscriptionInitialPosition::Earliest).await;
+            let mut all: Vec<String> = sent.into_values().flatten().collect();
+            all.sort();
+            assert_eq!(sorted_values(&receive_all(&queue, all.len()).await), all, "{partitions} partitions");
+            client.close().await.unwrap();
+        });
+    }
 }
 
 /// Asserts that every producer and consumer attached to the topics `topic` stores in is marked as managed by a V5
