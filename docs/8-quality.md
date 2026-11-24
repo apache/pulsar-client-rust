@@ -111,10 +111,11 @@ Two harnesses measure the client, and a recorded baseline is what later rounds c
   batch of 1000 small JSON messages, and the consumer decompresses it and splits it into its messages.
 - **End to end**, `tools/perf`: this client's `pulsar-perf`, which `cargo build --release` builds. `pulsar-perf produce`
   and `pulsar-perf consume` measure the producer's and the Queue consumer's throughput and latency against a broker.
-  Their options, their payloads and their summary lines are those of Java's `pulsar-perf`, which drives the V5 client
-  for a `topic://` topic, so that the two compare line for line. `tools/perf/baseline.sh` runs both, each in a
-  container of its own on the broker's Docker network, against a standalone broker of its own for each run, both
-  bounded by a 64 MiB client memory limit, the only bound a V5 producer has.
+  Their options, their payloads, their reports every 10 seconds and their summary lines are those of Java's
+  `pulsar-perf`, which drives the V5 client for a `topic://` topic, so that the two compare line for line.
+  `tools/perf/baseline.sh` runs both, each in a container of its own on the broker's Docker network, against a
+  standalone broker of its own for each run, both bounded by a 64 MiB client memory limit, the only bound a V5
+  producer has.
 
 Still to measure: loop counts, with producers spread over the thread-safe client's loops, and pulsar-rs, which has no
 scalable topics, so `persistent://` topics through the migration bridge, from a harness on tokio. An OpenMessaging
