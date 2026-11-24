@@ -23,6 +23,7 @@
 //! the Java client stored is read with the Rust consumer, both Java clients run in the broker container.
 
 mod bridge;
+mod buckets;
 mod conformance;
 mod env;
 mod schemas;
@@ -62,6 +63,7 @@ const TESTS: &[(&str, fn(&Env))] = &[
     ("queue_consumers_share_a_subscription", queue_consumers_share_a_subscription),
     ("a_negative_ack_brings_a_message_back", a_negative_ack_brings_a_message_back),
     ("batch_index_acks_settle_whole_batches", batch_index_acks_settle_whole_batches),
+    ("delayed_messages_wait_for_their_time", delayed_messages_wait_for_their_time),
     (
         "a_stream_consumer_reads_in_order_and_acknowledges_cumulatively",
         a_stream_consumer_reads_in_order_and_acknowledges_cumulatively,
@@ -78,6 +80,8 @@ const TESTS: &[(&str, fn(&Env))] = &[
         "a_closed_stream_consumer_hands_its_segments_over_at_once",
         a_closed_stream_consumer_hands_its_segments_over_at_once,
     ),
+    ("a_stream_consumer_creates_a_missing_topic", a_stream_consumer_creates_a_missing_topic),
+    ("stream_consumers_split_the_segments", stream_consumers_split_the_segments),
     ("a_checkpoint_consumer_resumes_across_a_split", a_checkpoint_consumer_resumes_across_a_split),
     ("a_latest_checkpoint_consumer_reads_a_later_split", a_latest_checkpoint_consumer_reads_a_later_split),
     ("a_checkpoint_consumer_skips_a_deleted_segment", a_checkpoint_consumer_skips_a_deleted_segment),
@@ -97,7 +101,7 @@ fn main() {
         });
         trial.with_ignored_flag(ignored)
     };
-    let tests = TESTS.iter().chain(bridge::TESTS).chain(schemas::TESTS).chain(conformance::TESTS);
+    let tests = TESTS.iter().chain(bridge::TESTS).chain(buckets::TESTS).chain(schemas::TESTS).chain(conformance::TESTS);
     let trials = tests.map(|test| trial(test, false)).chain(bridge::IGNORED.iter().map(|test| trial(test, true)));
     let conclusion = libtest_mimic::run(&args, trials.collect());
     // The tests that take the broker down run once the others are done, one at a time.
@@ -175,12 +179,22 @@ fn tls_with_client_certificate(env: &Env) {
     }
 }
 
+/// Java's `V5AuthErrorTest.testCredentialsRejected`, and with no token: a producer's create and a Stream consumer's
+/// subscribe are refused.
 fn missing_credentials_are_refused(_: &Env) {
     run(async {
         let error = produce_once(token_client(env::BROKER_URL, None)).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Authentication, "{error}");
         let error = produce_once(token_client(env::BROKER_URL, Some("not-a-token".into()))).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Authentication, "{error}");
+        for token in [None, Some("not-a-token".to_string())] {
+            let client = token_client(env::BROKER_URL, token).build().await.unwrap();
+            let topic = format!("topic://public/default/{}", unique("unauthenticated"));
+            let subscribe = client.new_stream_consumer(Schema::string()).topic(&topic).subscription_name(SUB);
+            let Err(error) = subscribe.subscribe().await else { panic!("a Stream consumer subscribed") };
+            assert_eq!(error.kind(), ErrorKind::Authentication, "{error}");
+            client.close().await.unwrap();
+        }
     });
 }
 
@@ -400,21 +414,27 @@ fn exclusive_with_fencing_fences_the_older_producer(env: &Env) {
     assert_eq!(values, ["before", "mine"]);
 }
 
-/// Java's `testNoAutoCreateWhenNamespaceDisallows`: a missing topic is NotFound when the namespace forbids
-/// creating it.
+/// Java's `testNoAutoCreateWhenNamespaceDisallows`: a missing topic is NotFound for a producer and each kind of
+/// consumer when the namespace forbids creating it.
 fn a_missing_topic_is_not_found_without_auto_creation(env: &Env) {
     let namespace = format!("public/{}", unique("strict"));
     env.admin(&["namespaces", "create", &namespace]);
     env.admin(&["namespaces", "set-auto-topic-creation", &namespace, "--disable"]);
+    let topic = format!("topic://{namespace}/absent");
     run(async {
         let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
-        let error = client
-            .new_producer(Schema::string())
-            .topic(format!("topic://{namespace}/absent"))
-            .create()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await;
+        let queue = client.new_queue_consumer(Schema::string()).topic(&topic).subscription_name(SUB).subscribe().await;
+        let stream =
+            client.new_stream_consumer(Schema::string()).topic(&topic).subscription_name(SUB).subscribe().await;
+        let checkpoint = client.new_checkpoint_consumer(Schema::string()).topic(&topic).create().await;
+        let kinds = [
+            producer.map(drop).map_err(|e| e.kind()),
+            queue.map(drop).map_err(|e| e.kind()),
+            stream.map(drop).map_err(|e| e.kind()),
+            checkpoint.map(drop).map_err(|e| e.kind()),
+        ];
+        assert_eq!(kinds, [Err(ErrorKind::NotFound); 4], "producer, Queue, Stream and Checkpoint consumers");
         client.close().await.unwrap();
     });
 }
@@ -762,6 +782,34 @@ fn batch_index_acks_settle_whole_batches(env: &Env) {
     assert_eq!(backlog.as_u64(), Some(0), "{backlog}");
 }
 
+/// Java's `V5MessageMetadataTest.testDeliverAfterDelaysVisibility` and `testDeliverAtDelaysVisibility`: a message to be
+/// delivered two seconds later doesn't reach a Queue consumer within half a second, and does after its time.
+fn delayed_messages_wait_for_their_time(env: &Env) {
+    let topic = format!("topic://public/default/{}", unique("delayed"));
+    run(async {
+        let client = token_client(env::BROKER_URL, Some(env.token.clone())).build().await.unwrap();
+        let consumer = queue_consumer(&client, Schema::string(), &topic, SubscriptionInitialPosition::Earliest).await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        for at in [false, true] {
+            let sent = std::time::SystemTime::now();
+            let message = producer.new_message().value(format!("at {at}"));
+            let message = if at {
+                message.deliver_at(sent + Duration::from_secs(2))
+            } else {
+                message.deliver_after(Duration::from_secs(2))
+            };
+            message.send().await.unwrap();
+            let early = consumer.receive_timeout(Duration::from_millis(500)).await.unwrap();
+            assert!(early.is_none(), "at {at}: delivered within half a second");
+            let message = consumer.receive_timeout(Duration::from_secs(10)).await.unwrap().expect("delayed message");
+            assert!(sent.elapsed().unwrap() >= Duration::from_millis(1500), "at {at}: {:?}", sent.elapsed());
+            assert_eq!(message.value().unwrap(), format!("at {at}"));
+            consumer.acknowledge(message.id()).await.unwrap();
+        }
+        client.close().await.unwrap();
+    });
+}
+
 /// A Stream consumer of `topic` on the `workers` subscription, from its start, named `name`. Through the proxy: on this
 /// broker, with an internal and an external listener, the layout names the controller by its internal address,
 /// which the host can't reach, and a client connected on the external listener has no other.
@@ -1048,6 +1096,48 @@ fn a_closed_stream_consumer_hands_its_segments_over_at_once(env: &Env) {
         let got = stream_all(&bob, 20).await;
         assert_eq!(got.len(), 20, "bob reads both segments");
         assert!(started.elapsed() < Duration::from_secs(30), "well within the 60 s grace period");
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `V5ScalableTopicAutoCreateTest.testStreamConsumerAutoCreatesScalableTopic`: a Stream consumer is the first to
+/// use a topic, which the broker creates with one segment, and reads what a producer then sends.
+fn a_stream_consumer_creates_a_missing_topic(env: &Env) {
+    let name = unique("stream-first");
+    let topic = format!("topic://public/default/{name}");
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let consumer = stream_consumer(&client, &topic, "first").await;
+        let metadata = stats(env, &["scalable-topics", "get-metadata", &format!("public/default/{name}")]);
+        assert_eq!(metadata["segments"].as_object().map(|s| s.len()), Some(1), "{metadata}");
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        producer.new_message().key("k").value("hello".to_string()).send().await.unwrap();
+        let got = stream_all(&consumer, 1).await;
+        assert_eq!(got.iter().map(|m| m.value().unwrap()).collect::<Vec<_>>(), ["hello"]);
+        client.close().await.unwrap();
+    });
+}
+
+/// Java's `V5MultipleConsumersTest.testStreamConsumersSplitSegmentsAcrossConsumers`: two Stream consumers of a topic of
+/// four segments split them. Every message reaches one of them, once, and both get some.
+fn stream_consumers_split_the_segments(env: &Env) {
+    let name = unique("stream-split");
+    let topic = format!("topic://public/default/{name}");
+    env.admin(&["scalable-topics", "create", "-s", "4", &format!("public/default/{name}")]);
+    run(async {
+        let client = proxy_client(env).build().await.unwrap();
+        let alice = stream_consumer(&client, &topic, "alice").await;
+        let bob = stream_consumer(&client, &topic, "bob").await;
+        let producer = client.new_producer(Schema::string()).topic(&topic).create().await.unwrap();
+        let sent: BTreeSet<String> = (0..100).map(|i| format!("v-{i:02}")).collect();
+        for (i, value) in sent.iter().enumerate() {
+            producer.new_message().key(format!("k-{i}")).value(value.clone()).send().await.unwrap();
+        }
+        let (from_alice, from_bob) = futures_util::join!(stream_all(&alice, 100), stream_all(&bob, 100));
+        let values = |m: &[Message<String>]| m.iter().map(|m| m.value().unwrap()).collect::<BTreeSet<_>>();
+        assert!(!from_alice.is_empty() && !from_bob.is_empty(), "alice {}, bob {}", from_alice.len(), from_bob.len());
+        assert_eq!(from_alice.len() + from_bob.len(), 100, "each message once");
+        assert_eq!(values(&from_alice).union(&values(&from_bob)).cloned().collect::<BTreeSet<_>>(), sent);
         client.close().await.unwrap();
     });
 }

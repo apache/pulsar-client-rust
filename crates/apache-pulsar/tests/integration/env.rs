@@ -256,6 +256,16 @@ impl Env {
         self.exec(&["bash", "-c", &post]);
     }
 
+    /// Rolls segment `segment` of scalable topic `tenant/namespace/name` over to a successor of the same range with
+    /// `buckets` entry buckets, as the controller's automatic rebucketing does: `POST /admin/v2/scalable/…/rebucket/…`,
+    /// which `pulsar-admin` 5.0.1 has no command for. The segment is sealed.
+    pub fn rebucket(&self, name: &str, segment: u64, buckets: u32) {
+        let url = format!("http://localhost:8080/admin/v2/scalable/{name}/rebucket/{segment}?bucketCount={buckets}");
+        let auth = "-H \"Authorization: Bearer $(cat /it/admin.token)\"";
+        let post = format!("curl -sSf -X POST {auth} -H 'Content-Type: application/json' -d '' '{url}'");
+        self.exec(&["bash", "-c", &post]);
+    }
+
     /// Reads `count` messages of `topic` with the Java client's Checkpoint consumer in the broker container, as the
     /// admin, from `start`: `earliest`, `latest`, or a checkpoint's bytes in hex. Returns the messages as
     /// `(key, value)`, and the consumer's checkpoint after them, in hex.
