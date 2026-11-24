@@ -72,16 +72,23 @@ jobs:
       - name: Summarize
         id: summary
         run: python3 .github/scripts/coverage-summary.py target/coverage.json
+      # A request to GitHub's API fails now and then, at times after GitHub has carried it out. Posting the status
+      # again does no harm: GitHub shows a context's newest status, and the gate reads the newest too. So the step
+      # tries three times before it fails the job.
       - name: Post the totals as a commit status
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           TOTALS: ${{ steps.summary.outputs.totals }}
-        run: >
-          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA"
-          -f state=success -f context=coverage -f description="$TOTALS"
-          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        run: |
+          for _ in 1 2 3; do
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+              -f state=success -f context=coverage -f description="$TOTALS" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" && exit 0
+            sleep 10
+          done
+          exit 1
       # What this branch is measured against: the totals this workflow posted as a status on the pull request's
       # base commit. Nothing is stored in the repository for it, so there is no baseline file to go stale and
       # nothing to bump by hand when coverage improves.
