@@ -18,17 +18,21 @@
 //! `pulsar-perf`: the producer's and the Queue consumer's throughput and latency against a broker (docs/8-quality.md
 //! §6).
 //!
-//! Its options and its summary lines are those of Java's `pulsar-perf produce` and `pulsar-perf consume`, so that the
-//! two clients compare line for line on the same broker:
+//! Its options, its reports every 10 seconds and its summary lines are those of Java's `pulsar-perf produce` and
+//! `pulsar-perf consume`, so that the two clients compare line for line on the same broker:
 //!
 //! ```text
 //! pulsar-perf produce -u pulsar://localhost:6650 -s 1024 -m 1000000 -r 5000000 topic://public/default/perf
 //! pulsar-perf consume -u pulsar://localhost:6650 -m 1000000 topic://public/default/perf
 //! ```
 
+use std::convert::Infallible;
+use std::io::IsTerminal;
 use std::pin::pin;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use apache_pulsar::{
     BatchingPolicy, CompressionPolicy, CompressionType, MessageId, Producer, ProducerBuilder, PulsarClient,
@@ -38,9 +42,21 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::future::{Either, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 /// What the client counts against its memory limit for a message, besides its payload.
 const PER_MESSAGE_OVERHEAD: u64 = 1024;
+
+/// How often a run prints its throughput and latency since the last report, as pulsar-perf does.
+const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The highest send latency the histograms tell apart, in microseconds: a minute.
+const MAX_SEND_LATENCY_MICROS: u64 = 60_000_000;
+
+/// The highest latency of a received message, from its publish time, the histogram tells apart, in milliseconds: ten
+/// days, as pulsar-perf's.
+const MAX_RECEIVE_LATENCY_MILLIS: u64 = 10 * 24 * 3600 * 1000;
 
 #[derive(Parser)]
 #[command(about = "Throughput and latency of the producer and the Queue consumer, as Java's pulsar-perf measures them")]
@@ -144,6 +160,11 @@ impl Codec {
 
 fn main() {
     let args = Args::parse();
+    // The client's logs and this tool's, at INFO unless `RUST_LOG` says otherwise.
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy())
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
     let runtime = compio::runtime::Runtime::new().expect("a runtime");
     let result = runtime.block_on(async {
         match args.command {
@@ -152,7 +173,7 @@ fn main() {
         }
     });
     if let Err(error) = result {
-        eprintln!("perf: {error}");
+        tracing::error!("{error}");
         std::process::exit(1);
     }
 }
@@ -197,11 +218,11 @@ impl Produce {
             .send_timeout(Duration::ZERO)
     }
 
-    /// Sends the messages, and prints their throughput and latency.
+    /// Sends the messages, and prints their throughput and latency every 10 seconds and over the run.
     async fn drive<Api>(&self, producer: &Producer<Vec<u8>, Api>) {
         let payload = letters(self.size);
         let keys: Vec<String> = (0..self.keys).map(|i| format!("key-{i}")).collect();
-        let mut latencies = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("a histogram");
+        let mut latencies = Histogram::<u64>::new_with_bounds(1, MAX_SEND_LATENCY_MICROS, 3).expect("a histogram");
         // As many in flight as the memory limit holds, by default: the limit binds as it does Java's V5 producer,
         // and the loop waits for completions, letting the producer's task run, where it would wait for room.
         let max_outstanding = match self.max_outstanding {
@@ -212,60 +233,66 @@ impl Produce {
         let start = Instant::now();
         let warmup = start + Duration::from_secs_f64(self.warmup_seconds);
         let end = (self.test_duration > 0).then(|| start + Duration::from_secs(self.test_duration));
+        let report = Arc::new(Mutex::new(Report::new(start, MAX_SEND_LATENCY_MICROS, produced)));
         let mut sent = 0;
         let mut record = |(sent, latency, result): (Instant, Duration, apache_pulsar::Result<MessageId>)| {
             result.expect("a send failed");
-            if sent >= warmup {
-                latencies.saturating_record(latency.as_micros() as u64);
+            let micros = (sent >= warmup).then_some(latency.as_micros() as u64);
+            if let Some(micros) = micros {
+                latencies.saturating_record(micros);
             }
+            report.lock().expect("the report").record(self.size, micros);
         };
-        while (self.messages == 0 || sent < self.messages) && end.is_none_or(|end| Instant::now() < end) {
-            let i = sent;
-            sent += 1;
-            // Ahead of the rate: wait, taking completions meanwhile.
-            let at = (self.rate > 0).then(|| start + Duration::from_secs_f64(i as f64 / self.rate as f64));
-            if let Some(at) = at.filter(|at| *at > Instant::now()) {
-                let mut sleep = pin!(compio::time::sleep_until(at));
-                loop {
-                    match select(sleep.as_mut(), in_flight.next()).await {
-                        Either::Left(_) => break,
-                        Either::Right((Some(done), _)) => record(done),
-                        // Nothing in flight: only the time is left to wait for.
-                        Either::Right((None, _)) => {
-                            sleep.as_mut().await;
-                            break;
+        reporting(&report, async {
+            while (self.messages == 0 || sent < self.messages) && end.is_none_or(|end| Instant::now() < end) {
+                let i = sent;
+                sent += 1;
+                // Ahead of the rate: wait, taking completions meanwhile.
+                let at = (self.rate > 0).then(|| start + Duration::from_secs_f64(i as f64 / self.rate as f64));
+                if let Some(at) = at.filter(|at| *at > Instant::now()) {
+                    let mut sleep = pin!(compio::time::sleep_until(at));
+                    loop {
+                        match select(sleep.as_mut(), in_flight.next()).await {
+                            Either::Left(_) => break,
+                            Either::Right((Some(done), _)) => record(done),
+                            // Nothing in flight: only the time is left to wait for.
+                            Either::Right((None, _)) => {
+                                sleep.as_mut().await;
+                                break;
+                            }
                         }
                     }
                 }
+                while in_flight.len() >= max_outstanding {
+                    record(in_flight.next().await.expect("sends in flight"));
+                }
+                let mut message = producer.new_message().value(payload.clone());
+                if !keys.is_empty() {
+                    message = message.key(keys[i as usize % keys.len()].clone());
+                }
+                // Polled once at once, so that it is queued now, in call order. Its latency runs from there to its
+                // completion.
+                let mut send = Box::pin(async move {
+                    let sent = Instant::now();
+                    let result = message.send().await;
+                    (sent, sent.elapsed(), result)
+                });
+                match futures_util::poll!(send.as_mut()) {
+                    Poll::Ready(done) => record(done),
+                    Poll::Pending => in_flight.push(send),
+                }
             }
-            while in_flight.len() >= max_outstanding {
-                record(in_flight.next().await.expect("sends in flight"));
+            while let Some(done) = in_flight.next().await {
+                record(done);
             }
-            let mut message = producer.new_message().value(payload.clone());
-            if !keys.is_empty() {
-                message = message.key(keys[i as usize % keys.len()].clone());
-            }
-            // Polled once at once, so that it is queued now, in call order. Its latency runs from there to its
-            // completion.
-            let mut send = Box::pin(async move {
-                let sent = Instant::now();
-                let result = message.send().await;
-                (sent, sent.elapsed(), result)
-            });
-            match futures_util::poll!(send.as_mut()) {
-                Poll::Ready(done) => record(done),
-                Poll::Pending => in_flight.push(send),
-            }
-        }
-        while let Some(done) = in_flight.next().await {
-            record(done);
-        }
+        })
+        .await;
         let elapsed = start.elapsed().as_secs_f64();
         let rate = sent as f64 / elapsed;
         let mbits = rate * self.size as f64 * 8.0 / 1024.0 / 1024.0;
-        println!("Aggregated throughput stats --- {sent} records sent --- {rate:.3} msg/s --- {mbits:.3} Mbit/s");
+        tracing::info!("Aggregated throughput stats --- {sent} records sent --- {rate:.3} msg/s --- {mbits:.3} Mbit/s");
         let ms = |micros: u64| micros as f64 / 1000.0;
-        println!(
+        tracing::info!(
             "Aggregated latency stats --- Latency: mean: {:7.3} ms - med: {:7.3} - 95pct: {:7.3} - 99pct: {:7.3} - \
              99.9pct: {:7.3} - 99.99pct: {:7.3} - Max: {:7.3}",
             latencies.mean() / 1000.0,
@@ -304,24 +331,151 @@ impl Consume {
             .receiver_queue_size(self.receiver_queue_size)
     }
 
-    /// Receives and acknowledges the messages, and prints their throughput.
+    /// Receives and acknowledges the messages, and prints their throughput and latency every 10 seconds, and their
+    /// throughput over the run.
     async fn drive<Api>(&self, consumer: &QueueConsumer<Vec<u8>, Api>) -> apache_pulsar::Result<()> {
         let mut bytes = 0;
         let start = Instant::now();
-        for _ in 0..self.messages {
-            let message = consumer.receive().await?;
-            bytes += message.size();
-            consumer.acknowledge(message.id()).await?;
-        }
+        let report = Arc::new(Mutex::new(Report::new(start, MAX_RECEIVE_LATENCY_MILLIS, received)));
+        reporting(&report, async {
+            for _ in 0..self.messages {
+                let message = consumer.receive().await?;
+                bytes += message.size();
+                // From the publish time, in whole milliseconds, as pulsar-perf's: none on a clock behind the broker's.
+                let millis = SystemTime::now()
+                    .duration_since(message.publish_time())
+                    .ok()
+                    .map(|latency| latency.as_millis() as u64);
+                report.lock().expect("the report").record(message.size(), millis);
+                consumer.acknowledge(message.id()).await?;
+            }
+            Ok::<_, apache_pulsar::Error>(())
+        })
+        .await?;
         let elapsed = start.elapsed().as_secs_f64();
         let rate = self.messages as f64 / elapsed;
         let mbits = bytes as f64 * 8.0 / 1024.0 / 1024.0 / elapsed;
-        println!(
+        tracing::info!(
             "Aggregated throughput stats --- {} records received --- {rate:.3} msg/s --- {mbits:.3} Mbit/s",
             self.messages
         );
         Ok(())
     }
+}
+
+/// What a run did since its last report, which it prints every 10 seconds, as pulsar-perf does.
+struct Report {
+    /// The run's messages so far.
+    total: u64,
+    /// The messages since the last report, their bytes, and their latencies.
+    messages: u64,
+    bytes: u64,
+    latencies: Histogram<u64>,
+    /// When the last report was, or the run started.
+    last: Instant,
+    /// The report's line: of the run's messages so far, the messages and the Mbit per second since the last report,
+    /// and their latencies.
+    line: fn(u64, f64, f64, &Histogram<u64>) -> String,
+}
+
+impl Report {
+    fn new(start: Instant, max_latency: u64, line: fn(u64, f64, f64, &Histogram<u64>) -> String) -> Self {
+        let latencies = Histogram::new_with_bounds(1, max_latency, 3).expect("a histogram");
+        Report { total: 0, messages: 0, bytes: 0, latencies, last: start, line }
+    }
+
+    /// A message done, of `bytes`, with its latency unless it is left out.
+    fn record(&mut self, bytes: usize, latency: Option<u64>) {
+        self.total += 1;
+        self.messages += 1;
+        self.bytes += bytes as u64;
+        if let Some(latency) = latency {
+            self.latencies.saturating_record(latency);
+        }
+    }
+
+    /// When the next report falls due.
+    fn next(&self) -> Instant {
+        self.last + REPORT_INTERVAL
+    }
+
+    /// The report's line, if it is due at `now`, which the next report counts from.
+    fn due(&mut self, now: Instant) -> Option<String> {
+        let elapsed = now.saturating_duration_since(self.last);
+        if elapsed < REPORT_INTERVAL {
+            return None;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let rate = self.messages as f64 / seconds;
+        let mbits = self.bytes as f64 * 8.0 / 1024.0 / 1024.0 / seconds;
+        let line = (self.line)(self.total, rate, mbits, &self.latencies);
+        self.messages = 0;
+        self.bytes = 0;
+        self.latencies.reset();
+        self.last = now;
+        Some(line)
+    }
+}
+
+/// A producer's report, as pulsar-perf prints it, of latencies in microseconds. A failed send ends the run, so no
+/// report has one.
+fn produced(total: u64, rate: f64, mbits: f64, latencies: &Histogram<u64>) -> String {
+    let ms = |micros: u64| micros as f64 / 1000.0;
+    format!(
+        "Throughput produced: {total:7} msg --- {rate:8.1} msg/s --- {mbits:8.1} Mbit/s --- failure {:8.1} msg/s --- \
+         Latency: mean: {:7.3} ms - med: {:7.3} - 95pct: {:7.3} - 99pct: {:7.3} - 99.9pct: {:7.3} - 99.99pct: {:7.3} \
+         - Max: {:7.3}",
+        0.0,
+        latencies.mean() / 1000.0,
+        ms(latencies.value_at_quantile(0.5)),
+        ms(latencies.value_at_quantile(0.95)),
+        ms(latencies.value_at_quantile(0.99)),
+        ms(latencies.value_at_quantile(0.999)),
+        ms(latencies.value_at_quantile(0.9999)),
+        ms(latencies.max()),
+    )
+}
+
+/// A consumer's report, as pulsar-perf prints it, of latencies in milliseconds.
+fn received(total: u64, rate: f64, mbits: f64, latencies: &Histogram<u64>) -> String {
+    format!(
+        "Throughput received: {total:7} msg --- {rate:.3} msg/s --- {mbits:.3} Mbit/s --- Latency: mean: {:.3} ms - \
+         med: {} - 95pct: {} - 99pct: {} - 99.9pct: {} - 99.99pct: {} - Max: {}",
+        latencies.mean(),
+        latencies.value_at_quantile(0.5),
+        latencies.value_at_quantile(0.95),
+        latencies.value_at_quantile(0.99),
+        latencies.value_at_quantile(0.999),
+        latencies.value_at_quantile(0.9999),
+        latencies.max(),
+    )
+}
+
+/// Runs `work` to its end, logging `report` every 10 seconds meanwhile, from a thread of its own, as pulsar-perf's
+/// main thread does: a timer on the runtime would cost every turn of the work's loop, and would wait for the work to.
+async fn reporting<T>(report: &Arc<Mutex<Report>>, work: impl Future<Output = T>) -> T {
+    let (done, finished) = mpsc::channel::<Infallible>();
+    let reports = {
+        let report = Arc::clone(report);
+        std::thread::spawn(move || {
+            loop {
+                let next = report.lock().expect("the report").next();
+                match finished.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                    Ok(never) => match never {},
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(line) = report.lock().expect("the report").due(Instant::now()) {
+                            tracing::info!("{line}");
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+    };
+    let output = work.await;
+    drop(done);
+    reports.join().expect("the reports' thread");
+    output
 }
 
 /// A size in bytes, with an optional `K`, `M` or `G` suffix of powers of 1024, as pulsar-perf's `-ml` takes.
@@ -364,6 +518,52 @@ mod tests {
         assert_eq!(bytes("32k"), Ok(32 << 10));
         assert_eq!(bytes("2GB"), Ok(2 << 30));
         assert!(bytes("64X").is_err() && bytes("M").is_err());
+    }
+
+    #[test]
+    fn producers_report_every_10_seconds() {
+        let start = Instant::now();
+        let mut report = Report::new(start, MAX_SEND_LATENCY_MICROS, produced);
+        for micros in [100, 200, 300, 400] {
+            report.record(128 * 1024, Some(micros));
+        }
+        // In the warm-up: counted, without its latency.
+        report.record(128 * 1024, None);
+        assert_eq!(report.due(start + Duration::from_secs(9)), None);
+        assert_eq!(
+            report.due(start + Duration::from_secs(10)).as_deref(),
+            Some(
+                "Throughput produced:       5 msg ---      0.5 msg/s ---      0.5 Mbit/s --- failure      0.0 msg/s --- \
+                 Latency: mean:   0.250 ms - med:   0.200 - 95pct:   0.400 - 99pct:   0.400 - 99.9pct:   0.400 - \
+                 99.99pct:   0.400 - Max:   0.400"
+            )
+        );
+        assert_eq!(report.due(start + Duration::from_secs(19)), None, "10 seconds from the last report");
+        assert_eq!(
+            report.due(start + Duration::from_secs(20)).as_deref(),
+            Some(
+                "Throughput produced:       5 msg ---      0.0 msg/s ---      0.0 Mbit/s --- failure      0.0 msg/s --- \
+                 Latency: mean:   0.000 ms - med:   0.000 - 95pct:   0.000 - 99pct:   0.000 - 99.9pct:   0.000 - \
+                 99.99pct:   0.000 - Max:   0.000"
+            ),
+            "an interval without messages"
+        );
+    }
+
+    #[test]
+    fn consumers_report_every_10_seconds() {
+        let start = Instant::now();
+        let mut report = Report::new(start, MAX_RECEIVE_LATENCY_MILLIS, received);
+        for millis in [5, 10, 20] {
+            report.record(1024, Some(millis));
+        }
+        assert_eq!(
+            report.due(start + Duration::from_secs(10)).as_deref(),
+            Some(
+                "Throughput received:       3 msg --- 0.300 msg/s --- 0.002 Mbit/s --- Latency: mean: 11.667 ms - \
+                 med: 10 - 95pct: 20 - 99pct: 20 - 99.9pct: 20 - 99.99pct: 20 - Max: 20"
+            )
+        );
     }
 
     #[test]

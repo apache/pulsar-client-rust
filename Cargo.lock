@@ -2901,6 +2901,8 @@ dependencies = [
  "compio",
  "futures-util",
  "hdrhistogram",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
