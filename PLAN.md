@@ -225,6 +225,21 @@ The 5.0.1 broker gives a migrated topic's first layout the synthetic layout's ep
 (spec gap 29). Left to the broker: a Stream consumer or a Checkpoint consumer group can't use a topic before it
 migrates (spec gap 28, J18). An ignored test keeps what a Stream consumer should get there.
 
+The checks are done. `tests/conformance/README.md` holds the conformance suite, the spec's interoperability cases
+described for any SDK, each with what this client runs for it, and the checklist, which names for each of C1–C15 the
+tests that show the client meets it. `tests/PORTING.md` lists each Java test class that uses the V5 API, 150 classes
+and 694 tests at apache/pulsar `a0e7f7de62`, with the tests here that cover its scenarios: 303 covered and 2 partly;
+104 Java-only, 80 the broker's, 18 needing several brokers and 177 out of scope. The 10 in scope that aren't ported,
+and what the 2 partly covered miss, each have their reason there: what the client doesn't have (a processing timeout,
+a TLS certificate apart from authentication, metrics, a proxy URL, Java V5's `autoProduceBytes()` and
+`generic(SchemaInfo)`), a failed `CONNECT` write, which nothing can cause over loopback, how the controller converges
+under churn, which is the broker's, and a bug. Java's tests added since `a0e7f7de62` aren't mapped yet.
+
+The bug is the checklist's known gap under C7: once the controller moves to another broker, a Stream consumer whose
+client holds the topic's layout watch for something else too, a producer say, registers again with the old
+controller. From the code, a member of a Checkpoint consumer group, which registers the same way and holds the watch
+itself, would too. An ignored test pins it until it is fixed.
+
 ## After the first release
 
 In rough order: OAuth2 authentication, dead-letter policy, namespace subscription, transactions, end-to-end
